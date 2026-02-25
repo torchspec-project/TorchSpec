@@ -57,23 +57,23 @@ try:
     def _patch_cutlass_compilation() -> None:
         """Two patches to reduce flash_attn cute DSL compilation overhead.
 
-        Patch 1 — Disk cache (BaseDSL.compile_and_cache):
+        Patch 1 -- Disk cache (BaseDSL.compile_and_cache):
             flash_attn hardcodes no_cache=True, bypassing CUTE_DSL_CACHE_DIR.
             Overriding to False lets compiled cubins be written on the first run
             and read back on every subsequent process start (seconds, not minutes).
             Set CUTE_DSL_CACHE_DIR to a persistent path to survive reboots:
                 export CUTE_DSL_CACHE_DIR=/scratch/$USER/cutlass_cache
 
-        Patch 2 — Compilation opt-level (Compiler._compile):
+        Patch 2 -- Compilation opt-level (Compiler._compile):
             flash_attn passes options="--enable-tvm-ffi" with no explicit
             --opt-level, so the parser default (3) is used. Lower levels reduce
             LLVM-IR and ptxas work at the cost of slightly slower kernels.
 
             Controlled by TORCHSPEC_FLASH_ATTN_OPT_LEVEL (default: 3):
-              3  – current default; ~12 min; fastest kernel
-              2  – ~6–8 min; <5% slower kernel  (recommended for training)
-              1  – ~3–5 min; ~15% slower kernel
-              0  – ~1–2 min; ~50% slower kernel  (debugging only)
+              3  - current default; ~12 min; fastest kernel
+              2  - ~6-8 min; <5% slower kernel  (recommended for training)
+              1  - ~3-5 min; ~15% slower kernel
+              0  - ~1-2 min; ~50% slower kernel  (debugging only)
 
             TORCHSPEC_FLASH_ATTN_PTXAS_OPT controls ptxas separately
             (default: 3). Use 1 for additional compile-time savings when
@@ -886,7 +886,7 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if not use_cache:
-            # Standard path — no caching
+            # Standard path -- no caching
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
                 cos, sin = self.rotary_emb(query_states, position_ids)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -917,7 +917,7 @@ class LlamaAttention(nn.Module):
             )
 
         else:
-            # Cached path — cache_keys shape: [bsz, num_heads, num_cached, seq_len, head_dim]
+            # Cached path -- cache_keys shape: [bsz, num_heads, num_cached, seq_len, head_dim]
             lck = 0 if cache_keys is None else cache_keys.shape[2]
 
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):

@@ -220,14 +220,19 @@ def train_async_no_generation(args):
         args, train_group, mooncake_config, inference_engines
     )
 
+    dataset_size = len(dataset)
+    dataset_ref = ray.put(dataset)
+    del dataset
+
     run_training_loop(
         args,
-        dataset,
+        dataset_ref,
         controller,
         inference_manager,
         train_group,
         inference_engines=inference_engines,
         eval_dataset=eval_dataset,
+        dataset_size=dataset_size,
     )
 
 

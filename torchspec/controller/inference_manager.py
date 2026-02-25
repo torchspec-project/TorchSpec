@@ -373,7 +373,7 @@ class AsyncInferenceManager:
             f"Sample pool full, pausing generation: pool_size={pool_size}/{self._max_pool_size}"
         )
 
-        while pool_size >= self._max_pool_size:
+        while pool_size >= self._max_pool_size and self._running:
             await asyncio.sleep(MOONCAKE_BACKPRESSURE_POLL_INTERVAL)
             pool_size = await self.controller.get_pool_size.remote()
 

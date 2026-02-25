@@ -36,14 +36,19 @@ from torchspec.training.checkpoint import (
 from torchspec.utils.logging import logger
 
 
+def _is_save_interval_step(step: int, interval: int) -> bool:
+    return interval > 0 and step % interval == 0
+
+
 def run_training_loop(
     args,
-    dataset,
+    dataset_ref,
     controller,
     inference_manager,
     train_group,
     inference_engines=None,
     eval_dataset=None,
+    dataset_size=None,
 ):
     """Run the training loop with sync training and async inference.
 
@@ -60,24 +65,31 @@ def run_training_loop(
 
     Args:
         args: Configuration arguments.
-        dataset: List of samples (from load_conversation_dataset or custom source).
+        dataset_ref: Ray ObjectRef to the dataset (from ray.put()), or a plain list
+            for backward compatibility (will be put into the object store).
         controller: AsyncTrainingController ray actor handle.
         inference_manager: AsyncInferenceManager ray actor handle.
         train_group: Training group with set_train_queues method.
-        eval_dataset: Optional eval samples — same format as *dataset*.
+        eval_dataset: Optional eval samples — same format as dataset.
+        dataset_size: Number of samples. Required when dataset_ref is an ObjectRef.
     """
-    ray.get(controller.add_dataset.remote(dataset))
-    logger.info(f"Added {len(dataset)} samples to controller")
+    if isinstance(dataset_ref, list):
+        dataset_size = len(dataset_ref)
+        dataset_ref = ray.put(dataset_ref)
+    elif dataset_size is None:
+        raise ValueError("dataset_size is required when passing a Ray ObjectRef")
+
+    ray.get(controller.add_dataset.remote(dataset_ref))
+    logger.info(f"Added {dataset_size} samples to controller")
 
     # ── Eval setup ──────────────────────────────────────────────
-    # eval_interval=0 (default): eval runs at every checkpoint save.
-    # eval_interval=N>0: eval also runs every N steps.
-    eval_interval = getattr(args, "eval_interval", 0)
+    # eval_interval=N>0: eval runs every N steps in addition to checkpoint saves.
+    eval_interval = args.eval_interval
     eval_enabled = bool(eval_dataset)
     eval_cached = False
     eval_batches_per_dp = 0
     eval_cache_path: str | None = None
-    eval_dispatch_bs = getattr(args, "eval_dispatch_batch_size", args.dispatch_batch_size)
+    eval_dispatch_bs = args.eval_dispatch_batch_size
 
     if eval_enabled:
         eval_batches_per_dp = len(eval_dataset) // eval_dispatch_bs
@@ -95,8 +107,8 @@ def run_training_loop(
                 )
 
     best_eval_score = -float("inf")
-    if eval_enabled and getattr(args, "save_path", None):
-        best_meta_path = Path(args.save_path).expanduser() / "best_meta.json"
+    if eval_enabled and args.checkpoint_dir:
+        best_meta_path = Path(args.checkpoint_dir).expanduser() / "best_meta.json"
         if best_meta_path.exists():
             existing = _read_checkpoint_metadata(best_meta_path)
             if "eval/simulated_acc_len" in existing:
@@ -125,11 +137,11 @@ def run_training_loop(
 
     def _update_checkpoint_eval_meta(step: int, eval_metrics: dict, current_best: float) -> float:
         """Append eval metrics to checkpoint meta.json and track best checkpoint."""
-        save_path = getattr(args, "save_path", None)
-        if not save_path or not eval_metrics:
+        checkpoint_dir = args.checkpoint_dir
+        if not checkpoint_dir or not eval_metrics:
             return current_best
 
-        base_dir = Path(save_path).expanduser()
+        base_dir = Path(checkpoint_dir).expanduser()
         step_id = step + 1
         meta_path = base_dir / f"iter_{step_id:07d}" / "meta.json"
 
@@ -202,7 +214,7 @@ def run_training_loop(
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
     # steps_per_epoch in optimizer steps, pre-computed in auto_calculate_training_steps
     steps_per_epoch = getattr(
-        args, "steps_per_epoch", len(dataset) // (args.dispatch_batch_size * accumulation_steps)
+        args, "steps_per_epoch", dataset_size // (args.dispatch_batch_size * accumulation_steps)
     )
     if steps_per_epoch == 0:
         steps_per_epoch = 1
@@ -227,6 +239,7 @@ def run_training_loop(
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     dispatch_attempts = 0
     consecutive_failures = 0
+    last_saved_step: int | None = None
     progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
     while completed_steps < num_steps:
         # Inner loop: dispatch accumulation_steps batches before training
@@ -283,7 +296,7 @@ def run_training_loop(
                         steps_in_current_epoch = 0
                         consecutive_failures = 0
                         logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                        ray.get(controller.add_dataset.remote(dataset))
+                        ray.get(controller.add_dataset.remote(dataset_ref))
                     else:
                         logger.info("Max steps reached, stopping")
                         break
@@ -327,11 +340,7 @@ def run_training_loop(
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
-            save_due = (
-                args.save_interval
-                and args.save_interval > 0
-                and completed_steps % args.save_interval == 0
-            )
+            save_due = _is_save_interval_step(completed_steps, args.save_interval)
             if eval_interval > 0 and completed_steps % eval_interval == 0 and not save_due:
                 _, eval_cached = _try_eval(completed_steps, eval_cached)
 
@@ -355,14 +364,11 @@ def run_training_loop(
             progress.set_postfix(postfix, refresh=False)
             progress.update(1)
 
-            if (
-                args.save_interval
-                and args.save_interval > 0
-                and completed_steps % args.save_interval == 0
-            ):
+            if _is_save_interval_step(completed_steps, args.save_interval):
                 eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
+                last_saved_step = completed_steps
                 best_eval_score = _update_checkpoint_eval_meta(
                     completed_steps, eval_metrics, best_eval_score
                 )
@@ -374,13 +380,18 @@ def run_training_loop(
                     f"Total steps: {completed_steps}/{num_steps}"
                 )
 
-                if getattr(args, "save_per_epoch", False) and args.save_path:
+                if (
+                    args.save_per_epoch
+                    and args.checkpoint_dir
+                    and last_saved_step != completed_steps
+                ):
                     eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
                     logger.info(
                         f"Saving checkpoint at end of epoch {current_epoch} "
                         f"(step {completed_steps})..."
                     )
                     train_group.save_model(completed_steps)
+                    last_saved_step = completed_steps
                     best_eval_score = _update_checkpoint_eval_meta(
                         completed_steps, eval_metrics, best_eval_score
                     )
@@ -389,7 +400,7 @@ def run_training_loop(
                     current_epoch += 1
                     steps_in_current_epoch = 0
                     logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                    ray.get(controller.add_dataset.remote(dataset))
+                    ray.get(controller.add_dataset.remote(dataset_ref))
                 else:
                     logger.info("Max steps reached")
                     break
@@ -403,12 +414,8 @@ def run_training_loop(
     ray.get(inference_manager.stop.remote())
     ray.get(inference_future)
 
-    should_save_final = (
-        not args.save_interval
-        or args.save_interval <= 0
-        or completed_steps % args.save_interval != 0
-    )
-    if should_save_final:
+    # Always save a final checkpoint unless saved.
+    if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)

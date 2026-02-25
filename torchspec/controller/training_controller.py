@@ -139,9 +139,7 @@ class AsyncTrainingController:
 
         self.batch_id = 0
         self.dispatch_batch_size = args.dispatch_batch_size
-        self.eval_dispatch_batch_size = getattr(
-            args, "eval_dispatch_batch_size", self.dispatch_batch_size
-        )
+        self.eval_dispatch_batch_size = args.eval_dispatch_batch_size
         self._data_id_counter = 0
 
         self._start_time = time.time()
@@ -407,6 +405,7 @@ class AsyncTrainingController:
 
         Uses ``eval_dispatch_batch_size`` (may differ from training).
         Only dispatches full batches. Remaining samples stay in the pool.
+        Clears eval tracking state after dispatch to prevent unbounded growth.
 
         Returns:
             Number of batches dispatched.
@@ -434,11 +433,18 @@ class AsyncTrainingController:
                     )
             dispatched += 1
 
-        remaining = len(self.eval_pool)
-        logger.info(
-            f"Eval: dispatched {dispatched} batches to eval queues "
-            f"({remaining} samples remaining in pool)"
-        )
+        with self._eval_pool_lock:
+            remaining = len(self.eval_pool)
+            if remaining > 0:
+                logger.warning(
+                    f"Eval: dropping {remaining} leftover samples that didn't fill a batch"
+                )
+                self.eval_pool.clear()
+
+        self._eval_data_ids.clear()
+        self._eval_expected_count = 0
+
+        logger.info(f"Eval: dispatched {dispatched} batches to eval queues")
         return dispatched
 
     # ─────────────────────────────────────────────────────────────

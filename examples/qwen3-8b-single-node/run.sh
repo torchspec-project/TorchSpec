@@ -27,7 +27,6 @@ ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
 export TORCHSPEC_LOG_LEVEL=INFO
 
-
 CONFIG_FILE="${1:-$ROOT_DIR/configs/sglang_qwen3_8b.yaml}"
 if [[ -f "$CONFIG_FILE" ]]; then
     shift 1 || true
@@ -59,14 +58,12 @@ echo "=============================================="
 
 python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
-    dataset.train_data_path="$ROOT_DIR/examples/data/sample_conversations.jsonl" \
     training.training_num_gpus_per_node="$TRAIN_GPUS" \
     inference.inference_engine_type="sgl" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
     sglang.sglang_tp_size=2 \
-    ${MOONCAKE_DEVICE_NAME:+mooncake.device_name="$MOONCAKE_DEVICE_NAME"} \
     "$@"
 
 echo "=============================================="
