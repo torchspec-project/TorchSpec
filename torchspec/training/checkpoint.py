@@ -234,7 +234,7 @@ def save(actor: Any, step: int) -> None:
     """
     torch.cuda.synchronize()
 
-    base_dir = Path(actor.args.save_path).expanduser()
+    base_dir = Path(actor.args.checkpoint_dir).expanduser()
     step_id = step + 1
     checkpoint_dir = base_dir / f"iter_{step_id:07d}"
     model_dir = checkpoint_dir / "model"

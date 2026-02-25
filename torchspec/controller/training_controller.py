@@ -139,9 +139,7 @@ class AsyncTrainingController:
 
         self.batch_id = 0
         self.dispatch_batch_size = args.dispatch_batch_size
-        self.eval_dispatch_batch_size = getattr(
-            args, "eval_dispatch_batch_size", self.dispatch_batch_size
-        )
+        self.eval_dispatch_batch_size = args.eval_dispatch_batch_size
         self._data_id_counter = 0
 
         self._start_time = time.time()
@@ -457,9 +455,7 @@ class AsyncTrainingController:
         self._eval_data_ids.clear()
         self._eval_expected_count = 0
 
-        logger.info(
-            f"Eval: dispatched {dispatched} batches to eval queues"
-        )
+        logger.info(f"Eval: dispatched {dispatched} batches to eval queues")
         return dispatched
 
     # ─────────────────────────────────────────────────────────────

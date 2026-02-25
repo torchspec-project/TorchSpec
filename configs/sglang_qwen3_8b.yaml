@@ -15,6 +15,8 @@ model:
 
 dataset:
   train_data_path: ./examples/data/sample_conversations.jsonl
+  eval_data_path: ./examples/data/eval_conversations.jsonl
+  eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
 
@@ -26,11 +28,12 @@ training:
   max_concurrent_batches: 1
   max_grad_norm: 0.5
   max_seq_length: 16384
-  num_epochs: 10
+  num_epochs: 1
   seed: 42
   training_num_gpus_per_node: 2
   training_num_nodes: 1
   ttt_length: 7
+  save_per_epoch: true
   warmup_ratio: 0.015
 
 inference:
@@ -55,7 +58,7 @@ mooncake:
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
-output_dir: ./outputs/train_entry_sgl
+output_dir: ./outputs/qwen3-8b-single-node
 cache_dir: ./cache
 model_download_dir: null
 

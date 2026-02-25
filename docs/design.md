@@ -1,6 +1,6 @@
 # TorchSpec Architecture
 
-TorchSpec implements **speculative decoding training** using the **Eagle3** architecture. The core idea is to train a small, fast **draft model** to predict multiple tokens in parallel, which are then validated by a larger **target model**.
+TorchSpec is a **disaggregated speculative decoding training framework** that separates inference and training onto independent GPU pools. A target model runs on inference GPUs to produce hidden states and logits, which are transferred to training GPUs via Mooncake (RDMA/TCP) for draft model training — all orchestrated as an asynchronous pipeline through Ray. This disaggregated design decouples compute scaling for inference and training, enabling efficient draft model training at scale.
 
 ## High-Level Architecture
 
