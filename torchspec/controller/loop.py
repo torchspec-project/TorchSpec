@@ -414,6 +414,7 @@ def run_training_loop(
     ray.get(inference_manager.stop.remote())
     ray.get(inference_future)
 
+    # Always save a final checkpoint unless saved.
     if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
