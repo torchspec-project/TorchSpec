@@ -444,9 +444,7 @@ class AsyncTrainingController:
         self._eval_data_ids.clear()
         self._eval_expected_count = 0
 
-        logger.info(
-            f"Eval: dispatched {dispatched} batches to eval queues"
-        )
+        logger.info(f"Eval: dispatched {dispatched} batches to eval queues")
         return dispatched
 
     # ─────────────────────────────────────────────────────────────
