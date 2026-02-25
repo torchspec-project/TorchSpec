@@ -1,0 +1,49 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from transformers import AutoTokenizer
+
+from torchspec.utils.logging import logger
+
+
+def load_tokenizer(name_or_path: str, **kwargs):
+    kwargs.setdefault("use_fast", True)
+    return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+
+
+def get_assistant_token_ids(args) -> tuple[list[int] | None, list[int] | None]:
+    """Derive assistant_header_ids and end_token_ids from chat_template config."""
+    from torchspec.data.template import TEMPLATE_REGISTRY
+
+    chat_template_name = getattr(args, "chat_template", None)
+    if not chat_template_name:
+        return None, None
+
+    template = TEMPLATE_REGISTRY.get(chat_template_name)
+    if not template.assistant_header or not template.end_of_turn_token:
+        return None, None
+
+    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
+    assistant_header_ids = tokenizer.encode(template.assistant_header, add_special_tokens=False)
+    end_token_ids = tokenizer.encode(template.end_of_turn_token, add_special_tokens=False)
+    logger.info(
+        f"Assistant loss mask token IDs: header={assistant_header_ids}, end={end_token_ids}"
+    )
+    return assistant_header_ids, end_token_ids

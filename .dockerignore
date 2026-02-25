@@ -1,0 +1,9 @@
+.git/
+build/
+cache/
+outputs/
+docker/
+*.log
+*.egg-info/
+__pycache__/
+.ruff_cache/

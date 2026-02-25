@@ -1,0 +1,33 @@
+SGLANG_VERSION := env("SGLANG_VERSION", "v0.5.8.post1")
+
+build:
+    ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _build-only
+
+release-primary:
+    ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _release-raw
+
+_build-only:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    VERSION="$(cat docker/version.txt | tr -d '\n')"
+    IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+
+    docker build -f docker/sglang/{{SGLANG_VERSION}}/Dockerfile . $ARG_BUILD_EXTRA_ARGS -t ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
+
+_release-raw:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    VERSION="$(cat docker/version.txt | tr -d '\n')"
+    IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+
+    docker build -f docker/sglang/{{SGLANG_VERSION}}/Dockerfile . $ARG_BUILD_EXTRA_ARGS -t ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
+    docker push ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
+
+    if [ -z "${ARG_TAG_POSTFIX}" ]; then
+        docker tag ghcr.io/torchspec-project/torchspec:$IMAGE_TAG ghcr.io/torchspec-project/torchspec:latest
+        docker push ghcr.io/torchspec-project/torchspec:latest
+    fi

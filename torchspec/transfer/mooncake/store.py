@@ -1,0 +1,216 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from abc import ABC
+from typing import Dict, Optional
+
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+from torchspec.config.mooncake_config import MooncakeConfig
+from torchspec.transfer.mooncake.buffers import (
+    GPUReceiveBuffer,
+    GPUSendBuffer,
+    HostBufferPool,
+)
+from torchspec.utils.logging import logger
+
+
+class MooncakeHiddenStateStore(ABC):
+    """
+    Base class for Mooncake Store wrapper to store hidden states from target model.
+
+    Uses RDMA-registered host buffers (MooncakeHostMemAllocator) and put_from
+    for zero-copy transfers. Optionally uses GPU Direct RDMA for both sending
+    and receiving.
+    """
+
+    def __init__(self, config: MooncakeConfig):
+        self.config = config
+        self._store: Optional[MooncakeDistributedStore] = None
+        self._initialized = False
+        self._registered_buffers: Dict[int, int] = {}
+        self._host_buffer_pool: Optional[HostBufferPool] = None
+        self._gpu_receive_buffer: Optional[GPUReceiveBuffer] = None
+        self._gpu_send_buffer: Optional[GPUSendBuffer] = None
+        self._gpu_direct_available = False
+
+    def setup(self, device: torch.device | int | None = None) -> None:
+        """Initialize the Mooncake Store client."""
+        if self._initialized:
+            return
+
+        if device is not None and not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        if self.config.protocol == "rdma" and not self.config.device_name:
+            logger.warning(
+                "RDMA protocol with empty device_name will use auto-discovery, "
+                "which may fail on hosts with mixed IB subnets. "
+                "Set mooncake.device_name to a specific RDMA device (e.g. 'mlx5_0')."
+            )
+
+        self._store = MooncakeDistributedStore()
+        logger.info(
+            "Connecting to Mooncake master at %s, metadata server at %s",
+            self.config.master_server_address,
+            self.config.metadata_server,
+        )
+        result = self._store.setup(
+            local_hostname=self.config.local_hostname,
+            metadata_server=self.config.metadata_server,
+            global_segment_size=self.config.global_segment_size,
+            local_buffer_size=self.config.local_buffer_size,
+            protocol=self.config.protocol,
+            rdma_devices=self.config.device_name,
+            master_server_addr=self.config.master_server_address,
+        )
+        if result is not None and result != 0:
+            raise RuntimeError(
+                f"Failed to initialize Mooncake client (error={result}). "
+                f"Check that Mooncake master is running at {self.config.master_server_address} "
+                f"and metadata server is available at {self.config.metadata_server}"
+            )
+
+        self._host_buffer_pool = HostBufferPool(
+            buffer_size=self.config.host_buffer_size,
+            pool_size=self.config.host_buffer_pool_size,
+        )
+        self._host_buffer_pool.initialize()
+
+        for buf in self._host_buffer_pool._buffers:
+            self._register_buffer(buf.ptr, buf.size)
+
+        if self.config.enable_gpu_direct and torch.cuda.is_available():
+            self._setup_gpu_direct(device)
+
+        self._initialized = True
+        logger.info(
+            "Mooncake Store client initialized (protocol=%s, device=%s, gpu_direct=%s)",
+            self.config.protocol,
+            self.config.device_name or "(auto-discovery)",
+            self._gpu_direct_available,
+        )
+
+    def _setup_gpu_direct(self, device: torch.device = None) -> None:
+        """Initialize GPU send/receive buffers and register for GPU Direct RDMA."""
+        try:
+            self._gpu_receive_buffer = GPUReceiveBuffer(
+                size=self.config.gpu_buffer_size,
+                device=device,
+            )
+            self._gpu_receive_buffer.initialize()
+
+            if not self._register_buffer(
+                self._gpu_receive_buffer.ptr, self._gpu_receive_buffer.size
+            ):
+                logger.warning("Failed to register GPU receive buffer with Mooncake")
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
+                return
+
+            # Allocate GPU send buffer (same size as host buffer — put is 1 sample)
+            self._gpu_send_buffer = GPUSendBuffer(
+                size=self.config.host_buffer_size,
+                device=device,
+            )
+            self._gpu_send_buffer.initialize()
+
+            if not self._register_buffer(self._gpu_send_buffer.ptr, self._gpu_send_buffer.size):
+                logger.warning("Failed to register GPU send buffer with Mooncake")
+                self._gpu_send_buffer.free()
+                self._gpu_send_buffer = None
+                # receive buffer is still usable, continue
+
+            self._gpu_direct_available = True
+            send_desc = (
+                f"{self._gpu_send_buffer.size / (1024**2):.1f}MB"
+                if self._gpu_send_buffer
+                else "N/A"
+            )
+            logger.info(
+                "GPU Direct RDMA enabled: receive=%.1fMB, send=%s on %s",
+                self._gpu_receive_buffer.size / (1024**2),
+                send_desc,
+                device or "cuda",
+            )
+
+        except Exception as e:
+            logger.warning("Failed to setup GPU Direct RDMA: %s", e)
+            self._gpu_direct_available = False
+            if self._gpu_receive_buffer is not None:
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
+            if self._gpu_send_buffer is not None:
+                self._gpu_send_buffer.free()
+                self._gpu_send_buffer = None
+
+    def _ensure_initialized(self) -> None:
+        """Ensure the store is initialized."""
+        if not self._initialized:
+            self.setup()
+
+    def _register_buffer(self, buffer_ptr: int, size: int) -> bool:
+        """Register a buffer for RDMA transfers."""
+        if buffer_ptr in self._registered_buffers:
+            return True
+
+        try:
+            if hasattr(self._store, "register_buffer"):
+                result = self._store.register_buffer(buffer_ptr, size)
+                if result == 0:
+                    self._registered_buffers[buffer_ptr] = size
+                    logger.debug("Registered buffer at %#x, size=%s", buffer_ptr, size)
+                    return True
+                logger.warning("register_buffer returned error code: %s", result)
+                return False
+        except Exception as e:
+            logger.warning("Failed to register buffer: %s", e)
+
+        return False
+
+    def remove(self, key: str) -> None:
+        """Remove data from Mooncake Store."""
+        self._store.remove(key)
+        logger.debug("Removed data with key: %s", key)
+
+    def exists(self, key: str) -> bool:
+        """Check if a key exists in the store (metadata-only, no data download)."""
+        try:
+            result = self._store.is_exist(key)
+            return result == 1
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        """Close the Mooncake Store client."""
+        if self._gpu_send_buffer is not None:
+            self._gpu_send_buffer.free()
+            self._gpu_send_buffer = None
+        if self._gpu_receive_buffer is not None:
+            self._gpu_receive_buffer.free()
+            self._gpu_receive_buffer = None
+        if self._host_buffer_pool is not None:
+            self._host_buffer_pool.shutdown()
+            self._host_buffer_pool = None
+        if self._store is not None and hasattr(self._store, "close"):
+            self._store.close()
+        self._initialized = False
+        self._gpu_direct_available = False
