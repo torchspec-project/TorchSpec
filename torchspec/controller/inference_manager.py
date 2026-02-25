@@ -44,6 +44,7 @@ from collections import deque
 from typing import Any
 
 import ray
+from ray.exceptions import RayActorError
 
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
@@ -446,6 +447,11 @@ class AsyncInferenceManager:
                     now = time.time()
                     self._batch_times.append((len(entries), now - t0, now))
                 return list(zip(entries, outputs, strict=True))
+            except RayActorError as e:
+                logger.critical(f"Engine actor died, terminating inference manager: {e}")
+                self._running = False
+                self.controller.set_inference_error.remote(str(e))
+                raise
             except Exception as e:
                 logger.error(f"Engine dispatch failed: {e}")
                 return [(entry, e) for entry in entries]
