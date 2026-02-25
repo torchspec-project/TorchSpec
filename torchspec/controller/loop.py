@@ -36,6 +36,10 @@ from torchspec.training.checkpoint import (
 from torchspec.utils.logging import logger
 
 
+def _is_save_interval_step(step: int, interval: int) -> bool:
+    return interval > 0 and step % interval == 0
+
+
 def run_training_loop(
     args,
     dataset,
@@ -70,14 +74,13 @@ def run_training_loop(
     logger.info(f"Added {len(dataset)} samples to controller")
 
     # ── Eval setup ──────────────────────────────────────────────
-    # eval_interval=0 (default): eval runs at every checkpoint save.
-    # eval_interval=N>0: eval also runs every N steps.
-    eval_interval = getattr(args, "eval_interval", 0)
+    # eval_interval=N>0: eval runs every N steps in addition to checkpoint saves.
+    eval_interval = args.eval_interval
     eval_enabled = bool(eval_dataset)
     eval_cached = False
     eval_batches_per_dp = 0
     eval_cache_path: str | None = None
-    eval_dispatch_bs = getattr(args, "eval_dispatch_batch_size", args.dispatch_batch_size)
+    eval_dispatch_bs = args.eval_dispatch_batch_size
 
     if eval_enabled:
         eval_batches_per_dp = len(eval_dataset) // eval_dispatch_bs
@@ -95,8 +98,8 @@ def run_training_loop(
                 )
 
     best_eval_score = -float("inf")
-    if eval_enabled and getattr(args, "save_path", None):
-        best_meta_path = Path(args.save_path).expanduser() / "best_meta.json"
+    if eval_enabled and args.checkpoint_dir:
+        best_meta_path = Path(args.checkpoint_dir).expanduser() / "best_meta.json"
         if best_meta_path.exists():
             existing = _read_checkpoint_metadata(best_meta_path)
             if "eval/simulated_acc_len" in existing:
@@ -125,11 +128,11 @@ def run_training_loop(
 
     def _update_checkpoint_eval_meta(step: int, eval_metrics: dict, current_best: float) -> float:
         """Append eval metrics to checkpoint meta.json and track best checkpoint."""
-        save_path = getattr(args, "save_path", None)
-        if not save_path or not eval_metrics:
+        checkpoint_dir = args.checkpoint_dir
+        if not checkpoint_dir or not eval_metrics:
             return current_best
 
-        base_dir = Path(save_path).expanduser()
+        base_dir = Path(checkpoint_dir).expanduser()
         step_id = step + 1
         meta_path = base_dir / f"iter_{step_id:07d}" / "meta.json"
 
@@ -227,6 +230,7 @@ def run_training_loop(
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     dispatch_attempts = 0
     consecutive_failures = 0
+    last_saved_step: int | None = None
     progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
     while completed_steps < num_steps:
         # Inner loop: dispatch accumulation_steps batches before training
@@ -327,11 +331,7 @@ def run_training_loop(
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
-            save_due = (
-                args.save_interval
-                and args.save_interval > 0
-                and completed_steps % args.save_interval == 0
-            )
+            save_due = _is_save_interval_step(completed_steps, args.save_interval)
             if eval_interval > 0 and completed_steps % eval_interval == 0 and not save_due:
                 _, eval_cached = _try_eval(completed_steps, eval_cached)
 
@@ -355,14 +355,11 @@ def run_training_loop(
             progress.set_postfix(postfix, refresh=False)
             progress.update(1)
 
-            if (
-                args.save_interval
-                and args.save_interval > 0
-                and completed_steps % args.save_interval == 0
-            ):
+            if _is_save_interval_step(completed_steps, args.save_interval):
                 eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
+                last_saved_step = completed_steps
                 best_eval_score = _update_checkpoint_eval_meta(
                     completed_steps, eval_metrics, best_eval_score
                 )
@@ -374,13 +371,14 @@ def run_training_loop(
                     f"Total steps: {completed_steps}/{num_steps}"
                 )
 
-                if getattr(args, "save_per_epoch", False) and args.save_path:
+                if args.save_per_epoch and args.checkpoint_dir:
                     eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
                     logger.info(
                         f"Saving checkpoint at end of epoch {current_epoch} "
                         f"(step {completed_steps})..."
                     )
                     train_group.save_model(completed_steps)
+                    last_saved_step = completed_steps
                     best_eval_score = _update_checkpoint_eval_meta(
                         completed_steps, eval_metrics, best_eval_score
                     )
@@ -403,12 +401,7 @@ def run_training_loop(
     ray.get(inference_manager.stop.remote())
     ray.get(inference_future)
 
-    should_save_final = (
-        not args.save_interval
-        or args.save_interval <= 0
-        or completed_steps % args.save_interval != 0
-    )
-    if should_save_final:
+    if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)

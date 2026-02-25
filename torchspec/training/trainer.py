@@ -313,7 +313,7 @@ class Trainer(abc.ABC):
     # ------------------------------------------------------------------
 
     def save_model(self, step: int, force_sync: bool = False) -> None:
-        if getattr(self.args, "save_path", None) is None:
+        if not self.args.checkpoint_dir:
             return
         checkpoint.save(self, step=step)
 

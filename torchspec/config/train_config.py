@@ -21,6 +21,7 @@
 import argparse
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
@@ -188,7 +189,6 @@ class TrainingConfig:
     num_train_steps: Optional[int] = None
     micro_batch_size: int = 2
     prefetch_depth: int = 4
-    save_path: Optional[str] = None
     save_interval: int = 5000
     save_per_epoch: bool = False
     seed: int = 0
@@ -320,6 +320,12 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
         flat.get("use_tensorboard", False) or flat.get("report_to") == "tensorboard"
+    )
+    save_enabled = flat.get("save_interval", 0) > 0 or flat.get("save_per_epoch", False)
+    flat["checkpoint_dir"] = (
+        str(Path(flat["output_dir"]) / "checkpoints")
+        if flat.get("output_dir") and save_enabled
+        else None
     )
 
     return argparse.Namespace(**flat)
