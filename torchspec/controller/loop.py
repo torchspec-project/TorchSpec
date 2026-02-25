@@ -38,12 +38,13 @@ from torchspec.utils.logging import logger
 
 def run_training_loop(
     args,
-    dataset,
+    dataset_ref,
     controller,
     inference_manager,
     train_group,
     inference_engines=None,
     eval_dataset=None,
+    dataset_size=None,
 ):
     """Run the training loop with sync training and async inference.
 
@@ -60,14 +61,22 @@ def run_training_loop(
 
     Args:
         args: Configuration arguments.
-        dataset: List of samples (from load_conversation_dataset or custom source).
+        dataset_ref: Ray ObjectRef to the dataset (from ray.put()), or a plain list
+            for backward compatibility (will be put into the object store).
         controller: AsyncTrainingController ray actor handle.
         inference_manager: AsyncInferenceManager ray actor handle.
         train_group: Training group with set_train_queues method.
-        eval_dataset: Optional eval samples — same format as *dataset*.
+        eval_dataset: Optional eval samples — same format as dataset.
+        dataset_size: Number of samples. Required when dataset_ref is an ObjectRef.
     """
-    ray.get(controller.add_dataset.remote(dataset))
-    logger.info(f"Added {len(dataset)} samples to controller")
+    if isinstance(dataset_ref, list):
+        dataset_size = len(dataset_ref)
+        dataset_ref = ray.put(dataset_ref)
+    elif dataset_size is None:
+        raise ValueError("dataset_size is required when passing a Ray ObjectRef")
+
+    ray.get(controller.add_dataset.remote(dataset_ref))
+    logger.info(f"Added {dataset_size} samples to controller")
 
     # ── Eval setup ──────────────────────────────────────────────
     # eval_interval=0 (default): eval runs at every checkpoint save.
@@ -202,7 +211,7 @@ def run_training_loop(
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
     # steps_per_epoch in optimizer steps, pre-computed in auto_calculate_training_steps
     steps_per_epoch = getattr(
-        args, "steps_per_epoch", len(dataset) // (args.dispatch_batch_size * accumulation_steps)
+        args, "steps_per_epoch", dataset_size // (args.dispatch_batch_size * accumulation_steps)
     )
     if steps_per_epoch == 0:
         steps_per_epoch = 1
@@ -283,7 +292,7 @@ def run_training_loop(
                         steps_in_current_epoch = 0
                         consecutive_failures = 0
                         logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                        ray.get(controller.add_dataset.remote(dataset))
+                        ray.get(controller.add_dataset.remote(dataset_ref))
                     else:
                         logger.info("Max steps reached, stopping")
                         break
@@ -389,7 +398,7 @@ def run_training_loop(
                     current_epoch += 1
                     steps_in_current_epoch = 0
                     logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                    ray.get(controller.add_dataset.remote(dataset))
+                    ray.get(controller.add_dataset.remote(dataset_ref))
                 else:
                     logger.info("Max steps reached")
                     break
