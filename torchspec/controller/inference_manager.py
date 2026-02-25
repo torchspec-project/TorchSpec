@@ -310,12 +310,12 @@ class AsyncInferenceManager:
             await self._forward_results(task.result())
 
     async def _drain(self) -> None:
-        """Flush remaining buffer and pending tasks on shutdown."""
+        # Currently drain is only called on shutdown, so we don't need to await pool.
         if self._prompt_buffer:
-            await self._await_pool_capacity()
-            entries = self._take_batch(len(self._prompt_buffer))
-            results = await self._dispatch_batch(entries)
-            await self._forward_results(results)
+            logger.info(
+                f"Drain: discarding {len(self._prompt_buffer)} buffered prompts on shutdown"
+            )
+            self._prompt_buffer.clear()
         if self._pending_tasks:
             done, _ = await asyncio.wait(self._pending_tasks, return_when=asyncio.ALL_COMPLETED)
             for task in done:
@@ -374,7 +374,7 @@ class AsyncInferenceManager:
             f"Sample pool full, pausing generation: pool_size={pool_size}/{self._max_pool_size}"
         )
 
-        while pool_size >= self._max_pool_size:
+        while pool_size >= self._max_pool_size and self._running:
             await asyncio.sleep(MOONCAKE_BACKPRESSURE_POLL_INTERVAL)
             pool_size = await self.controller.get_pool_size.remote()
 
@@ -388,6 +388,9 @@ class AsyncInferenceManager:
                 last_log_time = now
 
         wait_duration = time.time() - wait_start
+        if not self._running:
+            logger.info(f"Pool wait aborted (shutdown requested) after {wait_duration:.1f}s")
+            return
         logger.info(
             f"Pool capacity available after {wait_duration:.1f}s, "
             f"pool_size={pool_size}/{self._max_pool_size}"

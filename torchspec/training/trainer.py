@@ -124,16 +124,15 @@ class Trainer(abc.ABC):
         if mooncake_config is None:
             mooncake_config = MooncakeConfig.from_flat_args(self.args)
 
-
         mooncake_config = dataclasses.replace(
             mooncake_config,
             global_segment_size=0,
-            host_buffer_pool_size=0,
         )
 
         store = EagleMooncakeStore(mooncake_config)
         store.setup(device=torch.cuda.current_device())
         self.mooncake_store = store
+        logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore initialized")
         return store
 
     # ------------------------------------------------------------------
