@@ -371,7 +371,11 @@ def run_training_loop(
                     f"Total steps: {completed_steps}/{num_steps}"
                 )
 
-                if args.save_per_epoch and args.checkpoint_dir:
+                if (
+                    args.save_per_epoch
+                    and args.checkpoint_dir
+                    and last_saved_step != completed_steps
+                ):
                     eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
                     logger.info(
                         f"Saving checkpoint at end of epoch {current_epoch} "

@@ -321,11 +321,8 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     flat["use_tensorboard"] = (
         flat.get("use_tensorboard", False) or flat.get("report_to") == "tensorboard"
     )
-    save_enabled = flat.get("save_interval", 0) > 0 or flat.get("save_per_epoch", False)
     flat["checkpoint_dir"] = (
-        str(Path(flat["output_dir"]) / "checkpoints")
-        if flat.get("output_dir") and save_enabled
-        else None
+        str(Path(flat["output_dir"]) / "checkpoints") if flat.get("output_dir") else None
     )
 
     return argparse.Namespace(**flat)
