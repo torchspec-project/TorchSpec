@@ -34,6 +34,7 @@ from typing import Any
 import ray
 import sglang as sgl
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
@@ -194,7 +195,10 @@ class SglEngine(InferenceEngine, RayActor):
         # Apply extra_args (can override defaults above, but not protected keys)
         extra_args = getattr(self.args, "sglang_extra_args", None)
         if extra_args:
-            extra = dict(extra_args) if not isinstance(extra_args, dict) else extra_args
+            if isinstance(extra_args, DictConfig):
+                extra = OmegaConf.to_container(extra_args, resolve=True)
+            else:
+                extra = dict(extra_args) if not isinstance(extra_args, dict) else extra_args
             blocked = extra.keys() & _PROTECTED_ENGINE_KEYS
             if blocked:
                 logger.warning(
