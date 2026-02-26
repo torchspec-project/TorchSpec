@@ -27,6 +27,17 @@ export SGLANG_DISABLE_CUDNN_CHECK=1
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TORCHSPEC_LOG_LEVEL=INFO
 
+# Match the Ray temp dir used by setup_ray_cluster.sh so ray.init(address="auto") works
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_torchspec_kimi25_$(id -u)}"
+if [ -z "${RAY_ADDRESS:-}" ]; then
+  _cluster_file="$RAY_TEMP_DIR/ray_current_cluster"
+  if _addr="$(cat "$_cluster_file" 2>/dev/null)" && [ -n "$_addr" ]; then
+    export RAY_ADDRESS="$_addr"
+    echo "Auto-discovered RAY_ADDRESS=$RAY_ADDRESS from $_cluster_file"
+  fi
+  unset _addr _cluster_file
+fi
+
 TRAIN_GPUS="${TRAIN_GPUS:-8}"
 INFERENCE_GPUS="${INFERENCE_GPUS:-8}"
 

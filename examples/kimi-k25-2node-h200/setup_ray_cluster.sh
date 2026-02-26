@@ -70,7 +70,6 @@ case "$NODE_ROLE" in
     ray stop --force 2>/dev/null || true
     ray start \
       --address "$RAY_ADDR" \
-      --temp-dir "$RAY_TEMP_DIR" \
       --num-gpus 8 \
       --disable-usage-stats
     echo "Worker joined Ray cluster at $RAY_ADDR"

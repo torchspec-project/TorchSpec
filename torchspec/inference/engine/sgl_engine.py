@@ -266,16 +266,24 @@ class SglEngine(InferenceEngine, RayActor):
 
     @staticmethod
     def _extract_image_data(multimodal_inputs: list[dict] | None) -> list | None:
-        """Extract image_data list from multimodal_inputs for sgl.Engine."""
+        """Extract image_data list from multimodal_inputs for sgl.Engine.
+
+        Returns a list-of-lists so that SGLang's _normalize_image_data always
+        takes the "already a list of lists" branch.  Using [] instead of None
+        for imageless requests prevents the normalizer from misdetecting the
+        format when the first request in the batch has no images.
+        """
         if not multimodal_inputs:
             return None
         image_data = []
+        has_images = False
         for mm_input in multimodal_inputs:
             if mm_input and mm_input.get("images"):
                 image_data.append(mm_input["images"])
+                has_images = True
             else:
-                image_data.append(None)
-        return image_data
+                image_data.append([])
+        return image_data if has_images else None
 
     def generate(
         self,
