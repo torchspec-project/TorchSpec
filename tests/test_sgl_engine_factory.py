@@ -24,7 +24,6 @@ def _make_args(**overrides):
         sglang_pp_size=1,
         aux_hidden_states_layers=None,
         sglang_mem_fraction_static=0.8,
-        sglang_disable_cuda_graph=True,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

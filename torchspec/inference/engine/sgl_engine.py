@@ -194,7 +194,7 @@ class SglEngine(InferenceEngine, RayActor):
         # Build engine kwargs - base config for spec_training mode
         engine_kwargs = {
             "model_path": self.args.target_model_path,
-            "disable_cuda_graph": getattr(self.args, "sglang_disable_cuda_graph", True),
+            "disable_cuda_graph": True,  # Always disabled, prefill-only.
             "disable_radix_cache": True,  # IMPORTANT: radix cache interferes with hidden states capture
             "enable_return_hidden_states": True,
             "enable_aux_hidden_states": True,
@@ -235,8 +235,6 @@ class SglEngine(InferenceEngine, RayActor):
             val = getattr(self.args, args_key, False)
             if val:
                 engine_kwargs[engine_key] = val
-
-        engine_kwargs["disable_cuda_graph"] = True
 
         # Power-user passthrough: extra_args are forwarded as-is to sgl.Engine,
         # except for keys that TorchSpec manages internally.

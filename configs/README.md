@@ -68,7 +68,6 @@ inference:
 | `kv_cache_dtype` | null | KV cache dtype override |
 | `moe_runner_backend` | null | MoE runner backend |
 | `model_loader_extra_config` | null | Extra config dict for model loading |
-| `disable_cuda_graph` | true | Disable CUDA graph (always true in spec training) |
 | `disable_flashinfer_autotune` | false | Disable FlashInfer autotuning |
 | `enable_multimodal` | false | Enable multimodal input support |
 | `enable_metrics` | false | Forward SGLang metrics to W&B |

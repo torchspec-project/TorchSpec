@@ -56,7 +56,6 @@ class SGLangConfig:
     kv_cache_dtype: Optional[str] = None
     moe_runner_backend: Optional[str] = None
     model_loader_extra_config: Any = None
-    disable_cuda_graph: bool = True
     disable_flashinfer_autotune: bool = False
     enable_multimodal: bool = False
     enable_metrics: bool = False
