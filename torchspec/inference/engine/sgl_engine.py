@@ -41,6 +41,30 @@ from torchspec.utils.logging import logger
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
 
 
+# Keys managed by TorchSpec that extra_args must not override.
+_PROTECTED_ENGINE_KEYS = frozenset({
+    "model_path",
+    "trust_remote_code",
+    "disable_radix_cache",
+    "enable_return_hidden_states",
+    "enable_aux_hidden_states",
+    "aux_hidden_state_layer_ids",
+    "enable_spec_training_mooncake",
+    "chunked_prefill_size",
+    "disable_cuda_graph",
+    "tp_size",
+    "pp_size",
+    "base_gpu_id",
+    "gpu_id_step",
+    "mem_fraction_static",
+    "nccl_port",
+    "nnodes",
+    "node_rank",
+    "dist_init_addr",
+    "dist_timeout",
+})
+
+
 class SglEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for sgl.Engine with distributed deployment support.
 
@@ -212,6 +236,20 @@ class SglEngine(InferenceEngine, RayActor):
                 engine_kwargs[engine_key] = val
 
         engine_kwargs["disable_cuda_graph"] = True
+
+        # Power-user passthrough: extra_args are forwarded as-is to sgl.Engine,
+        # except for keys that TorchSpec manages internally.
+        extra_args = getattr(self.args, "sglang_extra_args", None)
+        if extra_args:
+            extra = dict(extra_args) if not isinstance(extra_args, dict) else extra_args
+            blocked = extra.keys() & _PROTECTED_ENGINE_KEYS
+            if blocked:
+                logger.warning(
+                    f"sglang extra_args contains protected keys that will be ignored: "
+                    f"{sorted(blocked)}. These are managed internally by TorchSpec."
+                )
+                extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
+            engine_kwargs.update(extra)
 
         # Avoid nccl_port collisions when multiple engines share the same node
         engine_kwargs["nccl_port"] = get_free_port()

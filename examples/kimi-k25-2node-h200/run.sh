@@ -64,7 +64,7 @@ python3 -m torchspec.train_entry \
   inference.inference_num_gpus="$INFERENCE_GPUS" \
   inference.inference_num_gpus_per_engine="$INFERENCE_GPUS" \
   inference.inference_num_gpus_per_node="$INFERENCE_GPUS" \
-  sglang.sglang_tp_size="$INFERENCE_GPUS" \
+  inference.sglang.tp_size="$INFERENCE_GPUS" \
   model.draft_model_config="$ROOT_DIR/configs/draft_models/kimi_k25_eagle3.json" \
   dataset.last_turn_loss_only=true \
   "$@"

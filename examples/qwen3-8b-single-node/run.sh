@@ -63,7 +63,7 @@ python3 -m torchspec.train_entry \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
-    sglang.sglang_tp_size=2 \
+    inference.sglang.tp_size=2 \
     "$@"
 
 echo "=============================================="

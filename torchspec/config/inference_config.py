@@ -18,18 +18,77 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Disaggregated training configuration classes.
+"""Inference configuration classes.
 
-These configs are specifically used for the controller/inference components
-of disaggregated training.
+SGLangConfig exposes only the fields that TorchSpec actually references.
+Power users can pass arbitrary extra kwargs to sgl.Engine via ``extra_args``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from torchspec.config.mooncake_config import MooncakeConfig
+
+
+@dataclass
+class SGLangConfig:
+    """Essential SGLang engine configuration.
+
+    Only fields that TorchSpec explicitly uses are listed here.
+    Any additional sgl.Engine kwargs can be supplied via ``extra_args``
+    and will be forwarded as-is.
+    """
+
+    # Parallelism
+    tp_size: int = 8
+    pp_size: int = 1
+    nnodes: int = 1
+
+    # Memory & context
+    mem_fraction_static: float = 0.8
+    context_length: Optional[int] = None
+
+    # Engine options
+    attention_backend: str = "flashinfer"
+    quantization: Optional[str] = None
+    kv_cache_dtype: Optional[str] = None
+    moe_runner_backend: Optional[str] = None
+    model_loader_extra_config: Any = None
+    disable_cuda_graph: bool = True
+    disable_flashinfer_autotune: bool = False
+    enable_multimodal: bool = False
+    enable_metrics: bool = False
+
+    # Networking
+    port: int = 30000
+    additional_ports: int = 4
+    dist_init_addr: Optional[str] = None
+    dist_timeout: int = 20
+    init_timeout: int = 300
+
+    # Logging
+    log_level: str = "warning"
+    log_requests: bool = False
+    log_requests_level: int = 0
+
+    # Passthrough: forwarded as-is to sgl.Engine for power users
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class InferenceConfig:
+    aux_hidden_states_layers: Optional[list] = None
+    inference_batch_size: int = 1
+    inference_buffer_threshold: int = 32
+    inference_engine_type: str = "hf"
+    inference_fetch_batch: int = 1
+    inference_num_gpus: Optional[int] = None
+    inference_num_gpus_per_engine: int = 1
+    inference_num_gpus_per_node: int = 8
+    max_sample_pool_size: int = 0
+    sglang: SGLangConfig = field(default_factory=SGLangConfig)
 
 
 @dataclass

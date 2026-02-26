@@ -42,7 +42,7 @@ Example (multimodal with image):
 
 Key points:
 
-- Set `chat_template=kimi-k25-vlm` and `sglang_enable_multimodal=True` in your config.
+- Set `chat_template=kimi-k25-vlm` and `inference.sglang.enable_multimodal=true` in your config.
 - Assistant responses should include `<think>...</think>` blocks.
 - For multimodal samples, use OpenAI-style list content with `image_url` or `image` fields — the pipeline extracts URLs for the SGLang engine and replaces image items with `<|image|>` placeholders for tokenization.
 - Plain-string `<|image|>` placeholders tokenize correctly but won't send pixel data to the engine — always use list-of-dicts content for multimodal samples.

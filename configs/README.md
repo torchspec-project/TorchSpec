@@ -34,7 +34,7 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `dataset` | `train_data_path`, `chat_template` | Training data and tokenization |
 | `training` | `learning_rate`, `micro_batch_size`, `ttt_length` | Training hyperparameters |
 | `inference` | `inference_engine_type`, `inference_num_gpus` | Inference backend configuration |
-| `sglang` | `sglang_tp_size`, `sglang_mem_fraction_static` | SGLang-specific settings |
+| `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
 
 ## Draft model configs

@@ -45,31 +45,31 @@ inference:
   max_sample_pool_size: 0
   inference_buffer_threshold: 8
   inference_batch_size: 4
-
-sglang:
-  sglang_tp_size: 8
-  sglang_nnodes: 1
-  sglang_dist_init_addr: null
-  sglang_mem_fraction_static: 0.6
-  sglang_additional_ports: 4
-  sglang_context_length: 262144
-  sglang_model_loader_extra_config:
-    enable_multithread_load: true
-    num_threads: 32
-  sglang_disable_flashinfer_autotune: true
-  sglang_init_timeout: 1800
-  sglang_dist_timeout: 600
-  sglang_watchdog_timeout: 1800
-  sglang_log_requests: false
-  sglang_log_requests_level: 0
-  sglang_enable_multimodal: true
+  sglang:
+    tp_size: 8
+    nnodes: 1
+    dist_init_addr: null
+    mem_fraction_static: 0.6
+    additional_ports: 4
+    context_length: 262144
+    model_loader_extra_config:
+      enable_multithread_load: true
+      num_threads: 32
+    disable_flashinfer_autotune: true
+    init_timeout: 1800
+    dist_timeout: 600
+    log_requests: false
+    log_requests_level: 0
+    enable_multimodal: true
+    extra_args:
+      watchdog_timeout: 1800
 
 mooncake:
   master_server_address: null
   metadata_server: null
   hidden_dim: 7168
   protocol: tcp # Change this to RDMA for good performance.
-  global_segment_size: 16GB
+  global_segment_size: 48GB
   local_buffer_size: 8GB
   device_name: mlx5_0
   host_buffer_pool_size: 4
