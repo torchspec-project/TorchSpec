@@ -48,7 +48,7 @@ def _is_port_available(port):
 
 
 def get_free_port(start_port=10000, consecutive=1):
-    port = start_port
+    # Find the first port >= start_port such that `consecutive` sequential ports are all available.    port = start_port
     while not all(_is_port_available(port + i) for i in range(consecutive)):
         port += 1
     return port
