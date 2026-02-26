@@ -57,23 +57,23 @@ try:
     def _patch_cutlass_compilation() -> None:
         """Two patches to reduce flash_attn cute DSL compilation overhead.
 
-        Patch 1 -- Disk cache (BaseDSL.compile_and_cache):
+        Patch 1 — Disk cache (BaseDSL.compile_and_cache):
             flash_attn hardcodes no_cache=True, bypassing CUTE_DSL_CACHE_DIR.
             Overriding to False lets compiled cubins be written on the first run
             and read back on every subsequent process start (seconds, not minutes).
             Set CUTE_DSL_CACHE_DIR to a persistent path to survive reboots:
                 export CUTE_DSL_CACHE_DIR=/scratch/$USER/cutlass_cache
 
-        Patch 2 -- Compilation opt-level (Compiler._compile):
+        Patch 2 — Compilation opt-level (Compiler._compile):
             flash_attn passes options="--enable-tvm-ffi" with no explicit
             --opt-level, so the parser default (3) is used. Lower levels reduce
             LLVM-IR and ptxas work at the cost of slightly slower kernels.
 
             Controlled by TORCHSPEC_FLASH_ATTN_OPT_LEVEL (default: 3):
-              3  - current default; ~12 min; fastest kernel
-              2  - ~6-8 min; <5% slower kernel  (recommended for training)
-              1  - ~3-5 min; ~15% slower kernel
-              0  - ~1-2 min; ~50% slower kernel  (debugging only)
+              3  – current default; ~12 min; fastest kernel
+              2  – ~6–8 min; <5% slower kernel  (recommended for training)
+              1  – ~3–5 min; ~15% slower kernel
+              0  – ~1–2 min; ~50% slower kernel  (debugging only)
 
             TORCHSPEC_FLASH_ATTN_PTXAS_OPT controls ptxas separately
             (default: 3). Use 1 for additional compile-time savings when
@@ -532,6 +532,64 @@ def _snap_to_multiple(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
 
+def _snap_to_power_of_2(n: int, min_val: int = 128) -> int:
+    """Round *n* up to the next power of 2, at least *min_val*."""
+    n = max(n, min_val)
+    return 1 << (n - 1).bit_length()
+
+
+# ---------------------------------------------------------------------------
+# EAGLE3 mask_mod mode selection
+# ---------------------------------------------------------------------------
+# Available modes (SM100+ only; SM90 always uses "closure"):
+#   "seqlen_po2" - (default) read Q_LEN from seqlen_info, bitmask modulo.
+#                  Requires power-of-2 Q_LEN.  Single compiled kernel.
+#   "seqlen"     - read Q_LEN from seqlen_info, runtime integer modulo.
+#                  Single compiled kernel but ~1.5-3x slower per-call.
+#   "dynamic"    - read Q_LEN from aux_tensors.  Single compiled kernel
+#                  but vec_size penalty (fwd: 2->1, bwd: 4->1).
+#   "simple"     - closure-captured Q_LEN without valid_seq_len checks.
+#                  One kernel per Q_LEN bucket (same as "closure" but fewer ops).
+#   "closure"    - original closure-captured Q_LEN + valid_seq_len.
+#                  One kernel per Q_LEN bucket.  Used on SM90.
+_VALID_MASK_MODES = {"seqlen_po2", "seqlen", "dynamic", "simple", "closure"}
+_EAGLE3_MASK_MODE: str = "seqlen_po2"
+
+
+def set_eagle3_mask_mode(mode: str) -> None:
+    """Set the EAGLE3 mask_mod strategy for SM100+.
+
+    Has no effect on SM90 (always uses "closure").
+    Valid modes: "seqlen_po2", "seqlen", "dynamic", "simple", "closure".
+    """
+    global _EAGLE3_MASK_MODE
+    if mode not in _VALID_MASK_MODES:
+        raise ValueError(f"Unknown eagle3 mask mode {mode!r}, must be one of {_VALID_MASK_MODES}")
+    _EAGLE3_MASK_MODE = mode
+
+
+def get_eagle3_mask_mode() -> str:
+    """Return the current EAGLE3 mask_mod strategy."""
+    return _EAGLE3_MASK_MODE
+
+
+def _effective_mask_mode() -> str:
+    """Return the effective mask mode, accounting for SM90 override."""
+    if _cuda_sm_major == 9:
+        return "closure"
+    return _EAGLE3_MASK_MODE
+
+
+def _snap_q_len(q_len: int, mode: str) -> int:
+    """Snap *q_len* to the bucket size required by *mode*.
+
+    "seqlen_po2" requires power-of-2 Q_LEN; all other modes use _SNAP_Q alignment.
+    """
+    if mode == "seqlen_po2":
+        return _snap_to_power_of_2(q_len)
+    return _snap_to_multiple(q_len, _SNAP_Q)
+
+
 # Caches for cute.jit mask_mod functions.
 # _flash_mask_mod_cache: (Q_LEN, valid_seq_len) -> compiled mask_mod (SM90).
 # _flash_mask_mod_simple_cache: Q_LEN -> compiled mask_mod (SM100+, no valid_seq_len).
@@ -635,6 +693,143 @@ def _make_eagle3_flash_mask_mod_simple(Q_LEN: int):
     return _eagle3_mask_mod
 
 
+_eagle3_flash_mask_mod_dynamic = None
+
+
+def _make_eagle3_flash_mask_mod_dynamic():
+    """Build a single cute.jit mask_mod that reads Q_LEN from aux_tensors at runtime.
+
+    Unlike _make_eagle3_flash_mask_mod_simple which captures Q_LEN as a closure
+    variable (compile-time constant, one kernel per Q_LEN bucket), this version
+    reads Q_LEN from aux_tensors[0] at runtime, enabling a single compiled kernel
+    for all Q_LEN values.
+
+    Trade-off: avoids per-bucket recompilation, but has_aux_tensors=True reduces
+    vec_size (fwd: 2->1, bwd: 4->1) and Q_LEN becomes a runtime value (global
+    memory read + loss of constant folding / branch elimination).
+    """
+    global _eagle3_flash_mask_mod_dynamic
+    if _eagle3_flash_mask_mod_dynamic is not None:
+        return _eagle3_flash_mask_mod_dynamic
+
+    if not _has_cute_dsl:
+        return None
+
+    @cute.jit
+    def _eagle3_mask_mod(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        q_idx: cute.TensorSSA,
+        kv_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors,
+    ) -> cute.TensorSSA:
+        # Read Q_LEN from aux_tensors[0] (a 1-element Int32 tensor)
+        q_len_ssa = fa_cute_utils.scalar_to_ssa(aux_tensors[0][0], cutlass.Int32)
+        zero_ssa = fa_cute_utils.scalar_to_ssa(0, cutlass.Int32)
+        in_k0 = kv_idx < q_len_ssa
+        causal_part = in_k0 & (q_idx >= kv_idx)
+        in_suffix = kv_idx >= q_len_ssa
+        diff = kv_idx - q_idx
+        suffix_part = in_suffix & ((diff % q_len_ssa) == zero_ssa)
+        return causal_part | suffix_part
+
+    _eagle3_mask_mod.__name__ = "eagle3_flash_mask_dynamic"
+    _eagle3_flash_mask_mod_dynamic = _eagle3_mask_mod
+    return _eagle3_mask_mod
+
+
+_eagle3_flash_mask_mod_seqlen = None
+
+
+def _make_eagle3_flash_mask_mod_seqlen():
+    """Build a single cute.jit mask_mod that reads Q_LEN from seqlen_info.seqlen_q.
+
+    The flash_attn compile cache key includes mask_mod_hash (from closure variables)
+    but NOT tensor shapes (seqlen dimensions are dynamic). This means:
+    - Closure approach: different Q_LEN -> different closure -> different hash -> recompile.
+    - This approach: single function, no closure -> fixed hash -> single compiled kernel.
+
+    seqlen_info.seqlen_q == Q_LEN because we call _flash_attn_fwd with q of shape
+    [bsz, q_len, num_heads, head_dim] and no cu_seqlens_q/seqused_q.
+
+    No aux_tensors needed -> no vec_size penalty (fwd: 2, bwd: 4 unchanged).
+    """
+    global _eagle3_flash_mask_mod_seqlen
+    if _eagle3_flash_mask_mod_seqlen is not None:
+        return _eagle3_flash_mask_mod_seqlen
+
+    if not _has_cute_dsl:
+        return None
+
+    @cute.jit
+    def _eagle3_mask_mod(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        q_idx: cute.TensorSSA,
+        kv_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors: None,
+    ) -> cute.TensorSSA:
+        q_len_ssa = fa_cute_utils.scalar_to_ssa(seqlen_info.seqlen_q, cutlass.Int32)
+        zero_ssa = fa_cute_utils.scalar_to_ssa(0, cutlass.Int32)
+        in_k0 = kv_idx < q_len_ssa
+        causal_part = in_k0 & (q_idx >= kv_idx)
+        in_suffix = kv_idx >= q_len_ssa
+        diff = kv_idx - q_idx
+        suffix_part = in_suffix & ((diff % q_len_ssa) == zero_ssa)
+        return causal_part | suffix_part
+
+    _eagle3_mask_mod.__name__ = "eagle3_flash_mask_seqlen"
+    _eagle3_flash_mask_mod_seqlen = _eagle3_mask_mod
+    return _eagle3_mask_mod
+
+
+_eagle3_flash_mask_mod_seqlen_po2 = None
+
+
+def _make_eagle3_flash_mask_mod_seqlen_po2():
+    """Mask_mod reading Q_LEN from seqlen_info.seqlen_q, using bitmask for modulo.
+
+    Requires Q_LEN to be a power of 2 (use _snap_to_power_of_2 for bucketing).
+    Replaces the expensive runtime `diff % Q_LEN == 0` with `diff & (Q_LEN-1) == 0`,
+    which is a single AND instruction.
+
+    Combined with reading Q_LEN from seqlen_info (no aux_tensors -> no vec_size penalty),
+    this should match or approach closure-captured compile-time constant performance.
+    """
+    global _eagle3_flash_mask_mod_seqlen_po2
+    if _eagle3_flash_mask_mod_seqlen_po2 is not None:
+        return _eagle3_flash_mask_mod_seqlen_po2
+
+    if not _has_cute_dsl:
+        return None
+
+    @cute.jit
+    def _eagle3_mask_mod(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        q_idx: cute.TensorSSA,
+        kv_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors: None,
+    ) -> cute.TensorSSA:
+        q_len_ssa = fa_cute_utils.scalar_to_ssa(seqlen_info.seqlen_q, cutlass.Int32)
+        one_ssa = fa_cute_utils.scalar_to_ssa(1, cutlass.Int32)
+        zero_ssa = fa_cute_utils.scalar_to_ssa(0, cutlass.Int32)
+        mask_ssa = q_len_ssa - one_ssa  # Q_LEN - 1 = bitmask for power-of-2
+        in_k0 = kv_idx < q_len_ssa
+        causal_part = in_k0 & (q_idx >= kv_idx)
+        in_suffix = kv_idx >= q_len_ssa
+        diff = kv_idx - q_idx
+        suffix_part = in_suffix & ((diff & mask_ssa) == zero_ssa)
+        return causal_part | suffix_part
+
+    _eagle3_mask_mod.__name__ = "eagle3_flash_mask_seqlen_po2"
+    _eagle3_flash_mask_mod_seqlen_po2 = _eagle3_mask_mod
+    return _eagle3_mask_mod
+
+
 def _build_eagle3_mask_pair(
     q_len: int,
     kv_len: int,
@@ -642,8 +837,16 @@ def _build_eagle3_mask_pair(
     lck: int,
     device: torch.device,
 ) -> tuple:
-    """Return (mask_mod_cute, mask_mod_flex) for the current SM architecture."""
-    if _cuda_sm_major == 9:
+    """Return (mask_mod_cute, mask_mod_flex, aux_tensors) for the current SM architecture.
+
+    SM90: always uses "closure" mode (block_sparse backward required).
+    SM100+: uses the mode selected by set_eagle3_mask_mode().
+    """
+    mode = _effective_mask_mode()
+    mask_mod_flex = None
+    aux_tensors = None
+
+    if mode == "closure":
         mask_mod_cute = _make_eagle3_flash_mask_mod(q_len, q_len)
         seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
         mask_mod_flex = generate_eagle3_mask(
@@ -652,10 +855,19 @@ def _build_eagle3_mask_pair(
             KV_LEN=kv_len,
             lck=lck,
         )
-    else:
+    elif mode == "simple":
         mask_mod_cute = _make_eagle3_flash_mask_mod_simple(q_len)
-        mask_mod_flex = None
-    return mask_mod_cute, mask_mod_flex
+    elif mode == "dynamic":
+        mask_mod_cute = _make_eagle3_flash_mask_mod_dynamic()
+        aux_tensors = [torch.tensor([q_len], dtype=torch.int32, device=device)]
+    elif mode == "seqlen":
+        mask_mod_cute = _make_eagle3_flash_mask_mod_seqlen()
+    elif mode == "seqlen_po2":
+        mask_mod_cute = _make_eagle3_flash_mask_mod_seqlen_po2()
+    else:
+        raise ValueError(f"Unknown eagle3 mask mode {mode!r}")
+
+    return mask_mod_cute, mask_mod_flex, aux_tensors
 
 
 # Two-level cache for SM90 backward block-sparse tensors.
@@ -728,7 +940,9 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_len):
+    def forward(
+        ctx, q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_len, aux_tensors=None
+    ):
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -737,6 +951,7 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             causal=False,
             mask_mod=mask_mod_cute,
             return_lse=True,
+            aux_tensors=aux_tensors,
         )
 
         bwd_block_sparse = None
@@ -750,6 +965,7 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.mask_mod_cute = mask_mod_cute
         ctx.bwd_block_sparse = bwd_block_sparse
+        ctx.aux_tensors = aux_tensors
         return out
 
     @staticmethod
@@ -766,8 +982,9 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             causal=False,
             mask_mod=ctx.mask_mod_cute,
             block_sparse_tensors=ctx.bwd_block_sparse,
+            aux_tensors=ctx.aux_tensors,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 class LlamaAttention(nn.Module):
@@ -835,6 +1052,7 @@ class LlamaAttention(nn.Module):
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "llama3":
+                # for nv type
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
@@ -886,7 +1104,7 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if not use_cache:
-            # Standard path -- no caching
+            # Standard path — no caching
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
                 cos, sin = self.rotary_emb(query_states, position_ids)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -917,7 +1135,7 @@ class LlamaAttention(nn.Module):
             )
 
         else:
-            # Cached path -- cache_keys shape: [bsz, num_heads, num_cached, seq_len, head_dim]
+            # Cached path — cache_keys shape: [bsz, num_heads, num_cached, seq_len, head_dim]
             lck = 0 if cache_keys is None else cache_keys.shape[2]
 
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
@@ -1051,8 +1269,8 @@ class LlamaFlexAttention(LlamaAttention):
         # Shrink the attention mask to align with the padding to the right.
         # This is equivalent to the shrinking logic in eagle3.py
         seq_lengths -= lck
-        # Workaround: use uncompiled create_block_mask for short sequences
-        # until https://github.com/pytorch/pytorch/issues/160018 is resolved.
+        # TODO: Remove the usage of uncompiled create_block_mask after
+        # https://github.com/pytorch/pytorch/issues/160018
         if q_len <= 128:
             create_block_mask_func = create_block_mask
             flex_attention_func = flex_attention
@@ -1233,9 +1451,10 @@ class LlamaFlashAttentionMasked(LlamaAttention):
                 "and the cutlass DSL (pip install cutlass-dsl)"
             )
 
-        # Snap q_len to the next multiple of _SNAP_Q so every batch in the same
-        # bucket shares the same compiled flash_attn kernel.
-        q_len = _snap_to_multiple(orig_q_len, _SNAP_Q)
+        # Snap q_len so every batch in the same bucket shares the same compiled
+        # flash_attn kernel.  "seqlen_po2" requires power-of-2 Q_LEN;
+        # all other modes only need _SNAP_Q alignment.
+        q_len = _snap_q_len(orig_q_len, _effective_mask_mode())
         pad_sz = q_len - orig_q_len
         if pad_sz > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_sz))
@@ -1288,7 +1507,7 @@ class LlamaFlashAttentionMasked(LlamaAttention):
         v_all = cache_values.reshape(bsz, -1, self.num_key_value_heads, self.head_dim)
 
         max_seq_len = q_len
-        mask_mod_cute, mask_mod_flex = _build_eagle3_mask_pair(
+        mask_mod_cute, mask_mod_flex, aux_tensors = _build_eagle3_mask_pair(
             q_len,
             k_all.shape[1],
             bsz,
@@ -1304,6 +1523,7 @@ class LlamaFlashAttentionMasked(LlamaAttention):
             mask_mod_flex,
             1.0 / math.sqrt(self.head_dim),
             max_seq_len,
+            aux_tensors,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
@@ -1324,43 +1544,52 @@ def warmup_flash_attention_masked(
 ) -> None:
     """Pre-compile flash_attn cute DSL kernels for LlamaFlashAttentionMasked.
 
-    Runs a fwd+bwd warmup for each _SNAP_Q-aligned Q_LEN bucket to populate
-    the in-process compile caches (_flash_attn_fwd.compile_cache /
-    _flash_attn_bwd.compile_cache), so training step 0 avoids compilation.
+    Runs a fwd+bwd warmup to populate the in-process compile caches
+    (_flash_attn_fwd.compile_cache / _flash_attn_bwd.compile_cache),
+    so training step 0 avoids compilation.
 
-    Each bucket produces a distinct compiled kernel because Q_LEN is baked into
-    the cute.jit closure. All TTT lck values within a bucket share the same
-    compile_key, so one fwd+bwd call per bucket suffices.
+    SM90:  Each Q_LEN bucket produces a distinct compiled kernel (closure-captured
+           Q_LEN). All lck values within a bucket share the same compile_key, so
+           one fwd+bwd call per bucket suffices.
+    SM100+: A single kernel handles all Q_LEN values (seqlen_po2 reads Q_LEN from
+            seqlen_info at runtime). Only one fwd+bwd call is needed regardless
+            of the number of buckets.
 
     Args:
         warmup_buckets: Q_LEN values to pre-compile. Default (None) warms up
-            only the max bucket, which is correct for fixed-length training.
-            For variable-length training, pass explicit bucket sizes.
-            _SNAP_Q (128) is always included as the minimum useful bucket.
+            only the max bucket (SM90) or a single representative (SM100+).
+            For SM90 variable-length training, pass explicit bucket sizes.
     """
     if not _has_cute_dsl or _flash_attn_fwd is None:
         return
     if device is None:
         device = torch.cuda.current_device()
 
-    max_bucket = _snap_to_multiple(q_len, _SNAP_Q)
-
-    if warmup_buckets is None:
-        buckets = sorted({_SNAP_Q, max_bucket})
+    mode = _effective_mask_mode()
+    # Modes with closure-captured Q_LEN need one warmup per bucket;
+    # runtime-Q_LEN modes ("seqlen_po2", "seqlen", "dynamic") need only one.
+    needs_per_bucket = mode in ("closure", "simple")
+    if needs_per_bucket:
+        max_bucket = _snap_to_multiple(q_len, _SNAP_Q)
+        if warmup_buckets is None:
+            buckets = sorted({_SNAP_Q, max_bucket})
+        else:
+            buckets = sorted(
+                {_SNAP_Q, max_bucket} | {_snap_to_multiple(b, _SNAP_Q) for b in warmup_buckets}
+            )
     else:
-        buckets = sorted(
-            {_SNAP_Q, max_bucket} | {_snap_to_multiple(b, _SNAP_Q) for b in warmup_buckets}
-        )
+        # Single compiled kernel for all Q_LEN values.
+        buckets = [_SNAP_Q]
 
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     print_with_rank(
         f"Warming up flash_attn cute DSL kernels "
-        f"({len(buckets)} Q_LEN bucket(s): {buckets}, sm_major={_cuda_sm_major})..."
+        f"({len(buckets)} Q_LEN bucket(s): {buckets}, mode={mode}, sm_major={_cuda_sm_major})..."
     )
 
     for warmup_q_len in buckets:
-        mask_mod_cute, mask_mod_flex = _build_eagle3_mask_pair(
+        mask_mod_cute, mask_mod_flex, aux_tensors = _build_eagle3_mask_pair(
             warmup_q_len,
             warmup_q_len,
             1,
@@ -1374,7 +1603,7 @@ def warmup_flash_attention_masked(
         k_t = torch.randn(1, warmup_q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v_t = torch.randn(1, warmup_q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         out = _EagleMaskedFlashAttnFunc.apply(
-            q_t, k_t, v_t, mask_mod_cute, mask_mod_flex, softmax_scale, warmup_q_len
+            q_t, k_t, v_t, mask_mod_cute, mask_mod_flex, softmax_scale, warmup_q_len, aux_tensors
         )
         out.sum().backward()
         del q_t, k_t, v_t, out
@@ -1452,10 +1681,10 @@ class LlamaDecoderLayer(nn.Module):
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "fa":
             self.self_attn = LlamaFlashAttention(config=config)
-        elif attention_backend == "fa_masked":
+        elif attention_backend == "fa_experimental":
             print_with_rank(
                 "[EXPERIMENTAL] Using LlamaFlashAttentionMasked (flash-attention cute DSL). "
-                "Validated on SM80/SM90. SM100 backward path is untested."
+                "Validated on SM80/SM90/SM100."
             )
             self.self_attn = LlamaFlashAttentionMasked(config=config)
         else:
