@@ -34,8 +34,66 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `dataset` | `train_data_path`, `chat_template` | Training data and tokenization |
 | `training` | `learning_rate`, `micro_batch_size`, `ttt_length` | Training hyperparameters |
 | `inference` | `inference_engine_type`, `inference_num_gpus` | Inference backend configuration |
-| `sglang` | `sglang_tp_size`, `sglang_mem_fraction_static` | SGLang-specific settings |
+| `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
+
+## SGLang engine configuration
+
+SGLang settings live under `inference.sglang` and are split into two tiers:
+
+### Essential fields
+
+Only fields that TorchSpec reads for its own logic live here. Everything else goes in `extra_args`.
+
+```yaml
+inference:
+  sglang:
+    tp_size: 8
+    mem_fraction_static: 0.6
+    nnodes: 2
+    dist_timeout: 600
+    enable_metrics: true
+```
+
+| Field | Default | Why it's here |
+|-------|---------|---------------|
+| `tp_size` | 8 | Factory validates it against `nnodes × gpus_per_engine`; engine uses it to compute the total TP degree |
+| `pp_size` | 1 | Engine asserts `pp_size == 1` (only prefill, no pipeline parallelism) |
+| `nnodes` | 1 | Factory uses it to decide single-node vs multi-node topology, replica count, and `dist_init_addr` auto-negotiation |
+| `mem_fraction_static` | 0.8 | Passed to `sgl.Engine` as a protected key — TorchSpec manages it so `extra_args` cannot accidentally override it |
+| `enable_metrics` | false | Read by TorchSpec's wandb integration to decide whether to scrape SGLang's metrics endpoint |
+| `dist_init_addr` | null | Factory auto-negotiates it via Ray when null; multi-node engines receive it at `init()` time |
+| `dist_timeout` | 60 | Engine sets it in `engine_kwargs` only for multi-node TP (`nnodes > 1`) |
+| `init_timeout` | 300 | Factory uses it as the `ray.get()` timeout when waiting for engine initialization |
+
+### `extra_args`: sgl.Engine passthrough
+
+Any `sgl.Engine` keyword argument that TorchSpec doesn't need to inspect can be passed via `extra_args`. These are forwarded as-is to the engine constructor. A few overridable defaults are applied before `extra_args` (e.g. `log_level` defaults to `"warning"`), so you can override them here.
+
+```yaml
+inference:
+  sglang:
+    tp_size: 8
+    enable_multimodal: true
+    extra_args:
+      context_length: 262144
+      attention_backend: flashinfer
+      quantization: fp8
+      disable_flashinfer_autotune: true
+      watchdog_timeout: 1800
+      enable_torch_compile: true
+      log_level: info            # override the "warning" default
+```
+
+Or via CLI:
+
+```bash
+python -m torchspec.train_entry --config my.yaml inference.sglang.extra_args.watchdog_timeout=1800
+```
+
+### Protected keys
+
+Some `sgl.Engine` parameters are always set by TorchSpec after `extra_args` is applied, so they cannot be overridden. If you put one of the commonly confused keys in `extra_args` (`model_path`, `tp_size`, `mem_fraction_static`, `nnodes`, `port`, `nccl_port`, `dist_init_addr`, `dist_timeout`), a warning is logged and the value is dropped. Other internally managed keys (e.g. `disable_radix_cache`, `enable_return_hidden_states`, `base_gpu_id`) are silently overwritten by the same mechanism without a warning since they're unlikely to appear in user configs.
 
 ## Draft model configs
 

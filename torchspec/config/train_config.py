@@ -26,6 +26,8 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
+from torchspec.config.inference_config import InferenceConfig
+
 
 @dataclass
 class DatasetConfig:
@@ -59,19 +61,6 @@ class DebugConfig:
 
 
 @dataclass
-class InferenceConfig:
-    aux_hidden_states_layers: Optional[list] = None
-    inference_batch_size: int = 1
-    inference_buffer_threshold: int = 32
-    inference_engine_type: str = "hf"
-    inference_fetch_batch: int = 1
-    inference_num_gpus: Optional[int] = None
-    inference_num_gpus_per_engine: int = 1
-    inference_num_gpus_per_node: int = 8
-    max_sample_pool_size: int = 0
-
-
-@dataclass
 class LoggingConfig:
     report_to: str = "none"
     use_tensorboard: bool = False
@@ -95,76 +84,6 @@ class ModelConfig:
     target_model_backend: str = "sglang"
     target_model_path: str = ""
     trust_remote_code: bool = False
-
-
-@dataclass
-class SGLangConfig:
-    sglang_additional_ports: int = 4
-    sglang_attention_backend: str = "flashinfer"
-    sglang_base_gpu_id: int = 0
-    sglang_chunked_prefill_size: Optional[int] = None
-    sglang_constrained_json_whitespace_pattern: Optional[str] = None
-    sglang_context_length: Optional[int] = None
-    sglang_data_parallel_size: int = 1
-    sglang_disable_cuda_graph: bool = True
-    sglang_disable_cuda_graph_padding: bool = False
-    sglang_disable_custom_all_reduce: bool = False
-    sglang_disable_disk_cache: bool = False
-    sglang_disable_flashinfer: bool = False
-    sglang_disable_flashinfer_autotune: bool = False
-    sglang_disable_flashinfer_sampling: bool = False
-    sglang_disable_mla: bool = False
-    sglang_disable_nan_detection: bool = False
-    sglang_disable_outlines_disk_cache: bool = False
-    sglang_disable_radix_cache: bool = False
-    sglang_disable_regex_jump_forward: bool = False
-    sglang_dist_init_addr: Optional[str] = None
-    sglang_dist_timeout: int = 20
-    sglang_download_dir: Optional[str] = None
-    sglang_dp_size: int = 1
-    sglang_enable_dp_attention: bool = False
-    sglang_enable_dp_lm_head: bool = False
-    sglang_enable_metrics: bool = False
-    sglang_enable_mixed_chunk: bool = False
-    sglang_enable_mla: bool = False
-    sglang_enable_multimodal: bool = False
-    sglang_enable_nan_detection: bool = False
-    sglang_enable_nccl_nvls: bool = False
-    sglang_enable_overlap_schedule: bool = False
-    sglang_enable_piecewise_cuda_graph: bool = False
-    sglang_enable_symm_mem: bool = False
-    sglang_enable_torch_compile: bool = True
-    sglang_ep_size: int = 1
-    sglang_expert_parallel_size: int = 1
-    sglang_kv_cache_dtype: Optional[str] = None
-    sglang_init_timeout: int = 300
-    sglang_log_level: str = "warning"
-    sglang_log_level_http: Optional[str] = None
-    sglang_log_requests: bool = False
-    sglang_log_requests_level: int = 0
-    sglang_max_running_requests: Optional[int] = None
-    sglang_max_total_tokens: Optional[int] = None
-    sglang_mem_fraction_static: float = 0.8
-    sglang_model_loader_extra_config: Any = None
-    sglang_moe_runner_backend: Optional[str] = None
-    sglang_nnodes: int = 1
-    sglang_piecewise_cuda_graph_max_tokens: int = 4096
-    sglang_piecewise_cuda_graph_tokens: Optional[str] = None
-    sglang_pipeline_parallel_size: int = 1
-    sglang_port: int = 30000
-    sglang_pp_size: int = 1
-    sglang_quantization: Optional[str] = None
-    sglang_random_seed: Optional[int] = None
-    sglang_router_ip: Optional[str] = None
-    sglang_router_port: Optional[int] = None
-    sglang_router_request_timeout_secs: int = 14400
-    sglang_schedule_policy: str = "lpm"
-    sglang_speculative_draft_attention_backend: Optional[str] = None
-    sglang_server_concurrency: int = 512
-    sglang_show_time_cost: bool = False
-    sglang_tensor_parallel_size: Optional[int] = None
-    sglang_tp_size: int = 8
-    sglang_watchdog_timeout: Optional[float] = None
 
 
 @dataclass
@@ -208,7 +127,6 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     mooncake: dict[str, Any] = field(default_factory=dict)
-    sglang: SGLangConfig = field(default_factory=SGLangConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -288,30 +206,40 @@ Examples:
     return config
 
 
-# Sections whose fields get a name prefix when flattened to args.
+# Sub-sections whose fields receive a name prefix when flattened.
 _PREFIXED_SECTIONS = {
     "mooncake": "mooncake_",
+    "sglang": "sglang_",
 }
 
 
 def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     flat: dict[str, Any] = {}
 
+    def _add(key: str, val: Any, origin: str) -> None:
+        if key in flat:
+            raise ValueError(f"Duplicate config key '{key}' (from '{origin}')")
+        flat[key] = val
+
     for section_name, section in config.items():
-        if isinstance(section, DictConfig):
-            prefix = _PREFIXED_SECTIONS.get(section_name, "")
-            for key, val in section.items():
-                flat_key = f"{prefix}{key}"
-                if flat_key in flat:
-                    raise ValueError(
-                        f"Duplicate config key '{flat_key}' (from section '{section_name}.{key}')"
+        if not isinstance(section, DictConfig):
+            _add(section_name, section, section_name)
+            continue
+
+        prefix = _PREFIXED_SECTIONS.get(section_name, "")
+        for key, val in section.items():
+            # Nested sub-config (e.g. inference.sglang) — flatten with its
+            # own prefix so consumers keep seeing ``sglang_tp_size`` etc.
+            if isinstance(val, DictConfig) and key in _PREFIXED_SECTIONS:
+                sub_prefix = _PREFIXED_SECTIONS[key]
+                for sub_key, sub_val in val.items():
+                    _add(
+                        f"{sub_prefix}{sub_key}",
+                        sub_val,
+                        f"{section_name}.{key}.{sub_key}",
                     )
-                flat[flat_key] = val
-        else:
-            # Top-level fields (output_dir, cache_dir, etc.)
-            if section_name in flat:
-                raise ValueError(f"Duplicate config key '{section_name}'")
-            flat[section_name] = section
+            else:
+                _add(f"{prefix}{key}", val, f"{section_name}.{key}")
 
     # --- Computed / alias fields ---
     flat["world_size"] = flat["training_num_nodes"] * flat["training_num_gpus_per_node"]

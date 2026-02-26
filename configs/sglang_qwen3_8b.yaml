@@ -41,15 +41,12 @@ inference:
   inference_num_gpus: 1
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 1
-    # Flow control: limit max samples in pool to prevent Mooncake overflow
   max_sample_pool_size: 64       # Max samples in controller pool
   inference_buffer_threshold: 32     # Fetch prompts when buffer < threshold
   inference_batch_size: 8
-
-sglang:
-  sglang_tp_size: 1
-  sglang_mem_fraction_static: 0.7
-  sglang_additional_ports: 4
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
 
 mooncake:
   master_server_address: null

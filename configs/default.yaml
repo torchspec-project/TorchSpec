@@ -26,31 +26,29 @@ training:
   ttt_length: 7
   warmup_ratio: 0.015
 
+inference:
+  sglang:
+    mem_fraction_static: 0.8
+    tp_size: 1
+    dist_timeout: 60
+    extra_args:
+      attention_backend: flashinfer
+      enable_nccl_nvls: false
+      enable_symm_mem: false
+      enable_torch_compile: true
+      enable_dp_attention: false
+      enable_dp_lm_head: false
+      enable_piecewise_cuda_graph: false
+      piecewise_cuda_graph_max_tokens: 4096
+      piecewise_cuda_graph_tokens: null
+      ep_size: 1
+      max_running_requests: null
+      max_total_tokens: null
+
 logging:
   report_to: none
   wandb_key: null
   wandb_project: null
-
-sglang:
-  sglang_attention_backend: flashinfer
-  sglang_mem_fraction_static: 0.8
-  sglang_context_length: null
-  sglang_enable_nccl_nvls: false
-  sglang_enable_symm_mem: false
-  sglang_enable_torch_compile: true
-  sglang_enable_dp_attention: false
-  sglang_enable_dp_lm_head: false
-  sglang_enable_piecewise_cuda_graph: false
-  sglang_piecewise_cuda_graph_max_tokens: 4096
-  sglang_piecewise_cuda_graph_tokens: null
-  sglang_ep_size: 1
-  sglang_max_running_requests: null
-  sglang_max_total_tokens: null
-  sglang_tp_size: 1
-  sglang_port: 30000
-  sglang_additional_ports: 4
-  sglang_dist_timeout: 20
-
 
 mooncake:
   master_server_address: null

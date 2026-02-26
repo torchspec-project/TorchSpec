@@ -5,7 +5,8 @@
 ```
 torchspec/
 ├── config/                  # Configuration system (OmegaConf-based)
-│   ├── train_config.py      #   Hierarchical dataclass configs (8 sections + Config root)
+│   ├── train_config.py      #   Hierarchical dataclass configs (7 sections + Config root)
+│   ├── inference_config.py  #   InferenceConfig + SGLangConfig (essential fields + extra_args passthrough)
 │   ├── mooncake_config.py   #   Mooncake runtime config (env-var, auto-calculated sizes)
 │   └── utils.py             #   Config loading utilities
 ├── ray/                     # Ray infrastructure (shared across all packages)
@@ -213,15 +214,15 @@ inference:
   inference_engine_type: hf       # or "sgl"
   inference_batch_size: 1
   inference_num_gpus: 4
+  sglang:                         # nested under inference
+    tp_size: 8
+    extra_args:                   # power-user passthrough to sgl.Engine
+      attention_backend: flashinfer
 
 mooncake:
   master_addr: null
   protocol: rdma                  # or "tcp"
   host_buffer_size: 32GB
-
-sglang:
-  sglang_tp_size: 8
-  sglang_attention_backend: flashinfer
 
 logging:
   report_to: wandb
@@ -306,7 +307,8 @@ python train.py --config base.yaml --config experiment.yaml training.learning_ra
 
 | Module | Purpose |
 |--------|-------|
-| `torchspec/config/train_config.py` | `Config` root + 8 typed dataclass sections (`DatasetConfig`, `DebugConfig`, `InferenceConfig`, `LoggingConfig`, `ModelConfig`, `SGLangConfig`, `TrainingConfig`, plus `mooncake: dict`) |
+| `torchspec/config/train_config.py` | `Config` root + 7 typed dataclass sections (`DatasetConfig`, `DebugConfig`, `InferenceConfig`, `LoggingConfig`, `ModelConfig`, `TrainingConfig`, plus `mooncake: dict`) |
+| `torchspec/config/inference_config.py` | `InferenceConfig`, `SGLangConfig` (essential fields + `extra_args` passthrough), `HFInferenceConfig` |
 | `torchspec/config/mooncake_config.py` | `MooncakeConfig` with env-var support and `from_flat_args()` |
 | `torchspec/config/utils.py` | Config loading helpers, `generate_draft_model_config` |
 

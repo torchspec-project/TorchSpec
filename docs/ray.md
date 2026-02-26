@@ -131,18 +131,18 @@ The PACK placement strategy spreads them across nodes automatically.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `training_num_nodes` | 1 | Number of training nodes |
-| `training_num_gpus_per_node` | 1 | GPUs per training node |
+| `training.training_num_nodes` | 1 | Number of training nodes |
+| `training.training_num_gpus_per_node` | 1 | GPUs per training node |
 
 ### Inference across nodes (SglEngine multi-node TP)
 
 When a single model is too large for one node, SglEngine supports multi-node
-tensor parallelism via `sglang_nnodes`.
+tensor parallelism via `inference.sglang.nnodes`.
 
 ```
 Example: 16-GPU TP across 2 nodes, 8 GPUs each
 
-  inference_num_gpus=16, sglang_nnodes=2, inference_num_gpus_per_node=8
+  inference.inference_num_gpus=16, inference.sglang.nnodes=2, inference.inference_num_gpus_per_node=8
 
   Factory creates 2 SglEngine actors (one per node):
     engine 0: node_rank=0 (head)   — accepts generate() calls
@@ -151,11 +151,11 @@ Example: 16-GPU TP across 2 nodes, 8 GPUs each
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `sglang_nnodes` | 1 | Nodes per inference replica |
-| `inference_num_gpus` | 1 | Total inference GPUs across all nodes |
-| `inference_num_gpus_per_node` | 8 | GPUs per inference node |
-| `sglang_dist_init_addr` | auto | Override dist init address (auto-negotiated if unset) |
-| `sglang_dist_timeout` | 600 | Dist init timeout in seconds |
+| `inference.sglang.nnodes` | 1 | Nodes per inference replica |
+| `inference.inference_num_gpus` | 1 | Total inference GPUs across all nodes |
+| `inference.inference_num_gpus_per_node` | 8 | GPUs per inference node |
+| `inference.sglang.dist_init_addr` | auto | Override dist init address (auto-negotiated if unset) |
+| `inference.sglang.dist_timeout` | 60 | Dist init timeout in seconds |
 
 ### Example: 3-node layout
 
@@ -164,6 +164,6 @@ Node 0 (head):   Ray head + 4 training GPUs
 Node 1 (worker): 8 inference GPUs (TP node_rank=0, head)
 Node 2 (worker): 8 inference GPUs (TP node_rank=1, worker)
 
-training_num_nodes=1, training_num_gpus_per_node=4
-inference_num_gpus=16, sglang_nnodes=2, inference_num_gpus_per_node=8
+training.training_num_nodes=1, training.training_num_gpus_per_node=4
+inference.inference_num_gpus=16, inference.sglang.nnodes=2, inference.inference_num_gpus_per_node=8
 ```

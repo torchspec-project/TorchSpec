@@ -34,11 +34,29 @@ from typing import Any
 import ray
 import sglang as sgl
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
+
+# Keys that users might plausibly put in extra_args but are managed by
+# TorchSpec.  Used only to emit a warning — the actual protection comes
+# from the .update() ordering in init() which overwrites extra_args.
+_PROTECTED_ENGINE_KEYS = frozenset(
+    {
+        "model_path",
+        "tp_size",
+        "mem_fraction_static",
+        "nnodes",
+        "port",
+        "nccl_port",
+        "dist_init_addr",
+        "dist_timeout",
+        "enable_multimodal",
+    }
+)
 
 
 class SglEngine(InferenceEngine, RayActor):
@@ -166,55 +184,57 @@ class SglEngine(InferenceEngine, RayActor):
             f"aux_hidden_state_layer_ids={self.aux_hidden_state_layer_ids}"
         )
 
-        # Build engine kwargs - base config for spec_training mode
+        # Build engine kwargs - base config for spec_training mode.
+        # Overridable defaults (e.g. log_level) are set first so that
+        # extra_args can override them; protected keys are set after
+        # extra_args and cannot be overridden.
         engine_kwargs = {
-            "model_path": self.args.target_model_path,
-            "disable_cuda_graph": getattr(self.args, "sglang_disable_cuda_graph", True),
-            "disable_radix_cache": True,  # IMPORTANT: radix cache interferes with hidden states capture
-            "enable_return_hidden_states": True,
-            "enable_aux_hidden_states": True,
-            "aux_hidden_state_layer_ids": self.aux_hidden_state_layer_ids,
-            "enable_spec_training_mooncake": True,  # Let sglang store to mooncake
-            "tp_size": tp_size,
-            "pp_size": pp_size,
-            "base_gpu_id": self.local_gpu_id,
-            "gpu_id_step": 1,  # Use consecutive GPUs for TP
-            "mem_fraction_static": mem_fraction,
-            "trust_remote_code": getattr(self.args, "trust_remote_code", True),
-            "log_level": getattr(self.args, "sglang_log_level", "warning"),
-            "chunked_prefill_size": -1,  # Disable chunked prefill
-            "log_requests": getattr(self.args, "sglang_log_requests", False),
-            "log_requests_level": getattr(self.args, "sglang_log_requests_level", 0),
+            "log_level": "warning",
         }
 
-        # Optional sglang fields - only add if set (avoids passing None to sgl.Engine)
-        _optional_sglang_fields = {
-            "quantization": getattr(self.args, "sglang_quantization", None),
-            "kv_cache_dtype": getattr(self.args, "sglang_kv_cache_dtype", None),
-            "moe_runner_backend": getattr(self.args, "sglang_moe_runner_backend", None),
-            "model_loader_extra_config": getattr(
-                self.args, "sglang_model_loader_extra_config", None
-            ),
-            "attention_backend": getattr(self.args, "sglang_attention_backend", None),
-            "context_length": getattr(self.args, "sglang_context_length", None),
-        }
-        for k, v in _optional_sglang_fields.items():
-            if v is not None:
-                engine_kwargs[k] = v
+        # Apply extra_args (can override defaults above, but not protected keys)
+        extra_args = getattr(self.args, "sglang_extra_args", None)
+        if extra_args:
+            if isinstance(extra_args, DictConfig):
+                extra = OmegaConf.to_container(extra_args, resolve=True)
+            else:
+                extra = dict(extra_args) if not isinstance(extra_args, dict) else extra_args
+            blocked = extra.keys() & _PROTECTED_ENGINE_KEYS
+            if blocked:
+                logger.warning(
+                    f"sglang extra_args contains protected keys that will be ignored: "
+                    f"{sorted(blocked)}. These are managed internally by TorchSpec."
+                )
+                extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
+            engine_kwargs.update(extra)
 
-        _optional_sglang_bool_fields = {
-            "disable_flashinfer_autotune": "sglang_disable_flashinfer_autotune",
-            "enable_multimodal": "sglang_enable_multimodal",
-        }
-        for engine_key, args_key in _optional_sglang_bool_fields.items():
-            val = getattr(self.args, args_key, False)
-            if val:
-                engine_kwargs[engine_key] = val
+        # Protected keys — always set by TorchSpec, never overridable
+        engine_kwargs.update(
+            {
+                "model_path": self.args.target_model_path,
+                "disable_cuda_graph": True,
+                "disable_radix_cache": True,
+                "enable_return_hidden_states": True,
+                "enable_aux_hidden_states": True,
+                "aux_hidden_state_layer_ids": self.aux_hidden_state_layer_ids,
+                "enable_spec_training_mooncake": True,
+                "tp_size": tp_size,
+                "pp_size": pp_size,
+                "base_gpu_id": self.local_gpu_id,
+                "gpu_id_step": 1,
+                "mem_fraction_static": mem_fraction,
+                "enable_multimodal": getattr(self.args, "sglang_enable_multimodal", False),
+                "trust_remote_code": getattr(self.args, "trust_remote_code", True),
+                "chunked_prefill_size": -1,
+            }
+        )
 
-        engine_kwargs["disable_cuda_graph"] = True
-
-        # Avoid nccl_port collisions when multiple engines share the same node
-        engine_kwargs["nccl_port"] = get_free_port()
+        # Each engine needs 2 consecutive ports (service + NCCL).  Offset the
+        # search start by rank so parallel engines on the same node never probe
+        # the same range.
+        base_port = get_free_port(start_port=10000 + self.rank * 2, consecutive=2)
+        engine_kwargs["port"] = base_port
+        engine_kwargs["nccl_port"] = base_port + 1
 
         # Multi-node TP support — always set nnodes/node_rank
         engine_kwargs["nnodes"] = nnodes
@@ -224,7 +244,7 @@ class SglEngine(InferenceEngine, RayActor):
             effective_addr = dist_init_addr or getattr(self.args, "sglang_dist_init_addr", None)
             if effective_addr:
                 engine_kwargs["dist_init_addr"] = effective_addr
-            sglang_dist_timeout = getattr(self.args, "sglang_dist_timeout", 600)
+            sglang_dist_timeout = getattr(self.args, "sglang_dist_timeout", 60)
             engine_kwargs["dist_timeout"] = sglang_dist_timeout
             logger.info(
                 f"SglEngine rank {self.rank}: multi-node TP enabled - "
@@ -237,7 +257,6 @@ class SglEngine(InferenceEngine, RayActor):
         if self.node_rank >= 1:
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
-        # Initialize sgl.Engine
         self._engine = sgl.Engine(**engine_kwargs)
 
         # Get hidden size from model config
