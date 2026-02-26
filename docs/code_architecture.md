@@ -216,8 +216,8 @@ inference:
   inference_num_gpus: 4
   sglang:                         # nested under inference
     tp_size: 8
-    attention_backend: flashinfer
-    extra_args: {}                # power-user passthrough to sgl.Engine
+    extra_args:                   # power-user passthrough to sgl.Engine
+      attention_backend: flashinfer
 
 mooncake:
   master_addr: null
