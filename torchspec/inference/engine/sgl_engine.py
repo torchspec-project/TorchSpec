@@ -40,27 +40,17 @@ from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
 
-# Keys managed by TorchSpec that extra_args must not override.
+# Keys that users might plausibly put in extra_args but are managed by
+# TorchSpec.  Used only to emit a warning — the actual protection comes
+# from the .update() ordering in init() which overwrites extra_args.
 _PROTECTED_ENGINE_KEYS = frozenset(
     {
         "model_path",
-        "trust_remote_code",
-        "disable_radix_cache",
-        "enable_return_hidden_states",
-        "enable_aux_hidden_states",
-        "aux_hidden_state_layer_ids",
-        "enable_spec_training_mooncake",
-        "chunked_prefill_size",
-        "disable_cuda_graph",
         "tp_size",
-        "pp_size",
-        "base_gpu_id",
-        "gpu_id_step",
         "mem_fraction_static",
+        "nnodes",
         "port",
         "nccl_port",
-        "nnodes",
-        "node_rank",
         "dist_init_addr",
         "dist_timeout",
     }
@@ -192,53 +182,15 @@ class SglEngine(InferenceEngine, RayActor):
             f"aux_hidden_state_layer_ids={self.aux_hidden_state_layer_ids}"
         )
 
-        # Build engine kwargs - base config for spec_training mode
+        # Build engine kwargs - base config for spec_training mode.
+        # Overridable defaults (e.g. log_level) are set first so that
+        # extra_args can override them; protected keys are set after
+        # extra_args and cannot be overridden.
         engine_kwargs = {
-            "model_path": self.args.target_model_path,
-            "disable_cuda_graph": True,  # Always disabled, prefill-only.
-            "disable_radix_cache": True,  # IMPORTANT: radix cache interferes with hidden states capture
-            "enable_return_hidden_states": True,
-            "enable_aux_hidden_states": True,
-            "aux_hidden_state_layer_ids": self.aux_hidden_state_layer_ids,
-            "enable_spec_training_mooncake": True,  # Let sglang store to mooncake
-            "tp_size": tp_size,
-            "pp_size": pp_size,
-            "base_gpu_id": self.local_gpu_id,
-            "gpu_id_step": 1,  # Use consecutive GPUs for TP
-            "mem_fraction_static": mem_fraction,
-            "trust_remote_code": getattr(self.args, "trust_remote_code", True),
-            "log_level": getattr(self.args, "sglang_log_level", "warning"),
-            "chunked_prefill_size": -1,  # Disable chunked prefill
-            "log_requests": getattr(self.args, "sglang_log_requests", False),
-            "log_requests_level": getattr(self.args, "sglang_log_requests_level", 0),
+            "log_level": "warning",
         }
 
-        # Optional sglang fields - only add if set (avoids passing None to sgl.Engine)
-        _optional_sglang_fields = {
-            "quantization": getattr(self.args, "sglang_quantization", None),
-            "kv_cache_dtype": getattr(self.args, "sglang_kv_cache_dtype", None),
-            "moe_runner_backend": getattr(self.args, "sglang_moe_runner_backend", None),
-            "model_loader_extra_config": getattr(
-                self.args, "sglang_model_loader_extra_config", None
-            ),
-            "attention_backend": getattr(self.args, "sglang_attention_backend", None),
-            "context_length": getattr(self.args, "sglang_context_length", None),
-        }
-        for k, v in _optional_sglang_fields.items():
-            if v is not None:
-                engine_kwargs[k] = v
-
-        _optional_sglang_bool_fields = {
-            "disable_flashinfer_autotune": "sglang_disable_flashinfer_autotune",
-            "enable_multimodal": "sglang_enable_multimodal",
-        }
-        for engine_key, args_key in _optional_sglang_bool_fields.items():
-            val = getattr(self.args, args_key, False)
-            if val:
-                engine_kwargs[engine_key] = val
-
-        # Power-user passthrough: extra_args are forwarded as-is to sgl.Engine,
-        # except for keys that TorchSpec manages internally.
+        # Apply extra_args (can override defaults above, but not protected keys)
         extra_args = getattr(self.args, "sglang_extra_args", None)
         if extra_args:
             extra = dict(extra_args) if not isinstance(extra_args, dict) else extra_args
@@ -250,6 +202,26 @@ class SglEngine(InferenceEngine, RayActor):
                 )
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
             engine_kwargs.update(extra)
+
+        # Protected keys — always set by TorchSpec, never overridable
+        engine_kwargs.update(
+            {
+                "model_path": self.args.target_model_path,
+                "disable_cuda_graph": True,
+                "disable_radix_cache": True,
+                "enable_return_hidden_states": True,
+                "enable_aux_hidden_states": True,
+                "aux_hidden_state_layer_ids": self.aux_hidden_state_layer_ids,
+                "enable_spec_training_mooncake": True,
+                "tp_size": tp_size,
+                "pp_size": pp_size,
+                "base_gpu_id": self.local_gpu_id,
+                "gpu_id_step": 1,
+                "mem_fraction_static": mem_fraction,
+                "trust_remote_code": getattr(self.args, "trust_remote_code", True),
+                "chunked_prefill_size": -1,
+            }
+        )
 
         # Avoid port collisions when multiple engines share the same node
         engine_kwargs["port"] = get_free_port()

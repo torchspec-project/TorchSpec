@@ -137,7 +137,7 @@ The PACK placement strategy spreads them across nodes automatically.
 ### Inference across nodes (SglEngine multi-node TP)
 
 When a single model is too large for one node, SglEngine supports multi-node
-The example uses nnodes=2 as if it were a top-level key, but in this refactor the configurable key is inference.sglang.nnodes (YAML/dotlist) and it’s flattened to sglang_nnodes internally. As written, nnodes=2 won’t be picked up by config loading.tensor parallelism via `inference.sglang.nnodes`.
+tensor parallelism via `inference.sglang.nnodes`.
 
 ```
 Example: 16-GPU TP across 2 nodes, 8 GPUs each

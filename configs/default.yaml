@@ -28,12 +28,11 @@ training:
 
 inference:
   sglang:
-    attention_backend: flashinfer
     mem_fraction_static: 0.8
-    context_length: null
     tp_size: 1
     dist_timeout: 60
     extra_args:
+      attention_backend: flashinfer
       enable_nccl_nvls: false
       enable_symm_mem: false
       enable_torch_compile: true

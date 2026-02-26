@@ -46,18 +46,10 @@ class SGLangConfig:
     pp_size: int = 1
     nnodes: int = 1
 
-    # Memory & context
+    # Memory
     mem_fraction_static: float = 0.8
-    context_length: Optional[int] = None
 
-    # Engine options
-    attention_backend: str = "flashinfer"
-    quantization: Optional[str] = None
-    kv_cache_dtype: Optional[str] = None
-    moe_runner_backend: Optional[str] = None
-    model_loader_extra_config: Any = None
-    disable_flashinfer_autotune: bool = False
-    enable_multimodal: bool = False
+    # Observability (read by TorchSpec's wandb integration)
     enable_metrics: bool = False
 
     # Networking (port is auto-selected by SglEngine via get_free_port)
@@ -65,12 +57,10 @@ class SGLangConfig:
     dist_timeout: int = 60
     init_timeout: int = 300
 
-    # Logging
-    log_level: str = "warning"
-    log_requests: bool = False
-    log_requests_level: int = 0
-
-    # Passthrough: forwarded as-is to sgl.Engine for power users
+    # Passthrough: forwarded as-is to sgl.Engine.
+    # Use this for any sgl.Engine kwarg that TorchSpec doesn't need to
+    # inspect (e.g. quantization, context_length, attention_backend,
+    # log_level, enable_multimodal, ...).
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 

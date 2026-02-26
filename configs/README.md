@@ -43,53 +43,46 @@ SGLang settings live under `inference.sglang` and are split into two tiers:
 
 ### Essential fields
 
-These are the fields TorchSpec directly uses. Set them in YAML or via CLI:
+Only fields that TorchSpec reads for its own logic live here. Everything else goes in `extra_args`.
 
 ```yaml
 inference:
   sglang:
     tp_size: 8
     mem_fraction_static: 0.6
-    context_length: 262144
     nnodes: 2
     dist_timeout: 600
-    enable_multimodal: true
+    enable_metrics: true
 ```
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `tp_size` | 8 | Tensor parallel degree (validated against `nnodes × gpus_per_engine`) |
-| `pp_size` | 1 | Pipeline parallel degree (must be 1) |
-| `nnodes` | 1 | Nodes per inference replica (>1 enables multi-node TP) |
-| `mem_fraction_static` | 0.8 | GPU memory fraction for KV cache |
-| `context_length` | null | Override model's default context length |
-| `attention_backend` | flashinfer | Attention backend |
-| `quantization` | null | Quantization method (e.g. `awq`, `gptq`) |
-| `kv_cache_dtype` | null | KV cache dtype override |
-| `moe_runner_backend` | null | MoE runner backend |
-| `model_loader_extra_config` | null | Extra config dict for model loading |
-| `disable_flashinfer_autotune` | false | Disable FlashInfer autotuning |
-| `enable_multimodal` | false | Enable multimodal input support |
-| `enable_metrics` | false | Forward SGLang metrics to W&B |
-| `dist_init_addr` | null | Distributed init address (auto-negotiated if unset) |
-| `dist_timeout` | 20 | Distributed init timeout (seconds) |
-| `init_timeout` | 300 | Engine initialization timeout (seconds) |
-| `log_level` | warning | SGLang log level |
-| `log_requests` | false | Log individual requests |
-| `log_requests_level` | 0 | Request log verbosity |
+| Field | Default | Why it's here |
+|-------|---------|---------------|
+| `tp_size` | 8 | Factory validates it against `nnodes × gpus_per_engine`; engine uses it to compute the total TP degree |
+| `pp_size` | 1 | Engine asserts `pp_size == 1` (only prefill, no pipeline parallelism) |
+| `nnodes` | 1 | Factory uses it to decide single-node vs multi-node topology, replica count, and `dist_init_addr` auto-negotiation |
+| `mem_fraction_static` | 0.8 | Passed to `sgl.Engine` as a protected key — TorchSpec manages it so `extra_args` cannot accidentally override it |
+| `enable_metrics` | false | Read by TorchSpec's wandb integration to decide whether to scrape SGLang's metrics endpoint |
+| `dist_init_addr` | null | Factory auto-negotiates it via Ray when null; multi-node engines receive it at `init()` time |
+| `dist_timeout` | 60 | Engine sets it in `engine_kwargs` only for multi-node TP (`nnodes > 1`) |
+| `init_timeout` | 300 | Factory uses it as the `ray.get()` timeout when waiting for engine initialization |
 
-### `extra_args`: power-user passthrough
+### `extra_args`: sgl.Engine passthrough
 
-Any additional `sgl.Engine` keyword argument can be passed via `extra_args`. These are forwarded as-is to the engine constructor:
+Any `sgl.Engine` keyword argument that TorchSpec doesn't need to inspect can be passed via `extra_args`. These are forwarded as-is to the engine constructor. A few overridable defaults are applied before `extra_args` (e.g. `log_level` defaults to `"warning"`), so you can override them here.
 
 ```yaml
 inference:
   sglang:
     tp_size: 8
     extra_args:
+      context_length: 262144
+      attention_backend: flashinfer
+      quantization: fp8
+      enable_multimodal: true
+      disable_flashinfer_autotune: true
       watchdog_timeout: 1800
       enable_torch_compile: true
-      enable_nccl_nvls: false
+      log_level: info            # override the "warning" default
 ```
 
 Or via CLI:
@@ -100,7 +93,7 @@ python -m torchspec.train_entry --config my.yaml inference.sglang.extra_args.wat
 
 ### Protected keys
 
-Certain `sgl.Engine` parameters are managed internally by TorchSpec and cannot be set via `extra_args`. If attempted, they are silently dropped with a warning. These include topology keys (`tp_size`, `pp_size`, `base_gpu_id`, `nnodes`, `node_rank`), auto-selected ports (`port`, `nccl_port`), networking keys (`dist_init_addr`, `dist_timeout`), spec-training invariants (`disable_radix_cache`, `enable_return_hidden_states`, `enable_aux_hidden_states`, `enable_spec_training_mooncake`, `chunked_prefill_size`, `disable_cuda_graph`), and keys derived from other config sections (`model_path`, `trust_remote_code`, `mem_fraction_static`).
+Some `sgl.Engine` parameters are always set by TorchSpec after `extra_args` is applied, so they cannot be overridden. If you put one of the commonly confused keys in `extra_args` (`model_path`, `tp_size`, `mem_fraction_static`, `nnodes`, `port`, `nccl_port`, `dist_init_addr`, `dist_timeout`), a warning is logged and the value is dropped. Other internally managed keys (e.g. `disable_radix_cache`, `enable_return_hidden_states`, `base_gpu_id`) are silently overwritten by the same mechanism without a warning since they're unlikely to appear in user configs.
 
 ## Draft model configs
 

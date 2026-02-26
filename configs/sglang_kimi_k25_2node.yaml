@@ -50,17 +50,15 @@ inference:
     nnodes: 1
     dist_init_addr: null
     mem_fraction_static: 0.6
-    context_length: 262144
-    model_loader_extra_config:
-      enable_multithread_load: true
-      num_threads: 32
-    disable_flashinfer_autotune: true
     init_timeout: 1800
     dist_timeout: 600
-    log_requests: false
-    log_requests_level: 0
-    enable_multimodal: true
     extra_args:
+      context_length: 262144
+      model_loader_extra_config:
+        enable_multithread_load: true
+        num_threads: 32
+      disable_flashinfer_autotune: true
+      enable_multimodal: true
       watchdog_timeout: 1800
 
 mooncake:
