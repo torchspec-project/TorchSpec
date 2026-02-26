@@ -40,29 +40,30 @@ from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
 
-
 # Keys managed by TorchSpec that extra_args must not override.
-_PROTECTED_ENGINE_KEYS = frozenset({
-    "model_path",
-    "trust_remote_code",
-    "disable_radix_cache",
-    "enable_return_hidden_states",
-    "enable_aux_hidden_states",
-    "aux_hidden_state_layer_ids",
-    "enable_spec_training_mooncake",
-    "chunked_prefill_size",
-    "disable_cuda_graph",
-    "tp_size",
-    "pp_size",
-    "base_gpu_id",
-    "gpu_id_step",
-    "mem_fraction_static",
-    "nccl_port",
-    "nnodes",
-    "node_rank",
-    "dist_init_addr",
-    "dist_timeout",
-})
+_PROTECTED_ENGINE_KEYS = frozenset(
+    {
+        "model_path",
+        "trust_remote_code",
+        "disable_radix_cache",
+        "enable_return_hidden_states",
+        "enable_aux_hidden_states",
+        "aux_hidden_state_layer_ids",
+        "enable_spec_training_mooncake",
+        "chunked_prefill_size",
+        "disable_cuda_graph",
+        "tp_size",
+        "pp_size",
+        "base_gpu_id",
+        "gpu_id_step",
+        "mem_fraction_static",
+        "nccl_port",
+        "nnodes",
+        "node_rank",
+        "dist_init_addr",
+        "dist_timeout",
+    }
+)
 
 
 class SglEngine(InferenceEngine, RayActor):
