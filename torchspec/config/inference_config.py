@@ -52,6 +52,9 @@ class SGLangConfig:
     # Observability (read by TorchSpec's wandb integration)
     enable_metrics: bool = False
 
+    # Multimodal
+    enable_multimodal: bool = False
+
     # Networking (port is auto-selected by SglEngine via get_free_port)
     dist_init_addr: Optional[str] = None
     dist_timeout: int = 60
@@ -60,7 +63,7 @@ class SGLangConfig:
     # Passthrough: forwarded as-is to sgl.Engine.
     # Use this for any sgl.Engine kwarg that TorchSpec doesn't need to
     # inspect (e.g. quantization, context_length, attention_backend,
-    # log_level, enable_multimodal, ...).
+    # log_level, ...).
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 

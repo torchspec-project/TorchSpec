@@ -48,7 +48,6 @@ def _is_port_available(port):
 
 
 def get_free_port(start_port=10000, consecutive=1):
-    # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
     port = start_port
     while not all(_is_port_available(port + i) for i in range(consecutive)):
         port += 1

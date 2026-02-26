@@ -50,6 +50,7 @@ inference:
     nnodes: 2
     dist_init_addr: null  # auto-negotiated via Ray; set explicitly to override
     mem_fraction_static: 0.6
+    enable_multimodal: true
     init_timeout: 1800
     dist_timeout: 600
     extra_args:
@@ -58,7 +59,6 @@ inference:
         enable_multithread_load: true
         num_threads: 32
       disable_flashinfer_autotune: true
-      enable_multimodal: true
       watchdog_timeout: 1800
 
 mooncake:

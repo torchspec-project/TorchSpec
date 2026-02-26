@@ -53,6 +53,7 @@ _PROTECTED_ENGINE_KEYS = frozenset(
         "nccl_port",
         "dist_init_addr",
         "dist_timeout",
+        "enable_multimodal",
     }
 )
 
@@ -218,13 +219,16 @@ class SglEngine(InferenceEngine, RayActor):
                 "base_gpu_id": self.local_gpu_id,
                 "gpu_id_step": 1,
                 "mem_fraction_static": mem_fraction,
+                "enable_multimodal": getattr(self.args, "sglang_enable_multimodal", False),
                 "trust_remote_code": getattr(self.args, "trust_remote_code", True),
                 "chunked_prefill_size": -1,
             }
         )
 
-        # Allocate two consecutive free ports so service and NCCL don't collide
-        base_port = get_free_port(consecutive=2)
+        # Each engine needs 2 consecutive ports (service + NCCL).  Offset the
+        # search start by rank so parallel engines on the same node never probe
+        # the same range.
+        base_port = get_free_port(start_port=10000 + self.rank * 2, consecutive=2)
         engine_kwargs["port"] = base_port
         engine_kwargs["nccl_port"] = base_port + 1
 
@@ -249,7 +253,6 @@ class SglEngine(InferenceEngine, RayActor):
         if self.node_rank >= 1:
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
-        # Initialize sgl.Engine
         self._engine = sgl.Engine(**engine_kwargs)
 
         # Get hidden size from model config

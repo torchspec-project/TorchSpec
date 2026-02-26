@@ -74,11 +74,11 @@ Any `sgl.Engine` keyword argument that TorchSpec doesn't need to inspect can be 
 inference:
   sglang:
     tp_size: 8
+    enable_multimodal: true
     extra_args:
       context_length: 262144
       attention_backend: flashinfer
       quantization: fp8
-      enable_multimodal: true
       disable_flashinfer_autotune: true
       watchdog_timeout: 1800
       enable_torch_compile: true
