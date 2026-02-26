@@ -1,10 +1,4 @@
-# TorchSpec Architecture
-
-TorchSpec is a **disaggregated speculative decoding training framework** that separates inference and training onto independent GPU pools. A target model runs on inference GPUs to produce hidden states and logits, which are transferred to training GPUs via Mooncake (RDMA/TCP) for draft model training — all orchestrated as an asynchronous pipeline through Ray. This disaggregated design decouples compute scaling for inference and training, enabling efficient draft model training at scale.
-
-## High-Level Architecture
-
-![TorchSpec Architecture](torchspec_architecture.png)
+# TorchSpec Code Architecture
 
 ## Package Layout
 
@@ -83,30 +77,7 @@ torchspec/
 
 ## Core Components
 
-### 1. Eagle3 Model (`torchspec/models/eagle3.py`)
-
-The speculative decoding model that predicts `length` tokens ahead (default: 7):
-
-```python
-class Eagle3Model(nn.Module):
-    def forward(input_ids, attention_mask, target, loss_mask, hidden_states):
-        # For each speculative position (0 to length-1):
-        for idx in range(self.length):
-            # 1. Embed input tokens
-            inputs_embeds = draft_model.embed_input_ids(input_ids)
-
-            # 2. Run draft model backbone
-            hidden_states = draft_model.backbone(inputs_embeds, hidden_states, ...)
-
-            # 3. Compute logits and loss against target
-            logits = draft_model.compute_logits(hidden_states)
-            loss += compiled_forward_kl_loss(logits, target_p, position_mask)
-
-            # 4. Shift positions for next speculation step
-            input_ids = padding(input_ids, left=False)
-```
-
-### 2. Draft Model (`torchspec/models/draft/`)
+### 1. Draft Model (`torchspec/models/draft/`)
 
 A lightweight transformer initialized from the target model's architecture:
 
@@ -118,7 +89,7 @@ A lightweight transformer initialized from the target model's architecture:
   - Hidden state projection from target model
   - Token-to-draft vocabulary mapping (`t2d`)
 
-### 3. Target Model (`torchspec/models/target/`)
+### 2. Target Model (`torchspec/models/target/`)
 
 Abstract interface for running the target model during inference:
 
@@ -130,7 +101,7 @@ The target model extracts:
 - **Hidden states** from configurable layers (`aux_hidden_states_layers`)
 - **Logits** for computing soft labels (KL divergence targets)
 
-### 4. Async Training Controller (`torchspec/controller/training_controller.py`)
+### 3. Async Training Controller (`torchspec/controller/training_controller.py`)
 
 Central orchestrator (Ray actor) managing the async pipeline:
 
@@ -151,13 +122,13 @@ class AsyncTrainingController:
 
 The controller only manages metadata and Mooncake keys, never actual tensor data. It tracks exact bytes in the sample pool for Mooncake backpressure control.
 
-### 5. Async Inference Manager (`torchspec/controller/inference_manager.py`)
+### 4. Async Inference Manager (`torchspec/controller/inference_manager.py`)
 
 Self-regulating inference manager (Ray actor) that dispatches to `HFEngine` / `SglEngine` Ray actors with load balancing.
 
 Includes Mooncake backpressure: pauses generation when `sample_pool` exceeds capacity, resuming when training catches up.
 
-### 6. Inference Engines (`torchspec/inference/engine/`)
+### 5. Inference Engines (`torchspec/inference/engine/`)
 
 - **`base.py`**: `InferenceEngine` - Abstract base class defining the unified engine interface
 - **`hf_runner.py`**: `HFRunner` - Core inference logic that runs target model, extracts hidden states, and stores tensors in Mooncake
@@ -166,7 +137,7 @@ Includes Mooncake backpressure: pauses generation when `sample_pool` exceeds cap
 
 Factory function in `factory.py`: `create_inference_engines()`
 
-### 7. Training (`torchspec/training/`)
+### 6. Training (`torchspec/training/`)
 
 The training side is split across three layers:
 
@@ -175,7 +146,7 @@ The training side is split across three layers:
 - **`eagle3_trainer.py`**: `Eagle3Trainer(Trainer)` — Eagle3-specific logic: initialises `Eagle3Model` with the draft model under FSDP2, runs the forward/backward, and aggregates metrics
 - **`fsdp.py`**: FSDP2 helpers (`apply_fsdp2`, `fsdp2_load_full_state_dict`, `init_empty_weights`)
 
-### 8. Mooncake Integration (`torchspec/transfer/mooncake/`)
+### 7. Mooncake Integration (`torchspec/transfer/mooncake/`)
 
 Distributed tensor transfer for multi-node training:
 

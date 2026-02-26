@@ -1,6 +1,10 @@
 # TorchSpec
 
-Torch-native speculative decoding training framework. Train Eagle3 draft models with distributed inference and FSDP training.
+TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via Mooncake (RDMA/TCP) store, allowing each side to scale independently.
+
+<p align="center">
+  <img src="docs/torchspec_architecture.png" alt="TorchSpec Architecture" width="100%">
+</p>
 
 ## Setup
 
