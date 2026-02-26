@@ -453,7 +453,7 @@ class AsyncInferenceManager:
             except RayActorError as e:
                 logger.critical(f"Engine actor died, terminating inference manager: {e}")
                 self._running = False
-                self.controller.set_inference_error.remote(str(e))
+                await self.controller.set_inference_error.remote(str(e))
                 raise
             except Exception as e:
                 logger.error(f"Engine dispatch failed: {e}")
