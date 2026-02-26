@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import abc
+import dataclasses
 import itertools
 import logging
 import os
@@ -122,6 +123,11 @@ class Trainer(abc.ABC):
     ) -> EagleMooncakeStore:
         if mooncake_config is None:
             mooncake_config = MooncakeConfig.from_flat_args(self.args)
+
+        mooncake_config = dataclasses.replace(
+            mooncake_config,
+            global_segment_size=0,
+        )
 
         store = EagleMooncakeStore(mooncake_config)
         store.setup(device=torch.cuda.current_device())

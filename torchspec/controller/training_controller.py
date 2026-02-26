@@ -146,6 +146,7 @@ class AsyncTrainingController:
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
         self._training_monitor = SpeedMonitor(window_seconds=10.0)
         self._last_dispatch_log_time = 0.0
+        self._inference_error: str | None = None
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -265,6 +266,10 @@ class AsyncTrainingController:
     # Dispatch Logic
     # ─────────────────────────────────────────────────────────────
 
+    def set_inference_error(self, msg: str) -> None:
+        """Called by the inference manager when a fatal error occurs."""
+        self._inference_error = msg
+
     def try_dispatch_batch(self) -> bool:
         """Try to dispatch one batch to training queues.
 
@@ -274,7 +279,13 @@ class AsyncTrainingController:
 
         Returns:
             True if a batch was dispatched, False if not enough samples.
+
+        Raises:
+            RuntimeError: If the inference manager has reported a fatal error.
         """
+        if self._inference_error is not None:
+            raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+
         with self._pool_lock:
             pool_size = len(self.sample_pool)
             now = time.time()

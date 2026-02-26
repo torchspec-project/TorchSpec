@@ -44,6 +44,7 @@ from collections import deque
 from typing import Any
 
 import ray
+from ray.exceptions import RayActorError
 
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
@@ -309,12 +310,12 @@ class AsyncInferenceManager:
             await self._forward_results(task.result())
 
     async def _drain(self) -> None:
-        """Flush remaining buffer and pending tasks on shutdown."""
+        # Currently drain is only called on shutdown, so we don't need to await pool.
         if self._prompt_buffer:
-            await self._await_pool_capacity()
-            entries = self._take_batch(len(self._prompt_buffer))
-            results = await self._dispatch_batch(entries)
-            await self._forward_results(results)
+            logger.info(
+                f"Drain: discarding {len(self._prompt_buffer)} buffered prompts on shutdown"
+            )
+            self._prompt_buffer.clear()
         if self._pending_tasks:
             done, _ = await asyncio.wait(self._pending_tasks, return_when=asyncio.ALL_COMPLETED)
             for task in done:
@@ -387,6 +388,9 @@ class AsyncInferenceManager:
                 last_log_time = now
 
         wait_duration = time.time() - wait_start
+        if not self._running:
+            logger.info(f"Pool wait aborted (shutdown requested) after {wait_duration:.1f}s")
+            return
         logger.info(
             f"Pool capacity available after {wait_duration:.1f}s, "
             f"pool_size={pool_size}/{self._max_pool_size}"
@@ -446,6 +450,11 @@ class AsyncInferenceManager:
                     now = time.time()
                     self._batch_times.append((len(entries), now - t0, now))
                 return list(zip(entries, outputs, strict=True))
+            except RayActorError as e:
+                logger.critical(f"Engine actor died, terminating inference manager: {e}")
+                self._running = False
+                await self.controller.set_inference_error.remote(str(e))
+                raise
             except Exception as e:
                 logger.error(f"Engine dispatch failed: {e}")
                 return [(entry, e) for entry in entries]
