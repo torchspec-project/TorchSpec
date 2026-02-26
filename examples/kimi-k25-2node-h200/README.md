@@ -17,7 +17,7 @@ Uses [`configs/sglang_kimi_k25_2node.yaml`](../../configs/sglang_kimi_k25_2node.
 
 ## Dataset format
 
-The dataset is a JSONL file where each row has a `conversations` field containing an OpenAI-style conversation. See [`examples/data/sample_conversations.jsonl`](../data/sample_conversations.jsonl) for complete examples — the `kimi_*` samples cover text-only, multimodal (single/multi-image), system messages, multi-turn, and tool calls.
+The dataset is a JSONL file where each row has a `conversations` field containing an OpenAI-style conversation. See [`examples/data/sample_kimi_k25_conversations.jsonl`](../data/sample_kimi_k25_conversations.jsonl) for complete examples covering text-only, multimodal (single/multi-image), system messages, multi-turn, and tool calls.
 
 Example (multimodal with image):
 
@@ -46,6 +46,7 @@ Key points:
 - Assistant responses should include `<think>...</think>` blocks.
 - For multimodal samples, use OpenAI-style list content with `image_url` or `image` fields — the pipeline extracts URLs for the SGLang engine and replaces image items with `<|image|>` placeholders for tokenization.
 - Plain-string `<|image|>` placeholders tokenize correctly but won't send pixel data to the engine — always use list-of-dicts content for multimodal samples.
+- For images in remote storage (S3, GCS, etc.), use pre-signed URLs so the engine can fetch them without credentials.
 
 ## How to run
 
