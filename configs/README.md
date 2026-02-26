@@ -71,8 +71,6 @@ inference:
 | `disable_flashinfer_autotune` | false | Disable FlashInfer autotuning |
 | `enable_multimodal` | false | Enable multimodal input support |
 | `enable_metrics` | false | Forward SGLang metrics to W&B |
-| `port` | 30000 | SGLang server port |
-| `additional_ports` | 4 | Additional ports for internal communication |
 | `dist_init_addr` | null | Distributed init address (auto-negotiated if unset) |
 | `dist_timeout` | 20 | Distributed init timeout (seconds) |
 | `init_timeout` | 300 | Engine initialization timeout (seconds) |
@@ -102,7 +100,7 @@ python -m torchspec.train_entry --config my.yaml inference.sglang.extra_args.wat
 
 ### Protected keys
 
-Certain `sgl.Engine` parameters are managed internally by TorchSpec and cannot be set via `extra_args`. If attempted, they are silently dropped with a warning. These include topology keys (`tp_size`, `pp_size`, `base_gpu_id`, `nnodes`, `node_rank`, `nccl_port`), spec-training invariants (`disable_radix_cache`, `enable_return_hidden_states`, `enable_aux_hidden_states`, `enable_spec_training_mooncake`, `chunked_prefill_size`, `disable_cuda_graph`), and keys derived from other config sections (`model_path`, `trust_remote_code`, `mem_fraction_static`, `dist_init_addr`, `dist_timeout`).
+Certain `sgl.Engine` parameters are managed internally by TorchSpec and cannot be set via `extra_args`. If attempted, they are silently dropped with a warning. These include topology keys (`tp_size`, `pp_size`, `base_gpu_id`, `nnodes`, `node_rank`), auto-selected ports (`port`, `nccl_port`), networking keys (`dist_init_addr`, `dist_timeout`), spec-training invariants (`disable_radix_cache`, `enable_return_hidden_states`, `enable_aux_hidden_states`, `enable_spec_training_mooncake`, `chunked_prefill_size`, `disable_cuda_graph`), and keys derived from other config sections (`model_path`, `trust_remote_code`, `mem_fraction_static`).
 
 ## Draft model configs
 

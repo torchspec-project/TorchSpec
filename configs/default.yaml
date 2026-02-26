@@ -32,9 +32,7 @@ inference:
     mem_fraction_static: 0.8
     context_length: null
     tp_size: 1
-    port: 30000
-    additional_ports: 4
-    dist_timeout: 20
+    dist_timeout: 60
     extra_args:
       enable_nccl_nvls: false
       enable_symm_mem: false

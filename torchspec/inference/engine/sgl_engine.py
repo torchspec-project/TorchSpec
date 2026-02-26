@@ -57,6 +57,7 @@ _PROTECTED_ENGINE_KEYS = frozenset(
         "base_gpu_id",
         "gpu_id_step",
         "mem_fraction_static",
+        "port",
         "nccl_port",
         "nnodes",
         "node_rank",
@@ -250,7 +251,8 @@ class SglEngine(InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
-        # Avoid nccl_port collisions when multiple engines share the same node
+        # Avoid port collisions when multiple engines share the same node
+        engine_kwargs["port"] = get_free_port()
         engine_kwargs["nccl_port"] = get_free_port()
 
         # Multi-node TP support — always set nnodes/node_rank
@@ -261,7 +263,7 @@ class SglEngine(InferenceEngine, RayActor):
             effective_addr = dist_init_addr or getattr(self.args, "sglang_dist_init_addr", None)
             if effective_addr:
                 engine_kwargs["dist_init_addr"] = effective_addr
-            sglang_dist_timeout = getattr(self.args, "sglang_dist_timeout", 600)
+            sglang_dist_timeout = getattr(self.args, "sglang_dist_timeout", 60)
             engine_kwargs["dist_timeout"] = sglang_dist_timeout
             logger.info(
                 f"SglEngine rank {self.rank}: multi-node TP enabled - "

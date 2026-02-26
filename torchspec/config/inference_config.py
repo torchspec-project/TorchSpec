@@ -60,11 +60,9 @@ class SGLangConfig:
     enable_multimodal: bool = False
     enable_metrics: bool = False
 
-    # Networking
-    port: int = 30000
-    additional_ports: int = 4
+    # Networking (port is auto-selected by SglEngine via get_free_port)
     dist_init_addr: Optional[str] = None
-    dist_timeout: int = 20
+    dist_timeout: int = 60
     init_timeout: int = 300
 
     # Logging

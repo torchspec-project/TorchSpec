@@ -47,7 +47,6 @@ inference:
   sglang:
     tp_size: 1
     mem_fraction_static: 0.7
-    additional_ports: 4
 
 mooncake:
   master_server_address: null
