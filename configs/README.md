@@ -37,6 +37,74 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
 
+## SGLang engine configuration
+
+SGLang settings live under `inference.sglang` and are split into two tiers:
+
+### Essential fields
+
+These are the fields TorchSpec directly uses. Set them in YAML or via CLI:
+
+```yaml
+inference:
+  sglang:
+    tp_size: 8
+    mem_fraction_static: 0.6
+    context_length: 262144
+    nnodes: 2
+    dist_timeout: 600
+    enable_multimodal: true
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `tp_size` | 8 | Tensor parallel degree (validated against `nnodes × gpus_per_engine`) |
+| `pp_size` | 1 | Pipeline parallel degree (must be 1) |
+| `nnodes` | 1 | Nodes per inference replica (>1 enables multi-node TP) |
+| `mem_fraction_static` | 0.8 | GPU memory fraction for KV cache |
+| `context_length` | null | Override model's default context length |
+| `attention_backend` | flashinfer | Attention backend |
+| `quantization` | null | Quantization method (e.g. `awq`, `gptq`) |
+| `kv_cache_dtype` | null | KV cache dtype override |
+| `moe_runner_backend` | null | MoE runner backend |
+| `model_loader_extra_config` | null | Extra config dict for model loading |
+| `disable_cuda_graph` | true | Disable CUDA graph (always true in spec training) |
+| `disable_flashinfer_autotune` | false | Disable FlashInfer autotuning |
+| `enable_multimodal` | false | Enable multimodal input support |
+| `enable_metrics` | false | Forward SGLang metrics to W&B |
+| `port` | 30000 | SGLang server port |
+| `additional_ports` | 4 | Additional ports for internal communication |
+| `dist_init_addr` | null | Distributed init address (auto-negotiated if unset) |
+| `dist_timeout` | 20 | Distributed init timeout (seconds) |
+| `init_timeout` | 300 | Engine initialization timeout (seconds) |
+| `log_level` | warning | SGLang log level |
+| `log_requests` | false | Log individual requests |
+| `log_requests_level` | 0 | Request log verbosity |
+
+### `extra_args`: power-user passthrough
+
+Any additional `sgl.Engine` keyword argument can be passed via `extra_args`. These are forwarded as-is to the engine constructor:
+
+```yaml
+inference:
+  sglang:
+    tp_size: 8
+    extra_args:
+      watchdog_timeout: 1800
+      enable_torch_compile: true
+      enable_nccl_nvls: false
+```
+
+Or via CLI:
+
+```bash
+python -m torchspec.train_entry --config my.yaml inference.sglang.extra_args.watchdog_timeout=1800
+```
+
+### Protected keys
+
+Certain `sgl.Engine` parameters are managed internally by TorchSpec and cannot be set via `extra_args`. If attempted, they are silently dropped with a warning. These include topology keys (`tp_size`, `pp_size`, `base_gpu_id`, `nnodes`, `node_rank`, `nccl_port`), spec-training invariants (`disable_radix_cache`, `enable_return_hidden_states`, `enable_aux_hidden_states`, `enable_spec_training_mooncake`, `chunked_prefill_size`, `disable_cuda_graph`), and keys derived from other config sections (`model_path`, `trust_remote_code`, `mem_fraction_static`, `dist_init_addr`, `dist_timeout`).
+
 ## Draft model configs
 
 Architecture configs for Eagle3 draft models are in [`draft_models/`](draft_models/). These define the draft model architecture (hidden size, layers, attention heads, etc.) and are referenced via the `model.draft_model_config` field.
