@@ -15,6 +15,39 @@ Production 3-node setup for training an Eagle3 draft model for Kimi-K2.5 (MoE, 2
 
 Uses [`configs/sglang_kimi_k25_3node.yaml`](../../configs/sglang_kimi_k25_3node.yaml) with draft model config [`configs/draft_models/kimi_k25_eagle3.json`](../../configs/draft_models/kimi_k25_eagle3.json).
 
+## Dataset format
+
+The dataset is a JSONL file where each row has a `conversations` field containing an OpenAI-style conversation. See [`examples/data/sample_kimi_k25_conversations.jsonl`](../data/sample_kimi_k25_conversations.jsonl) for complete examples covering text-only, multimodal (single/multi-image), system messages, multi-turn, and tool calls.
+
+Example (multimodal with image):
+
+```json
+{
+  "id": "kimi_mm_001",
+  "conversations": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "https://upload.wikimedia.org/...jpg"}},
+        {"type": "text", "text": "What animal is in this image?"}
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "<think>The image shows a domestic cat.</think>This is a cat."
+    }
+  ]
+}
+```
+
+Key points:
+
+- Set `chat_template=kimi-k25-vlm` and `sglang_enable_multimodal=True` in your config.
+- Assistant responses should include `<think>...</think>` blocks.
+- For multimodal samples, use OpenAI-style list content with `image_url` or `image` fields — the pipeline extracts URLs for the SGLang engine and replaces image items with `<|image|>` placeholders for tokenization.
+- Plain-string `<|image|>` placeholders tokenize correctly but won't send pixel data to the engine — always use list-of-dicts content for multimodal samples.
+- For images in remote storage (S3, GCS, etc.), use pre-signed URLs so the engine can fetch them without credentials.
+
 ## How to run
 
 ### 1. Start the Ray cluster

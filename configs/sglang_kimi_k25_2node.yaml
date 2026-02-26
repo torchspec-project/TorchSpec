@@ -16,7 +16,7 @@ model:
 dataset:
   train_data_path: ???  # set to your dataset path (HF hub id, local dir, or jsonl)
   chat_template: kimi-k25-vlm
-  prompt_key: messages
+  prompt_key: conversations
   defer_tokenization: true
 
 training:
