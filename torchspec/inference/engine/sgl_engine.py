@@ -223,9 +223,10 @@ class SglEngine(InferenceEngine, RayActor):
             }
         )
 
-        # Avoid port collisions when multiple engines share the same node
-        engine_kwargs["port"] = get_free_port()
-        engine_kwargs["nccl_port"] = get_free_port()
+        # Allocate two consecutive free ports so service and NCCL don't collide
+        base_port = get_free_port(consecutive=2)
+        engine_kwargs["port"] = base_port
+        engine_kwargs["nccl_port"] = base_port + 1
 
         # Multi-node TP support — always set nnodes/node_rank
         engine_kwargs["nnodes"] = nnodes
