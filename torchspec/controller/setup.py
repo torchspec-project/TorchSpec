@@ -34,7 +34,9 @@ def build_mooncake_config(args):
     return MooncakeConfig.from_flat_args(args)
 
 
-def setup_async_training_with_engines(args, train_group, mooncake_config, inference_engines):
+def setup_async_training_with_engines(
+    args, train_group, mooncake_config, inference_engines, controller=None
+):
     """Setup async training with distributed inference engines (e.g., Eagle3).
 
     The engines are Ray actors responsible for storing tensors in mooncake and returning keys.
@@ -45,6 +47,7 @@ def setup_async_training_with_engines(args, train_group, mooncake_config, infere
         train_group: Training group.
         mooncake_config: MooncakeConfig object. Each actor initializes its own store.
         inference_engines: List of Ray actor engine handles for distributed generation.
+        controller: Optional pre-created AsyncTrainingController. If None, a new one is created.
     """
     from torchspec.controller.inference_manager import AsyncInferenceManager
     from torchspec.controller.training_controller import AsyncTrainingController
@@ -64,7 +67,8 @@ def setup_async_training_with_engines(args, train_group, mooncake_config, infere
             f"Cannot evenly distribute samples across DP ranks."
         )
 
-    controller = AsyncTrainingController.remote(args, dp_size)
+    if controller is None:
+        controller = AsyncTrainingController.remote(args, dp_size)
 
     max_concurrent = getattr(args, "max_concurrent_batches", 1)
     inference_manager = AsyncInferenceManager.remote(

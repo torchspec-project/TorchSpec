@@ -21,7 +21,6 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
-import copy
 import os
 import sys
 
@@ -29,13 +28,12 @@ import ray
 import yaml
 
 from torchspec.controller import (
+    AsyncTrainingController,
     auto_calculate_training_steps,
     build_mooncake_config,
     run_training_loop,
     setup_async_training_with_engines,
 )
-from torchspec.data.dataset import load_conversation_dataset
-from torchspec.data.preprocessing import generate_vocab_mapping
 from torchspec.inference import prepare_inference_engines
 from torchspec.ray.placement_group import (
     allocate_train_group,
@@ -128,19 +126,6 @@ def _get_draft_model_config(args):
     return AutoDraftModelConfig.from_dict(config_dict)
 
 
-def _load_eval_dataset(args):
-    """Load eval dataset using the same pipeline as training data."""
-    eval_data_path = getattr(args, "eval_data_path", None)
-    if not eval_data_path:
-        return None
-
-    eval_args = copy.copy(args)
-    eval_args.train_data_path = eval_data_path
-    eval_dataset = load_conversation_dataset(eval_args)
-    logger.info(f"Loaded {len(eval_dataset)} eval samples from {eval_data_path}")
-    return eval_dataset
-
-
 def train_async_no_generation(args):
     """Entry point for Eagle3 distillation training without generation.
 
@@ -152,37 +137,50 @@ def train_async_no_generation(args):
     """
     init_tracking(args)
 
-    dataset = load_conversation_dataset(args)
-    eval_dataset = _load_eval_dataset(args)
+    dp_size = (
+        getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
+    )
 
-    auto_calculate_training_steps(args, len(dataset))
+    # [1] Create controller early (lightweight: only needs args + dp_size)
+    controller = AsyncTrainingController.remote(args, dp_size)
 
+    # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
+    dataset_size_ref = controller.load_dataset.remote(args)
+    eval_dataset_size_ref = controller.load_eval_dataset.remote(args)
+
+    # [3] Do initialization that doesn't depend on dataset in parallel
     draft_model_config = _get_draft_model_config(args)
     args.draft_model_config_obj = draft_model_config
 
-    # Generate vocab mapping if vocab pruning is enabled
+    pgs = create_placement_groups(args)
+    launch_mooncake_master(args)
+    mooncake_config = build_mooncake_config(args)
+
+    # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
+    dataset_size, eval_dataset_size = ray.get([dataset_size_ref, eval_dataset_size_ref])
+    logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
+
+    # [5] Auto-calculate training steps (needs dataset_size)
+    auto_calculate_training_steps(args, dataset_size)
+
+    # [6] Generate vocab mapping on controller if vocab pruning is enabled
     vocab_mapping = None
     draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
     vocab_size = draft_model_config.vocab_size
     if draft_vocab_size is not None and draft_vocab_size != vocab_size:
-        vocab_mapping = generate_vocab_mapping(
-            prompts=dataset,
-            target_vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
+        logger.info(
+            f"Computing vocab mapping on controller (target={vocab_size}, draft={draft_vocab_size})..."
+        )
+        vocab_mapping = ray.get(
+            controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
         )
         logger.info(
             f"Generated vocab mapping: d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
         )
 
-    pgs = create_placement_groups(args)
-
-    launch_mooncake_master(args)
-
+    # [7] Create training actors + inference engines (args now has num_train_steps)
     from torchspec.training.trainer_actor import TrainerActor
 
-    mooncake_config = build_mooncake_config(args)
-
-    # Phase 1: Create actors and fire init calls (non-blocking)
     train_group = allocate_train_group(
         args=args,
         num_nodes=args.training_num_nodes,
@@ -198,7 +196,7 @@ def train_async_no_generation(args):
         args, pgs["inference"], mooncake_config
     )
 
-    # Phase 2: Wait for all init to complete concurrently
+    # [8] Wait for all actor init to complete concurrently
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
@@ -216,23 +214,20 @@ def train_async_no_generation(args):
         train_group.set_vocab_buffers(*vocab_mapping)
         logger.info("Loaded vocab mapping into training actors")
 
+    # [9] Setup async training with pre-created controller
     controller, inference_manager = setup_async_training_with_engines(
-        args, train_group, mooncake_config, inference_engines
+        args, train_group, mooncake_config, inference_engines, controller=controller
     )
 
-    dataset_size = len(dataset)
-    dataset_ref = ray.put(dataset)
-    del dataset
-
+    # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(
         args,
-        dataset_ref,
         controller,
         inference_manager,
         train_group,
         inference_engines=inference_engines,
-        eval_dataset=eval_dataset,
         dataset_size=dataset_size,
+        eval_dataset_size=eval_dataset_size,
     )
 
 
