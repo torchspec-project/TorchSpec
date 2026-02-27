@@ -21,16 +21,19 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
-import os
 import sys
 import time
 from collections import namedtuple
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Generator
 
 import ray
-import yaml
+from omegaconf import OmegaConf
 
+from torchspec import AutoDraftModelConfig
+from torchspec.config.train_config import config_to_flat_args, load_config, save_config
+from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
     AsyncTrainingController,
     auto_calculate_training_steps,
@@ -93,32 +96,49 @@ class _InitTimer:
         logger.info("\n".join(lines))
 
 
-def parse_nested_config():
-    """Parse nested YAML config and convert to flat args.
+def parse_config():
+    """Parse YAML config and convert to flat args.
 
-    Supports configs with nested sections matching the Config dataclass:
-    model, dataset, training, debug, inference, logging, mooncake, sglang.
+    Supports configs with sections matching the Config dataclass:
+    model, dataset, training, debug, inference, logging, mooncake.
 
-    The nested config is flattened via config_to_flat_args(), with mooncake
-    sections getting a name prefix (mooncake_*).
+    The config is flattened via config_to_flat_args(), with mooncake and
+    inference.sglang sections getting a name prefix (mooncake_*, sglang_*).
+
+    If ``output_dir`` is set, the resolved config is saved to
+    ``output_dir/config.yaml`` for reproducibility (creating the directory
+    if necessary).  If ``--print-config-only`` is passed, the resolved
+    config is printed and the process exits.
     """
-    from torchspec.config.train_config import config_to_flat_args, load_config
 
-    parser = argparse.ArgumentParser(description="Train with nested config")
+    parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
+    parser.add_argument("--config", "-c", type=str, required=True, help="Path to YAML config")
     parser.add_argument(
-        "--config", "-c", type=str, required=True, help="Path to nested YAML config"
+        "--print-config-only", action="store_true", help="Print resolved config and exit"
     )
-    parser.add_argument("--print-config", action="store_true", help="Print config and exit")
 
     args, unknown = parser.parse_known_args()
 
     config = load_config(config_path=args.config, cli_args=unknown if unknown else None)
 
-    if args.print_config:
-        from omegaconf import OmegaConf
+    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))
 
-        print(OmegaConf.to_yaml(config))
+    if args.print_config_only:
         sys.exit(0)
+
+    # Persist the fully-resolved config (including CLI overrides) so the
+    # exact training configuration can be reproduced later.
+    if OmegaConf.select(config, "output_dir"):
+        output_dir = Path(config.output_dir)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_config(config, str(output_dir / "config.yaml"))
+            logger.info(f"Saved resolved config to {output_dir / 'config.yaml'}")
+        except OSError as e:
+            logger.warning(
+                f"Failed to save resolved config to {output_dir / 'config.yaml'}: {e}. "
+                "Training will continue without saving the config."
+            )
 
     flat_args = config_to_flat_args(config)
 
@@ -163,8 +183,6 @@ def _resolve_batch_size(args):
 
 def _get_draft_model_config(args):
     """Resolve draft model config from args or auto-generate from target model."""
-    from torchspec import AutoDraftModelConfig
-    from torchspec.config.utils import generate_draft_model_config
 
     draft_config_path = getattr(args, "draft_model_config", None)
     if draft_config_path is not None:
@@ -291,26 +309,6 @@ def train_async_no_generation(args):
     )
 
 
-def _detect_nested_config() -> bool:
-    """Detect if using nested config format by checking for nested YAML structure."""
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg in ("--config", "-c") and i + 1 < len(sys.argv) - 1:
-            config_path = sys.argv[i + 2]
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    data = yaml.safe_load(f) or {}
-                return any(key in data for key in ("model", "training", "inference"))
-    return False
-
-
 if __name__ == "__main__":
-    if _detect_nested_config():
-        logger.info("Detected nested config format, using parse_nested_config()")
-        args = parse_nested_config()
-    else:
-        raise NotImplementedError(
-            "Flat config format is not supported in this version. "
-            "Please use nested YAML config with --config."
-        )
-
+    args = parse_config()
     train_async_no_generation(args)
