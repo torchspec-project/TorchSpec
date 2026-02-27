@@ -136,6 +136,9 @@ def _load_eval_dataset(args):
 
     eval_args = copy.copy(args)
     eval_args.train_data_path = eval_data_path
+    eval_prompt_key = getattr(args, "eval_prompt_key", None)
+    if eval_prompt_key:
+        eval_args.prompt_key = eval_prompt_key
     eval_dataset = load_conversation_dataset(eval_args)
     logger.info(f"Loaded {len(eval_dataset)} eval samples from {eval_data_path}")
     return eval_dataset
