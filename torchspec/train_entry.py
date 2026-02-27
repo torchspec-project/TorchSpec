@@ -23,6 +23,10 @@
 import argparse
 import os
 import sys
+import time
+from collections import namedtuple
+from contextlib import contextmanager
+from typing import Any, Generator
 
 import ray
 import yaml
@@ -39,8 +43,54 @@ from torchspec.ray.placement_group import (
     allocate_train_group,
     create_placement_groups,
 )
+from torchspec.training.trainer_actor import TrainerActor
 from torchspec.transfer.mooncake.utils import launch_mooncake_master
 from torchspec.utils.logging import init_tracking, logger
+
+_Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
+
+
+class _InitTimer:
+    """Lightweight segmented timer for initialization phases."""
+
+    def __init__(self) -> None:
+        self._t0 = time.time()
+        self._phases: list[_Phase] = []
+        self._pending: dict[str, float] = {}
+
+    @contextmanager
+    def phase(self, name: str) -> Generator[None, None, None]:
+        """Time a synchronous phase."""
+        start = time.time()
+        yield
+        self._phases.append(_Phase(name, time.time() - start, is_async=False, blocked=0.0))
+
+    def begin_async(self, name: str) -> None:
+        """Mark the start of an async operation (e.g., ray.remote dispatch)."""
+        self._pending[name] = time.time()
+
+    def wait(self, name: str, refs) -> Any:
+        """Wrap ray.get for async phases. Returns the result."""
+        if name not in self._pending:
+            raise ValueError(f"No async phase '{name}' was started via begin_async()")
+        t_before = time.time()
+        result = ray.get(refs)
+        t_after = time.time()
+        dispatch_time = self._pending.pop(name)
+        total = t_after - dispatch_time
+        blocked = t_after - t_before
+        self._phases.append(_Phase(name, total, is_async=True, blocked=blocked))
+        return result
+
+    def log_summary(self) -> None:
+        total = time.time() - self._t0
+        lines = ["Initialization timing:"]
+        for p in self._phases:
+            suffix = f"  (blocked {p.blocked:.2f}s)" if p.is_async else ""
+            lines.append(f"  {p.name:<48s} {p.duration:>8.2f}s{suffix}")
+        lines.append(f"  {'─' * 57}")
+        lines.append(f"  {'Total':<48s} {total:>8.2f}s")
+        logger.info("\n".join(lines))
 
 
 def parse_nested_config():
@@ -92,10 +142,11 @@ def parse_nested_config():
 
 
 def _resolve_batch_size(args):
-    """Derive per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
+    """Derive dp_size, per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
     )
+    args.dp_size = dp_size
     sp_size = getattr(args, "sp_size", None)
     if sp_size is not None and sp_size != 1:
         raise NotImplementedError(f"Sequence parallel is not yet supported (got sp_size={sp_size})")
@@ -136,65 +187,71 @@ def train_async_no_generation(args):
     Mooncake master is launched as a Ray actor to handle tensor storage coordination.
     """
     init_tracking(args)
-
-    dp_size = (
-        getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
-    )
+    timer = _InitTimer()
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
-    controller = AsyncTrainingController.remote(args, dp_size)
+    with timer.phase("Create controller"):
+        controller = AsyncTrainingController.remote(args, args.dp_size)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
+    timer.begin_async("Dataset loading")
     dataset_size_ref = controller.load_dataset.remote(args)
     eval_dataset_size_ref = controller.load_eval_dataset.remote(args)
 
     # [3] Do initialization that doesn't depend on dataset in parallel
-    draft_model_config = _get_draft_model_config(args)
-    args.draft_model_config_obj = draft_model_config
+    with timer.phase("Driver-side init"):
+        draft_model_config = _get_draft_model_config(args)
+        args.draft_model_config_obj = draft_model_config
 
-    pgs = create_placement_groups(args)
-    launch_mooncake_master(args)
-    mooncake_config = build_mooncake_config(args)
+        pgs = create_placement_groups(args)
+        launch_mooncake_master(args)
+        mooncake_config = build_mooncake_config(args)
 
     # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
-    dataset_size, eval_dataset_size = ray.get([dataset_size_ref, eval_dataset_size_ref])
+    dataset_size, eval_dataset_size = timer.wait(
+        "Dataset loading", [dataset_size_ref, eval_dataset_size_ref]
+    )
     logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
 
     # [5] Auto-calculate training steps (needs dataset_size)
-    auto_calculate_training_steps(args, dataset_size)
+    with timer.phase("Auto-calculate training steps"):
+        auto_calculate_training_steps(args, dataset_size)
 
     # [6] Generate vocab mapping on controller if vocab pruning is enabled
     vocab_mapping = None
     draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
     vocab_size = draft_model_config.vocab_size
     if draft_vocab_size is not None and draft_vocab_size != vocab_size:
-        logger.info(
-            f"Computing vocab mapping on controller (target={vocab_size}, draft={draft_vocab_size})..."
-        )
-        vocab_mapping = ray.get(
-            controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
-        )
-        logger.info(
-            f"Generated vocab mapping: d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
-        )
+        with timer.phase("Vocab mapping"):
+            logger.info(
+                f"Computing vocab mapping on controller "
+                f"(target={vocab_size}, draft={draft_vocab_size})..."
+            )
+            vocab_mapping = ray.get(
+                controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
+            )
+            logger.info(
+                f"Generated vocab mapping: "
+                f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
+            )
 
     # [7] Create training actors + inference engines (args now has num_train_steps)
-    from torchspec.training.trainer_actor import TrainerActor
+    timer.begin_async("Actor initialization")
+    with timer.phase("Allocate actors + dispatch init"):
+        train_group = allocate_train_group(
+            args=args,
+            num_nodes=args.training_num_nodes,
+            num_gpus_per_node=args.training_num_gpus_per_node,
+            pg=pgs["training"],
+            training_class=TrainerActor,
+        )
+        train_init_refs = train_group.async_init(
+            args, role="training", mooncake_config=mooncake_config, with_ref=False
+        )
 
-    train_group = allocate_train_group(
-        args=args,
-        num_nodes=args.training_num_nodes,
-        num_gpus_per_node=args.training_num_gpus_per_node,
-        pg=pgs["training"],
-        training_class=TrainerActor,
-    )
-    train_init_refs = train_group.async_init(
-        args, role="training", mooncake_config=mooncake_config, with_ref=False
-    )
-
-    inference_engines, engine_init_refs = prepare_inference_engines(
-        args, pgs["inference"], mooncake_config
-    )
+        inference_engines, engine_init_refs = prepare_inference_engines(
+            args, pgs["inference"], mooncake_config
+        )
 
     # [8] Wait for all actor init to complete concurrently
     n_train = len(train_init_refs)
@@ -202,7 +259,7 @@ def train_async_no_generation(args):
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
         f"inference engines to initialize in parallel..."
     )
-    all_results = ray.get(train_init_refs + engine_init_refs)
+    all_results = timer.wait("Actor initialization", train_init_refs + engine_init_refs)
 
     train_results = all_results[:n_train]
     assert len(set(train_results)) == 1
@@ -215,9 +272,12 @@ def train_async_no_generation(args):
         logger.info("Loaded vocab mapping into training actors")
 
     # [9] Setup async training with pre-created controller
-    controller, inference_manager = setup_async_training_with_engines(
-        args, train_group, mooncake_config, inference_engines, controller=controller
-    )
+    with timer.phase("Setup async training"):
+        controller, inference_manager = setup_async_training_with_engines(
+            args, train_group, mooncake_config, inference_engines, controller=controller
+        )
+
+    timer.log_summary()
 
     # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(
