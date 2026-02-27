@@ -95,9 +95,7 @@ def parse_arguments():
         default=64,
         help="The number of requests to send to a single server concurrently, the total number of concurrent requests is concurrency * number of server addresses",
     )
-    parser.add_argument(
-        "--input-file-path", type=str, required=True, help="Path to the input file"
-    )
+    parser.add_argument("--input-file-path", type=str, required=True, help="Path to the input file")
     parser.add_argument(
         "--output-file-path", type=str, required=True, help="Path to the output file"
     )
@@ -267,9 +265,7 @@ def wait_for_healthy_servers(args) -> List[str]:
                 print(f"Server {server_address} is not available")
 
         if valid_server_addresses:
-            print(
-                f"Using {len(valid_server_addresses)} server addresses: {valid_server_addresses}"
-            )
+            print(f"Using {len(valid_server_addresses)} server addresses: {valid_server_addresses}")
             print("-" * 50)
             return valid_server_addresses
 
@@ -288,7 +284,7 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
     print(f"  Concurrency: {args.concurrency}")
@@ -364,9 +360,7 @@ def main():
         start_server_index = 0
         retry_records: List[Dict[str, Any]] = []
 
-        def ensure_servers_available(
-            valid_addrs: List[str], waiting: Dict[str, List]
-        ) -> List[str]:
+        def ensure_servers_available(valid_addrs: List[str], waiting: Dict[str, List]) -> List[str]:
             if valid_addrs:
                 return valid_addrs
             print("No valid server available, waiting for servers to become healthy...")
@@ -383,31 +377,23 @@ def main():
             if regen_data.get("status") == "error":
                 if is_connection_error(str(regen_data.get("error", ""))):
                     if server_addr in valid_server_addresses:
-                        print(
-                            f"Removing unhealthy server {server_addr} from valid list"
-                        )
+                        print(f"Removing unhealthy server {server_addr} from valid list")
                         valid_server_addresses.remove(server_addr)
 
                 data_id = regen_data.get("data_id")
                 if isinstance(data_id, int):
                     retry_counts[data_id] = retry_counts.get(data_id, 0) + 1
                     if retry_counts[data_id] >= sample_max_retries:
-                        error_file_handle.write(
-                            json.dumps(regen_data, ensure_ascii=False) + "\n"
-                        )
+                        error_file_handle.write(json.dumps(regen_data, ensure_ascii=False) + "\n")
                         error_samples += 1
                     else:
                         retry_records.append(regen_data)
                 else:
-                    error_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
+                    error_file_handle.write(json.dumps(regen_data, ensure_ascii=False) + "\n")
                     error_samples += 1
             else:
                 calculate_metrics(regen_data.get("context_length"))
-                output_file_handle.write(
-                    json.dumps(regen_data, ensure_ascii=False) + "\n"
-                )
+                output_file_handle.write(json.dumps(regen_data, ensure_ascii=False) + "\n")
                 success_samples += 1
 
             if server_addr in waiting_queue:
@@ -424,9 +410,7 @@ def main():
                     continue
 
                 server_address = valid_server_addresses[start_server_index]
-                start_server_index = (start_server_index + 1) % len(
-                    valid_server_addresses
-                )
+                start_server_index = (start_server_index + 1) % len(valid_server_addresses)
 
                 while len(waiting_queue[server_address]) >= args.concurrency:
                     finished_on_request = False
@@ -460,10 +444,7 @@ def main():
     with open(args.input_file_path, "r") as input_file:
         data_id = 0
         for line in input_file:
-            if (
-                args.num_samples is not None
-                and success_samples + error_samples >= args.num_samples
-            ):
+            if args.num_samples is not None and success_samples + error_samples >= args.num_samples:
                 break
             if data_id in processed_ids:
                 data_id += 1
@@ -493,7 +474,7 @@ def main():
                 remaining_data.append(record)
             output_open_mode = "a"
 
-    print(f"\nProcessing completed!")
+    print("\nProcessing completed!")
     if success_samples > 0:
         avg_len = CONTEXT_TOKEN_SUM / success_samples
         print("Context length statistics (token count over conversations):")
