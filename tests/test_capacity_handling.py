@@ -114,6 +114,7 @@ class MockControllerArgs:
     """Mock args for AsyncTrainingController."""
 
     dispatch_batch_size: int = 4
+    eval_dispatch_batch_size: int = 4
 
 
 def _create_mock_inference_output(

@@ -42,13 +42,12 @@ def _is_save_interval_step(step: int, interval: int) -> bool:
 
 def run_training_loop(
     args,
-    dataset_ref,
     controller,
     inference_manager,
     train_group,
     inference_engines=None,
-    eval_dataset=None,
     dataset_size=None,
+    eval_dataset_size=None,
 ):
     """Run the training loop with sync training and async inference.
 
@@ -65,42 +64,41 @@ def run_training_loop(
 
     Args:
         args: Configuration arguments.
-        dataset_ref: Ray ObjectRef to the dataset (from ray.put()), or a plain list
-            for backward compatibility (will be put into the object store).
-        controller: AsyncTrainingController ray actor handle.
+        controller: AsyncTrainingController ray actor handle (dataset already loaded).
         inference_manager: AsyncInferenceManager ray actor handle.
         train_group: Training group with set_train_queues method.
-        eval_dataset: Optional eval samples — same format as dataset.
-        dataset_size: Number of samples. Required when dataset_ref is an ObjectRef.
+        dataset_size: Number of training samples. If None, queried from controller.
+        eval_dataset_size: Number of eval samples. If None, queried from controller. 0 means no eval.
     """
-    if isinstance(dataset_ref, list):
-        dataset_size = len(dataset_ref)
-        dataset_ref = ray.put(dataset_ref)
-    elif dataset_size is None:
-        raise ValueError("dataset_size is required when passing a Ray ObjectRef")
-
-    ray.get(controller.add_dataset.remote(dataset_ref))
-    logger.info(f"Added {dataset_size} samples to controller")
+    if dataset_size is None:
+        dataset_size = ray.get(controller.get_dataset_size.remote())
+    if dataset_size <= 0:
+        raise ValueError(
+            f"Training dataset size is {dataset_size}. "
+            f"Ensure controller.load_dataset() was called before run_training_loop()."
+        )
+    if eval_dataset_size is None:
+        eval_dataset_size = ray.get(controller.get_eval_dataset_size.remote())
 
     # ── Eval setup ──────────────────────────────────────────────
     # eval_interval=N>0: eval runs every N steps in addition to checkpoint saves.
     eval_interval = args.eval_interval
-    eval_enabled = bool(eval_dataset)
+    eval_enabled = eval_dataset_size > 0
     eval_cached = False
     eval_batches_per_dp = 0
     eval_cache_path: str | None = None
     eval_dispatch_bs = args.eval_dispatch_batch_size
 
     if eval_enabled:
-        eval_batches_per_dp = len(eval_dataset) // eval_dispatch_bs
+        eval_batches_per_dp = eval_dataset_size // eval_dispatch_bs
         if eval_batches_per_dp == 0:
             logger.warning(
-                f"Eval dataset ({len(eval_dataset)} samples) is smaller than "
+                f"Eval dataset ({eval_dataset_size} samples) is smaller than "
                 f"eval_dispatch_batch_size ({eval_dispatch_bs}). Disabling eval."
             )
             eval_enabled = False
         else:
-            dropped = len(eval_dataset) - eval_batches_per_dp * eval_dispatch_bs
+            dropped = eval_dataset_size - eval_batches_per_dp * eval_dispatch_bs
             if dropped > 0:
                 logger.info(
                     f"Eval: {dropped} samples will be dropped (not enough for a full batch)"
@@ -132,8 +130,8 @@ def run_training_loop(
                 f"Eval: loaded cached tensors from {eval_cache_path} ({loaded[0]} batches per rank)"
             )
         else:
-            ray.get(controller.set_eval_dataset.remote(eval_dataset))
-            logger.info(f"Eval: {len(eval_dataset)} samples, batches_per_dp={eval_batches_per_dp}")
+            ray.get(controller.submit_eval_dataset.remote())
+            logger.info(f"Eval: {eval_dataset_size} samples, batches_per_dp={eval_batches_per_dp}")
 
     def _update_checkpoint_eval_meta(step: int, eval_metrics: dict, current_best: float) -> float:
         """Append eval metrics to checkpoint meta.json and track best checkpoint."""
@@ -187,7 +185,7 @@ def run_training_loop(
             else:
                 pool_sz = ray.get(controller.get_eval_pool_size.remote())
                 logger.warning(
-                    f"Eval inference not ready yet ({pool_sz}/{len(eval_dataset)}), skipping eval"
+                    f"Eval inference not ready yet ({pool_sz}/{eval_dataset_size}), skipping eval"
                 )
                 return {}, eval_cached
 
@@ -296,7 +294,7 @@ def run_training_loop(
                         steps_in_current_epoch = 0
                         consecutive_failures = 0
                         logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                        ray.get(controller.add_dataset.remote(dataset_ref))
+                        ray.get(controller.reload_dataset.remote())
                     else:
                         logger.info("Max steps reached, stopping")
                         break
@@ -400,7 +398,7 @@ def run_training_loop(
                     current_epoch += 1
                     steps_in_current_epoch = 0
                     logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                    ray.get(controller.add_dataset.remote(dataset_ref))
+                    ray.get(controller.reload_dataset.remote())
                 else:
                     logger.info("Max steps reached")
                     break
