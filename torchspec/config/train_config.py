@@ -36,6 +36,7 @@ class DatasetConfig:
     eval_data_path: Optional[str] = None
     eval_interval: int = 50
     eval_micro_batch_size: Optional[int] = None
+    eval_prompt_key: Optional[str] = None
     last_turn_loss_only: bool = False
     prompt_key: str = "conversations"
     train_data_path: str = ""

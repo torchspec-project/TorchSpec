@@ -34,7 +34,7 @@ from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from torchspec.utils.logging import print_with_rank
+from torchspec.utils.logging import logger, print_with_rank
 
 _flash_attn_import_error: ImportError | None = None
 try:
@@ -120,9 +120,10 @@ try:
             from cutlass.base_dsl.cache_helpers import default_generated_ir_path
 
             cache_dir = os.environ.get("CUTE_DSL_CACHE_DIR", default_generated_ir_path)
-            print_with_rank(
-                f"CUTLASS DSL disk cache enabled → {cache_dir}  "
-                "(set CUTE_DSL_CACHE_DIR for a persistent location)"
+            logger.debug(
+                "CUTLASS DSL disk cache enabled → %s  "
+                "(set CUTE_DSL_CACHE_DIR for a persistent location)",
+                cache_dir,
             )
 
         # ── Patch 2: opt-level injection ──────────────────────────────────────
@@ -152,7 +153,7 @@ try:
         CompileCallable._opt_level_patched = True
 
         if _opt_level != 3 or _ptxas_opt != 3:
-            print_with_rank(
+            logger.debug(
                 f"flash_attn compilation: opt-level={_opt_level}, "
                 f"ptxas-opt={_ptxas_opt}  "
                 f"(TORCHSPEC_FLASH_ATTN_OPT_LEVEL / TORCHSPEC_FLASH_ATTN_PTXAS_OPT)"
@@ -274,7 +275,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
                 orig_max_position,
             ]
         ):
-            print_with_rank(
+            logger.info(
                 f"Using Llama3 style rotary embedding with scaling_factor={scaling_factor}, low_freq_factor={low_freq_factor}, high_freq_factor={high_freq_factor}, orig_max_position={orig_max_position}"
             )
             self.scaling_factor = scaling_factor

@@ -219,6 +219,9 @@ class AsyncTrainingController:
 
         eval_args = copy.copy(args)
         eval_args.train_data_path = eval_data_path
+        eval_prompt_key = getattr(args, "eval_prompt_key", None)
+        if eval_prompt_key:
+            eval_args.prompt_key = eval_prompt_key
         self._stored_eval_dataset = load_conversation_dataset(eval_args)
         count = len(self._stored_eval_dataset)
         logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")

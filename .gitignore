@@ -88,3 +88,4 @@ _sglang/
 wandb/log.txt
 
 .claude/
+wandb/

@@ -65,3 +65,4 @@ ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
 known-first-party = ["torchspec"]
+known-third-party = ["wandb"]
