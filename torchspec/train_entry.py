@@ -21,7 +21,6 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
-import copy
 import sys
 import time
 from collections import namedtuple
@@ -42,7 +41,6 @@ from torchspec.controller import (
     run_training_loop,
     setup_async_training_with_engines,
 )
-from torchspec.data.dataset import load_conversation_dataset
 from torchspec.inference import prepare_inference_engines
 from torchspec.ray.placement_group import (
     allocate_train_group,
@@ -196,22 +194,6 @@ def _get_draft_model_config(args):
         cache_dir=getattr(args, "model_download_dir", None),
     )
     return AutoDraftModelConfig.from_dict(config_dict)
-
-
-def _load_eval_dataset(args):
-    """Load eval dataset using the same pipeline as training data."""
-    eval_data_path = getattr(args, "eval_data_path", None)
-    if not eval_data_path:
-        return None
-
-    eval_args = copy.copy(args)
-    eval_args.train_data_path = eval_data_path
-    eval_prompt_key = getattr(args, "eval_prompt_key", None)
-    if eval_prompt_key:
-        eval_args.prompt_key = eval_prompt_key
-    eval_dataset = load_conversation_dataset(eval_args)
-    logger.info(f"Loaded {len(eval_dataset)} eval samples from {eval_data_path}")
-    return eval_dataset
 
 
 def train_async_no_generation(args):
