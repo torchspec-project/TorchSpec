@@ -26,9 +26,9 @@ import time
 from pathlib import Path
 
 import ray
+import wandb
 from tqdm import tqdm
 
-import wandb
 from torchspec.training.checkpoint import (
     _read_checkpoint_metadata,
     _write_checkpoint_metadata,
