@@ -42,8 +42,9 @@ inference:
   inference_num_gpus: 16
   inference_num_gpus_per_engine: 16
   inference_num_gpus_per_node: 8
-  max_sample_pool_size: 0
+  max_sample_pool_size: 32
   inference_buffer_threshold: 8
+  inference_fetch_batch: 32
   inference_batch_size: 8
   sglang:
     tp_size: 16
@@ -66,8 +67,8 @@ mooncake:
   metadata_server: null
   protocol: tcp # Change this to RDMA for good performance.
   hidden_dim: 7168
-  global_segment_size: 48GB
-  local_buffer_size: 8GB
+  global_segment_size: 128GB
+  local_buffer_size: 16GB
   host_buffer_pool_size: 4
   # device_name: mlx5_0,mlx5_1 # Please change this to correct network devices.
   # enable_gpu_direct: true
