@@ -21,6 +21,7 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
+import copy
 import sys
 import time
 from collections import namedtuple
@@ -41,6 +42,7 @@ from torchspec.controller import (
     run_training_loop,
     setup_async_training_with_engines,
 )
+from torchspec.data.dataset import load_conversation_dataset
 from torchspec.inference import prepare_inference_engines
 from torchspec.ray.placement_group import (
     allocate_train_group,
@@ -210,7 +212,7 @@ def _load_eval_dataset(args):
     logger.info(f"Loaded {len(eval_dataset)} eval samples from {eval_data_path}")
     return eval_dataset
 
-  
+
 def train_async_no_generation(args):
     """Entry point for Eagle3 distillation training without generation.
 
