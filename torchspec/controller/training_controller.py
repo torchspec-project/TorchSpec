@@ -22,11 +22,13 @@
 Async Training Controller for decoupled inference and training.
 
 Data flow:
-  Dataset → Prompt Buffer → Inference Manager → Sample Pool → Train Queues → Training Workers
+  load_dataset(args) → Stored Dataset → Prompt Buffer → Inference Manager
+    → Sample Pool → Train Queues → Training Workers
+  (Stored dataset is retained for epoch reloads and vocab mapping computation.)
 
-Controller only manages metadata and mooncake keys, not actual tensor data.
-Inference writes tensors to mooncake and sends keys back to controller.
-Tracks exact bytes in pool for Mooncake backpressure control.
+Controller manages the tokenized dataset (for epoch reloads and vocab mapping),
+prompt metadata, and mooncake keys. Actual inference tensor data is stored in
+mooncake; the controller only tracks keys and byte sizes for backpressure.
 
 Batch Size Design:
   micro_batch_size                   # Samples per GPU per dispatch (user config)
@@ -46,6 +48,7 @@ Batch Size Design:
     4. Forward/backward for each micro-batch, optimizer step after last one
 """
 
+import copy
 import threading
 import time
 from collections import deque
@@ -110,6 +113,8 @@ class AsyncTrainingController:
     """Central controller for async training pipeline.
 
     Responsibilities:
+      - Loads and stores tokenized datasets for training and eval
+      - Computes vocab mappings for draft model pruning
       - Manages prompt buffer (samples waiting for inference)
       - Manages sample pool (completed inferences waiting for training)
       - Dispatches batches to per-DP training queues when pool is full
@@ -141,6 +146,9 @@ class AsyncTrainingController:
         self.dispatch_batch_size = args.dispatch_batch_size
         self.eval_dispatch_batch_size = args.eval_dispatch_batch_size
         self._data_id_counter = 0
+
+        self._stored_dataset: list | None = None
+        self._stored_eval_dataset: list | None = None
 
         self._start_time = time.time()
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
@@ -179,6 +187,69 @@ class AsyncTrainingController:
                     )
                 self.prompt_buffer.append(entry)
             return len(dataset)
+
+    def load_dataset(self, args) -> int:
+        """Load and tokenize dataset on the controller, store for epoch reloads, and prime the prompt buffer."""
+        from torchspec.data.dataset import load_conversation_dataset
+
+        self._stored_dataset = load_conversation_dataset(args)
+        if not self._stored_dataset:
+            raise ValueError(
+                f"Training dataset is empty after tokenization. "
+                f"Check train_data_path='{args.train_data_path}', "
+                f"max_seq_length={getattr(args, 'max_seq_length', None)}, "
+                f"and chat_template settings."
+            )
+        count = self.add_dataset(self._stored_dataset)
+        logger.info(f"Controller loaded dataset: {count} samples")
+        return count
+
+    def reload_dataset(self) -> int:
+        """Re-add the stored dataset to the prompt buffer (epoch reload)."""
+        assert self._stored_dataset is not None, "No stored dataset to reload"
+        return self.add_dataset(self._stored_dataset)
+
+    def load_eval_dataset(self, args) -> int:
+        """Load eval dataset on the controller and store it. Returns size (0 if none)."""
+        eval_data_path = getattr(args, "eval_data_path", None)
+        if not eval_data_path:
+            return 0
+
+        from torchspec.data.dataset import load_conversation_dataset
+
+        eval_args = copy.copy(args)
+        eval_args.train_data_path = eval_data_path
+        self._stored_eval_dataset = load_conversation_dataset(eval_args)
+        count = len(self._stored_eval_dataset)
+        logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")
+        return count
+
+    def submit_eval_dataset(self) -> int:
+        """Submit the stored eval dataset for inference (prepended with high priority)."""
+        assert self._stored_eval_dataset is not None, "No stored eval dataset"
+        return self.set_eval_dataset(self._stored_eval_dataset)
+
+    def get_dataset_size(self) -> int:
+        if self._stored_dataset is None:
+            raise RuntimeError(
+                "get_dataset_size() called but no dataset has been loaded. "
+                "Call load_dataset() first."
+            )
+        return len(self._stored_dataset)
+
+    def get_eval_dataset_size(self) -> int:
+        return len(self._stored_eval_dataset) if self._stored_eval_dataset is not None else 0
+
+    def compute_vocab_mapping(self, target_vocab_size: int, draft_vocab_size: int) -> tuple:
+        """Generate vocab mapping on the controller using the stored dataset."""
+        from torchspec.data.preprocessing import generate_vocab_mapping
+
+        assert self._stored_dataset is not None, "No stored dataset for vocab mapping"
+        return generate_vocab_mapping(
+            prompts=self._stored_dataset,
+            target_vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+        )
 
     # ─────────────────────────────────────────────────────────────
     # Interface for Inference Manager

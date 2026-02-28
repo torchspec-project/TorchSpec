@@ -21,56 +21,124 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
-import copy
-import os
 import sys
+import time
+from collections import namedtuple
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Generator
 
 import ray
-import yaml
+from omegaconf import OmegaConf
 
+from torchspec import AutoDraftModelConfig
+from torchspec.config.train_config import config_to_flat_args, load_config, save_config
+from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
+    AsyncTrainingController,
     auto_calculate_training_steps,
     build_mooncake_config,
     run_training_loop,
     setup_async_training_with_engines,
 )
-from torchspec.data.dataset import load_conversation_dataset
-from torchspec.data.preprocessing import generate_vocab_mapping
 from torchspec.inference import prepare_inference_engines
 from torchspec.ray.placement_group import (
     allocate_train_group,
     create_placement_groups,
 )
+from torchspec.training.trainer_actor import TrainerActor
 from torchspec.transfer.mooncake.utils import launch_mooncake_master
 from torchspec.utils.logging import init_tracking, logger
 
+_Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
 
-def parse_nested_config():
-    """Parse nested YAML config and convert to flat args.
 
-    Supports configs with nested sections matching the Config dataclass:
-    model, dataset, training, debug, inference, logging, mooncake, sglang.
+class _InitTimer:
+    """Lightweight segmented timer for initialization phases."""
 
-    The nested config is flattened via config_to_flat_args(), with mooncake
-    sections getting a name prefix (mooncake_*).
+    def __init__(self) -> None:
+        self._t0 = time.time()
+        self._phases: list[_Phase] = []
+        self._pending: dict[str, float] = {}
+
+    @contextmanager
+    def phase(self, name: str) -> Generator[None, None, None]:
+        """Time a synchronous phase."""
+        start = time.time()
+        yield
+        self._phases.append(_Phase(name, time.time() - start, is_async=False, blocked=0.0))
+
+    def begin_async(self, name: str) -> None:
+        """Mark the start of an async operation (e.g., ray.remote dispatch)."""
+        self._pending[name] = time.time()
+
+    def wait(self, name: str, refs) -> Any:
+        """Wrap ray.get for async phases. Returns the result."""
+        if name not in self._pending:
+            raise ValueError(f"No async phase '{name}' was started via begin_async()")
+        t_before = time.time()
+        result = ray.get(refs)
+        t_after = time.time()
+        dispatch_time = self._pending.pop(name)
+        total = t_after - dispatch_time
+        blocked = t_after - t_before
+        self._phases.append(_Phase(name, total, is_async=True, blocked=blocked))
+        return result
+
+    def log_summary(self) -> None:
+        total = time.time() - self._t0
+        lines = ["Initialization timing:"]
+        for p in self._phases:
+            suffix = f"  (blocked {p.blocked:.2f}s)" if p.is_async else ""
+            lines.append(f"  {p.name:<48s} {p.duration:>8.2f}s{suffix}")
+        lines.append(f"  {'─' * 57}")
+        lines.append(f"  {'Total':<48s} {total:>8.2f}s")
+        logger.info("\n".join(lines))
+
+
+def parse_config():
+    """Parse YAML config and convert to flat args.
+
+    Supports configs with sections matching the Config dataclass:
+    model, dataset, training, debug, inference, logging, mooncake.
+
+    The config is flattened via config_to_flat_args(), with mooncake and
+    inference.sglang sections getting a name prefix (mooncake_*, sglang_*).
+
+    If ``output_dir`` is set, the resolved config is saved to
+    ``output_dir/config.yaml`` for reproducibility (creating the directory
+    if necessary).  If ``--print-config-only`` is passed, the resolved
+    config is printed and the process exits.
     """
-    from torchspec.config.train_config import config_to_flat_args, load_config
 
-    parser = argparse.ArgumentParser(description="Train with nested config")
+    parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
+    parser.add_argument("--config", "-c", type=str, required=True, help="Path to YAML config")
     parser.add_argument(
-        "--config", "-c", type=str, required=True, help="Path to nested YAML config"
+        "--print-config-only", action="store_true", help="Print resolved config and exit"
     )
-    parser.add_argument("--print-config", action="store_true", help="Print config and exit")
 
     args, unknown = parser.parse_known_args()
 
     config = load_config(config_path=args.config, cli_args=unknown if unknown else None)
 
-    if args.print_config:
-        from omegaconf import OmegaConf
+    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))
 
-        print(OmegaConf.to_yaml(config))
+    if args.print_config_only:
         sys.exit(0)
+
+    # Persist the fully-resolved config (including CLI overrides) so the
+    # exact training configuration can be reproduced later.
+    if OmegaConf.select(config, "output_dir"):
+        output_dir = Path(config.output_dir)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_config(config, str(output_dir / "config.yaml"))
+            logger.info(f"Saved resolved config to {output_dir / 'config.yaml'}")
+        except OSError as e:
+            logger.warning(
+                f"Failed to save resolved config to {output_dir / 'config.yaml'}: {e}. "
+                "Training will continue without saving the config."
+            )
 
     flat_args = config_to_flat_args(config)
 
@@ -94,10 +162,11 @@ def parse_nested_config():
 
 
 def _resolve_batch_size(args):
-    """Derive per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
+    """Derive dp_size, per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
     )
+    args.dp_size = dp_size
     sp_size = getattr(args, "sp_size", None)
     if sp_size is not None and sp_size != 1:
         raise NotImplementedError(f"Sequence parallel is not yet supported (got sp_size={sp_size})")
@@ -114,8 +183,6 @@ def _resolve_batch_size(args):
 
 def _get_draft_model_config(args):
     """Resolve draft model config from args or auto-generate from target model."""
-    from torchspec import AutoDraftModelConfig
-    from torchspec.config.utils import generate_draft_model_config
 
     draft_config_path = getattr(args, "draft_model_config", None)
     if draft_config_path is not None:
@@ -143,7 +210,7 @@ def _load_eval_dataset(args):
     logger.info(f"Loaded {len(eval_dataset)} eval samples from {eval_data_path}")
     return eval_dataset
 
-
+  
 def train_async_no_generation(args):
     """Entry point for Eagle3 distillation training without generation.
 
@@ -154,60 +221,79 @@ def train_async_no_generation(args):
     Mooncake master is launched as a Ray actor to handle tensor storage coordination.
     """
     init_tracking(args)
+    timer = _InitTimer()
 
-    dataset = load_conversation_dataset(args)
-    eval_dataset = _load_eval_dataset(args)
+    # [1] Create controller early (lightweight: only needs args + dp_size)
+    with timer.phase("Create controller"):
+        controller = AsyncTrainingController.remote(args, args.dp_size)
 
-    auto_calculate_training_steps(args, len(dataset))
+    # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
+    timer.begin_async("Dataset loading")
+    dataset_size_ref = controller.load_dataset.remote(args)
+    eval_dataset_size_ref = controller.load_eval_dataset.remote(args)
 
-    draft_model_config = _get_draft_model_config(args)
-    args.draft_model_config_obj = draft_model_config
+    # [3] Do initialization that doesn't depend on dataset in parallel
+    with timer.phase("Driver-side init"):
+        draft_model_config = _get_draft_model_config(args)
+        args.draft_model_config_obj = draft_model_config
 
-    # Generate vocab mapping if vocab pruning is enabled
+        pgs = create_placement_groups(args)
+        launch_mooncake_master(args)
+        mooncake_config = build_mooncake_config(args)
+
+    # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
+    dataset_size, eval_dataset_size = timer.wait(
+        "Dataset loading", [dataset_size_ref, eval_dataset_size_ref]
+    )
+    logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
+
+    # [5] Auto-calculate training steps (needs dataset_size)
+    with timer.phase("Auto-calculate training steps"):
+        auto_calculate_training_steps(args, dataset_size)
+
+    # [6] Generate vocab mapping on controller if vocab pruning is enabled
     vocab_mapping = None
     draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
     vocab_size = draft_model_config.vocab_size
     if draft_vocab_size is not None and draft_vocab_size != vocab_size:
-        vocab_mapping = generate_vocab_mapping(
-            prompts=dataset,
-            target_vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
+        with timer.phase("Vocab mapping"):
+            logger.info(
+                f"Computing vocab mapping on controller "
+                f"(target={vocab_size}, draft={draft_vocab_size})..."
+            )
+            vocab_mapping = ray.get(
+                controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
+            )
+            logger.info(
+                f"Generated vocab mapping: "
+                f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
+            )
+
+    # [7] Create training actors + inference engines (args now has num_train_steps)
+    timer.begin_async("Actor initialization")
+    with timer.phase("Allocate actors + dispatch init"):
+        train_group = allocate_train_group(
+            args=args,
+            num_nodes=args.training_num_nodes,
+            num_gpus_per_node=args.training_num_gpus_per_node,
+            pg=pgs["training"],
+            training_class=TrainerActor,
         )
-        logger.info(
-            f"Generated vocab mapping: d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
+        train_init_refs = train_group.async_init(
+            args, role="training", mooncake_config=mooncake_config, with_ref=False
         )
 
-    pgs = create_placement_groups(args)
+        inference_engines, engine_init_refs = prepare_inference_engines(
+            args, pgs["inference"], mooncake_config
+        )
 
-    launch_mooncake_master(args)
-
-    from torchspec.training.trainer_actor import TrainerActor
-
-    mooncake_config = build_mooncake_config(args)
-
-    # Phase 1: Create actors and fire init calls (non-blocking)
-    train_group = allocate_train_group(
-        args=args,
-        num_nodes=args.training_num_nodes,
-        num_gpus_per_node=args.training_num_gpus_per_node,
-        pg=pgs["training"],
-        training_class=TrainerActor,
-    )
-    train_init_refs = train_group.async_init(
-        args, role="training", mooncake_config=mooncake_config, with_ref=False
-    )
-
-    inference_engines, engine_init_refs = prepare_inference_engines(
-        args, pgs["inference"], mooncake_config
-    )
-
-    # Phase 2: Wait for all init to complete concurrently
+    # [8] Wait for all actor init to complete concurrently
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
         f"inference engines to initialize in parallel..."
     )
-    all_results = ray.get(train_init_refs + engine_init_refs)
+    all_results = timer.wait("Actor initialization", train_init_refs + engine_init_refs)
 
     train_results = all_results[:n_train]
     assert len(set(train_results)) == 1
@@ -219,46 +305,26 @@ def train_async_no_generation(args):
         train_group.set_vocab_buffers(*vocab_mapping)
         logger.info("Loaded vocab mapping into training actors")
 
-    controller, inference_manager = setup_async_training_with_engines(
-        args, train_group, mooncake_config, inference_engines
-    )
+    # [9] Setup async training with pre-created controller
+    with timer.phase("Setup async training"):
+        controller, inference_manager = setup_async_training_with_engines(
+            args, train_group, mooncake_config, inference_engines, controller=controller
+        )
 
-    dataset_size = len(dataset)
-    dataset_ref = ray.put(dataset)
-    del dataset
+    timer.log_summary()
 
+    # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(
         args,
-        dataset_ref,
         controller,
         inference_manager,
         train_group,
         inference_engines=inference_engines,
-        eval_dataset=eval_dataset,
         dataset_size=dataset_size,
+        eval_dataset_size=eval_dataset_size,
     )
 
 
-def _detect_nested_config() -> bool:
-    """Detect if using nested config format by checking for nested YAML structure."""
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg in ("--config", "-c") and i + 1 < len(sys.argv) - 1:
-            config_path = sys.argv[i + 2]
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    data = yaml.safe_load(f) or {}
-                return any(key in data for key in ("model", "training", "inference"))
-    return False
-
-
 if __name__ == "__main__":
-    if _detect_nested_config():
-        logger.info("Detected nested config format, using parse_nested_config()")
-        args = parse_nested_config()
-    else:
-        raise NotImplementedError(
-            "Flat config format is not supported in this version. "
-            "Please use nested YAML config with --config."
-        )
-
+    args = parse_config()
     train_async_no_generation(args)
