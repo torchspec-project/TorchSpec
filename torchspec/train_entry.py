@@ -50,6 +50,7 @@ from torchspec.ray.placement_group import (
 )
 from torchspec.training.trainer_actor import TrainerActor
 from torchspec.transfer.mooncake.utils import launch_mooncake_master
+from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import init_tracking, logger
 
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
@@ -227,7 +228,9 @@ def train_async_no_generation(args):
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
-        controller = AsyncTrainingController.remote(args, args.dp_size)
+        controller = AsyncTrainingController.options(
+            runtime_env={"env_vars": get_torchspec_env_vars()}
+        ).remote(args, args.dp_size)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")

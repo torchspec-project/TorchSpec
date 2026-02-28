@@ -24,6 +24,7 @@ import math
 
 import ray
 
+from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
 
@@ -68,7 +69,9 @@ def setup_async_training_with_engines(
         )
 
     if controller is None:
-        controller = AsyncTrainingController.remote(args, dp_size)
+        controller = AsyncTrainingController.options(
+            runtime_env={"env_vars": get_torchspec_env_vars()}
+        ).remote(args, dp_size)
 
     max_concurrent = getattr(args, "max_concurrent_batches", 1)
     inference_manager = AsyncInferenceManager.remote(
