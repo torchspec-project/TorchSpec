@@ -25,6 +25,7 @@ if __name__ == "__main__":
 
     engine = sgl.Engine(
         model_path=model_path,
+        disable_radix_cache=True,
         disable_cuda_graph=True,
         enable_return_hidden_states=True,
         enable_aux_hidden_states=True,

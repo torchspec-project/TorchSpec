@@ -127,6 +127,7 @@ class Trainer(abc.ABC):
         mooncake_config = dataclasses.replace(
             mooncake_config,
             global_segment_size=0,
+            async_put_pool_size=0,
         )
 
         store = EagleMooncakeStore(mooncake_config)

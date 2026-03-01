@@ -14,7 +14,7 @@ if [ ! -d "$SGLANG_DIR" ]; then
 fi
 
 SGLANG_COMMIT=$(grep "^ARG SGLANG_COMMIT=" "$SGLANG_DIR/Dockerfile" | cut -d= -f2)
-SGLANG_FOLDER_NAME=$(grep "^SGLANG_FOLDER_NAME=" "$SCRIPT_DIR/build_conda.sh" | cut -d= -f2 | tr -d '"')
+SGLANG_FOLDER_NAME="${SGLANG_FOLDER_NAME:-$(grep "^SGLANG_FOLDER_NAME=" "$SCRIPT_DIR/build_conda.sh" | cut -d= -f2 | tr -d '"')}"
 
 if [ -z "$SGLANG_COMMIT" ]; then
     echo "Error: Could not find SGLANG_COMMIT in $SGLANG_DIR/Dockerfile"
@@ -26,24 +26,30 @@ if [ -z "$SGLANG_FOLDER_NAME" ]; then
     SGLANG_FOLDER_NAME="_sglang"
 fi
 
+if [[ "$SGLANG_FOLDER_NAME" = /* ]]; then
+    SGLANG_PATH="$SGLANG_FOLDER_NAME"
+else
+    SGLANG_PATH="$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
+fi
+
 echo "SGLANG_VERSION: $SGLANG_VERSION"
 echo "SGLANG_COMMIT: $SGLANG_COMMIT"
-echo "Using folder: $SGLANG_FOLDER_NAME"
+echo "Using folder: $SGLANG_PATH"
 
-if [ ! -d "$PROJECT_ROOT/$SGLANG_FOLDER_NAME" ]; then
-    echo "Error: $SGLANG_FOLDER_NAME directory not found"
+if [ ! -d "$SGLANG_PATH" ]; then
+    echo "Error: $SGLANG_PATH directory not found"
     exit 1
 fi
 
-cd "$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
+cd "$SGLANG_PATH"
 
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    echo "Error: $SGLANG_FOLDER_NAME is not a git repository"
+    echo "Error: $SGLANG_PATH is not a git repository"
     exit 1
 fi
 
 if ! git rev-parse "$SGLANG_COMMIT" > /dev/null 2>&1; then
-    echo "Error: Commit $SGLANG_COMMIT not found in $SGLANG_FOLDER_NAME repository"
+    echo "Error: Commit $SGLANG_COMMIT not found in $SGLANG_PATH repository"
     exit 1
 fi
 
@@ -64,9 +70,9 @@ if [ "$(git rev-parse HEAD)" = "$(git rev-parse $SGLANG_COMMIT)" ]; then
         git status --short
         echo ""
         echo "Please commit them first:"
-        echo "  cd $SGLANG_FOLDER_NAME && git add -A && git commit -m 'your message'"
+        echo "  cd $SGLANG_PATH && git add -A && git commit -m 'your message'"
     else
-        echo "Please make and commit your changes in $SGLANG_FOLDER_NAME first."
+        echo "Please make and commit your changes in $SGLANG_PATH first."
     fi
     exit 1
 fi
@@ -76,7 +82,7 @@ if [ "$has_uncommitted" = true ]; then
     git status --short
     echo ""
     echo "Please commit them first:"
-    echo "  cd $SGLANG_FOLDER_NAME && git add -A && git commit --amend --no-edit"
+    echo "  cd $SGLANG_PATH && git add -A && git commit --amend --no-edit"
     exit 1
 fi
 

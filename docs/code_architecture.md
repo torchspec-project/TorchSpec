@@ -222,7 +222,6 @@ inference:
 mooncake:
   master_addr: null
   protocol: rdma                  # or "tcp"
-  host_buffer_size: 32GB
 
 logging:
   report_to: wandb
