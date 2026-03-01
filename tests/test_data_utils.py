@@ -6,7 +6,6 @@ import pytest
 from torchspec.data import utils as data_utils
 from torchspec.data.utils import is_local_data_path
 
-
 # ---------------------------------------------------------------------------
 # is_local_data_path
 # ---------------------------------------------------------------------------
