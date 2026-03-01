@@ -18,12 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import datetime
 import logging
 import os
 
 import torch.distributed as dist
 
 from torchspec.utils import wandb as wandb_utils
+
+_LOG_FORMAT = "[%(asctime)s] %(filename)s:%(lineno)d %(levelname)s %(message)s"
 
 
 def _get_logger_level():
@@ -45,9 +48,7 @@ def setup_logger(log_level=None, actor_name=None, ip_addr=None):
     _logger.setLevel(log_level)
     handler = logging.StreamHandler()
     if ip_addr is None:
-        handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(filename)s:%(lineno)d %(levelname)s %(message)s")
-        )
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
     else:
         rank = os.environ.get("RANK", 0)
         handler.setFormatter(
@@ -61,6 +62,46 @@ def setup_logger(log_level=None, actor_name=None, ip_addr=None):
 
 
 logger = setup_logger()
+
+
+def setup_file_logging(
+    role: str,
+    rank: int | str,
+    group: int = 0,
+    log_dir: str | None = None,
+) -> None:
+    """Add a FileHandler to the module-level logger for per-role/per-node/per-rank file logging."""
+    if log_dir is None:
+        log_dir = os.environ.get("TORCHSPEC_LOG_DIR")
+    if log_dir is None:
+        return
+
+    for h in logger.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+
+    try:
+        from torchspec.utils.misc import get_current_node_ip
+
+        node_ip = get_current_node_ip()
+    except Exception:
+        node_ip = "unknown"
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_path = os.path.join(log_dir, role, node_ip)
+    filename = f"{role}_g{group}_rank{rank}_{timestamp}.log"
+    filepath = os.path.join(dir_path, filename)
+
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        fh = logging.FileHandler(filepath)
+        fh.setFormatter(logging.Formatter(_LOG_FORMAT))
+        fh.setLevel(logger.level)
+        logger.addHandler(fh)
+        logger.info(f"File logging enabled: {filepath}")
+    except OSError:
+        logger.warning(f"Could not set up file logging at {filepath} — NFS may not be available")
 
 
 def print_with_rank(message):

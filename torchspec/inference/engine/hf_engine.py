@@ -33,7 +33,7 @@ import torch
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
-from torchspec.utils.logging import logger
+from torchspec.utils.logging import logger, setup_file_logging
 
 
 class HFEngine(InferenceEngine, RayActor):
@@ -50,12 +50,14 @@ class HFEngine(InferenceEngine, RayActor):
         args,
         rank: int,
         base_gpu_id: int | None = None,
+        engine_group: int = 0,
     ):
         self.args = args
         self.rank = rank
         self.base_gpu_id = base_gpu_id
         self._engine = None
         self._mooncake_config = None
+        setup_file_logging("inference", self.rank, group=engine_group)
 
     def init(self, mooncake_config=None) -> None:
         """Initialize the HFRunner on the allocated GPU.

@@ -28,6 +28,7 @@ from torchspec import AutoDraftModelConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group
+from torchspec.utils.logging import setup_file_logging
 
 
 class TrainerActor(RayActor):
@@ -43,6 +44,7 @@ class TrainerActor(RayActor):
         os.environ["RANK"] = str(self._rank)
 
         self.setup_gpu()
+        setup_file_logging("training", self._rank)
 
     def init(self, args: Namespace, role: str, mooncake_config=None, with_ref: bool = False) -> int:
         self.args = args

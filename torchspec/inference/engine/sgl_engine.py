@@ -38,7 +38,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
-from torchspec.utils.logging import logger
+from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
 
 # Keys that users might plausibly put in extra_args but are managed by
@@ -76,6 +76,7 @@ class SglEngine(InferenceEngine, RayActor):
         base_gpu_id: int | None = None,
         num_gpus_per_engine: int = 1,
         node_rank: int = 0,
+        engine_group: int = 0,
     ):
         """Store configuration but don't load model yet.
 
@@ -85,6 +86,7 @@ class SglEngine(InferenceEngine, RayActor):
             base_gpu_id: Base GPU ID from placement group.
             num_gpus_per_engine: Number of GPUs this engine uses (for TP).
             node_rank: Node rank for multi-node TP (0 = head).
+            engine_group: Group index to disambiguate multiple engine groups on the same node.
         """
         self.args = args
         self.rank = rank
@@ -96,6 +98,7 @@ class SglEngine(InferenceEngine, RayActor):
         self._mooncake_store = None
         self._hidden_size = None
         self.local_gpu_id = None
+        setup_file_logging("inference", self.rank, group=engine_group)
 
     def init(self, mooncake_config=None, dist_init_addr: str | None = None) -> None:
         """Initialize the sgl.Engine on the allocated GPU.
