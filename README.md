@@ -85,6 +85,33 @@ Set `TORCHSPEC_LOG_LEVEL=DEBUG` for verbose logging when diagnosing issues:
 TORCHSPEC_LOG_LEVEL=DEBUG ./examples/qwen3-8b-single-node/run.sh
 ```
 
+### Per-Rank File Logging
+
+Set `TORCHSPEC_LOG_DIR` to an <b> absolute path </b> on a shared filesystem (NFS) to enable per-rank log files for every Ray actor (training and inference):
+
+```bash
+export TORCHSPEC_LOG_DIR=/my_project/running_logs
+```
+
+This creates a structured directory with one file per actor, organized by role and node:
+
+```
+running_logs/
+  training/
+    10.0.0.1/
+      training_g0_rank0_20260301_080012.log
+      training_g0_rank1_20260301_080012.log
+    10.0.0.2/
+      training_g0_rank2_20260301_080013.log
+  inference/
+    10.0.0.1/
+      inference_g0_rank0_20260301_080014.log
+    10.0.0.2/
+      inference_g0_rank1_20260301_080015.log
+```
+
+The path must be an absolute path on a shared filesystem (NFS) accessible from all nodes. If `TORCHSPEC_LOG_DIR` is not set or the path is not writable, per-rank file logging is disabled and only Ray's default stdout/stderr capture is used.
+
 | Issue | Reference |
 |-------|-----------|
 | Stuck or failing distributed runs, Ray actor errors | [docs/debugging_ray_jobs.md](docs/debugging_ray_jobs.md) |
