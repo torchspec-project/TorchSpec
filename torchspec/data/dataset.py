@@ -34,7 +34,6 @@ from torchspec.data.utils import (
     flatten_multimodal_content,
     load_hf_dataset,
 )
-from torchspec.data.parse import create_parser
 from torchspec.utils.logging import logger
 
 _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
@@ -82,10 +81,14 @@ def _tokenize_single(args):
     }
 
 
-def _init_format_worker(chat_template_name):
+def _init_format_worker(tokenizer_path, trust_remote_code, chat_template_name):
+    from torchspec.data.parse import create_parser
+    from torchspec.utils.processing import load_tokenizer
+
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
+    tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
-    _worker_state["parser"] = create_parser(None, _worker_state["template"])
+    _worker_state["parser"] = create_parser(tokenizer, _worker_state["template"])
 
 
 def _format_single(args):
@@ -173,20 +176,24 @@ def load_conversation_dataset(args):
         data_id = sample.get("id", f"sample_{idx}")
         raw_samples.append((data_id, messages, multimodal_inputs))
 
-    logger.info(f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers...")
+    logger.info(
+        f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."
+    )
 
     # Pass 2: process in parallel
     work_items = [(messages, max_length) for _, messages, _ in raw_samples]
 
     if defer_tokenization:
         worker_init = _init_format_worker
-        worker_initargs = (chat_template_name,)
+        worker_initargs = (args.target_model_path, True, chat_template_name)
         worker_fn = _format_single
         desc = "Formatting dataset"
     else:
         last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
         if last_turn_loss_only:
-            logger.info("last_turn_loss_only=True: loss mask will only cover the last assistant turn")
+            logger.info(
+                "last_turn_loss_only=True: loss mask will only cover the last assistant turn"
+            )
         worker_init = _init_tokenize_worker
         worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only)
         worker_fn = _tokenize_single

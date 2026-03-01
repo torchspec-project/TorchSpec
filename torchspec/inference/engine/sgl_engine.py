@@ -423,21 +423,13 @@ class SglEngine(InferenceEngine, RayActor):
                 seq_len = result["meta_info"].get("prompt_tokens")
                 if seq_len is None:
                     if use_prompts:
-                        logger.warning(
+                        raise RuntimeError(
                             f"SglEngine rank {self.rank}: 'prompt_tokens' missing from "
-                            f"meta_info for data_id={data_ids[i]}; cannot reliably "
-                            f"determine seq_len from formatted_prompts (char count != token count)."
+                            f"meta_info for data_id={data_ids[i]}. The engine must report "
+                            f"prompt_tokens when using formatted_prompts (defer_tokenization mode)."
                         )
-                        seq_len = 0
                     else:
                         seq_len = len(input_ids_list_of_lists[i])
-
-                if seq_len == 0:
-                    logger.debug(
-                        f"SglEngine rank {self.rank}: skipping mooncake_key={key} "
-                        f"with seq_len=0 for data_id={data_ids[i]}"
-                    )
-                    continue
 
                 tensor_shapes = self._get_tensor_shapes(seq_len)
                 logger.debug(

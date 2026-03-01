@@ -169,11 +169,19 @@ class AsyncTrainingController:
             for sample in dataset:
                 if isinstance(sample, dict):
                     data_id = sample.get("data_id") or self._generate_data_id()
+                    input_ids = sample.get("input_ids")
+                    packed_loss_mask = sample.get("packed_loss_mask")
+                    if input_ids is not None and packed_loss_mask is None:
+                        raise ValueError(
+                            f"packed_loss_mask is required when input_ids is provided "
+                            f"(data_id={data_id}). Use defer_tokenization=True to skip "
+                            f"tokenization entirely."
+                        )
                     entry = InferenceInput(
                         data_id=data_id,
                         prompt=sample.get("prompt", sample),
-                        input_ids=sample.get("input_ids"),
-                        packed_loss_mask=sample.get("packed_loss_mask"),
+                        input_ids=input_ids,
+                        packed_loss_mask=packed_loss_mask,
                         formatted_prompt=sample.get("formatted_prompt"),
                         metadata=sample.get("metadata", {}),
                         multimodal_inputs=sample.get("multimodal_inputs"),
