@@ -32,13 +32,18 @@ from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
 
-def is_local_data_path(path: str) -> bool:
-    """True if *path* looks like a local file/directory rather than a HF Hub dataset ID."""
+def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
+    """True if *path* looks like a local file/directory rather than a HF Hub dataset ID.
+
+    When *base_dir* is given, relative paths are probed against it instead of
+    the process CWD.
+    """
     if path.startswith((".", "/", "~")):
         return True
     if os.path.splitext(path)[1].lower() in _LOCAL_DATA_EXTS:
         return True
-    return os.path.exists(path)
+    probe = os.path.join(base_dir, path) if base_dir is not None else path
+    return os.path.exists(probe)
 
 
 class DataCollatorWithPadding:

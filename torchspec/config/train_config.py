@@ -27,8 +27,19 @@ from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
 
 from torchspec.config.inference_config import InferenceConfig
-from torchspec.data.utils import is_local_data_path
 from torchspec.utils.logging import logger
+
+_LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
+
+
+def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
+    """True if *path* looks like a local file/directory rather than a HF Hub dataset ID."""
+    if path.startswith((".", "/", "~")):
+        return True
+    if os.path.splitext(path)[1].lower() in _LOCAL_DATA_EXTS:
+        return True
+    probe = os.path.join(base_dir, path) if base_dir is not None else path
+    return os.path.exists(probe)
 
 
 @dataclass
@@ -159,7 +170,7 @@ def _resolve_relative_paths(config: DictConfig, base_dir: str) -> None:
                 OmegaConf.update(config, dotted_key, expanded)
             continue
 
-        if dotted_key in _ALWAYS_LOCAL_PATH_KEYS or is_local_data_path(expanded):
+        if dotted_key in _ALWAYS_LOCAL_PATH_KEYS or is_local_data_path(expanded, base_dir=base_dir):
             OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
 
 
