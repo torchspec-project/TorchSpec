@@ -118,10 +118,15 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         last_hidden_states: Optional[torch.Tensor],
         target: Optional[torch.Tensor] = None,
     ) -> Dict[str, Tuple[int, ...]]:
-        """Store Eagle3 output tensors using zero-copy batch_put_from.
+        """Store Eagle3 output tensors via async batch_put_from.
 
-        Uses GPU Direct RDMA when available (NIC reads directly from GPU memory),
-        otherwise falls back to staging through a pinned host buffer.
+        DtoH staging runs on ``_copy_stream`` so the caller's compute stream
+        is never blocked.  The RDMA transfer runs on a background thread via
+        ``AsyncPutManager``.  With *pool_size* host buffers the caller almost
+        never waits — ``wait_for_buffer`` only blocks when every buffer is
+        still in-flight.
+
+        For GPU Direct send the path is synchronous (no DtoH needed).
         """
         logger.debug("put: starting for key=%s", key)
         keys = [f"{key}_hs", f"{key}_ids"]
@@ -137,42 +142,34 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
             buf = self._gpu_send_buffer
+            buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+            self._do_sync_batch_put(keys, buffer_ptrs, sizes)
         else:
             buf = self._host_buffer_pool.get_buffer()
-        buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+            self._async_put_manager.check_last_error()
+            self._async_put_manager.wait_for_buffer(buf.ptr)
 
-        total_bytes = sum(sizes)
+            # Stage DtoH on a dedicated stream so the default (compute) stream
+            # is free to run the next prefill concurrently.
+            compute_event = torch.cuda.Event()
+            compute_event.record()
 
-        def _run_batch_put() -> List[Tuple[str, int, int, int]]:
-            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
-            failures: List[Tuple[str, int, int, int]] = []
-            for k, r, ptr, size in zip(keys, results, buffer_ptrs, sizes):
-                if r != 0:
-                    failures.append((k, r, ptr, size))
-            return failures
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_event(compute_event)
+                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                copy_done = torch.cuda.Event()
+                copy_done.record()
 
-        failures = _run_batch_put()
+            for t in tensors:
+                if t.is_cuda:
+                    t.record_stream(self._copy_stream)
 
-        if failures:
-            for k in keys:
-                try:
-                    self._store.remove(k)
-                except Exception:
-                    logger.debug(
-                        "Failed to remove partial key %s after batch_put_from failure.",
-                        k,
-                    )
-            failure_details = ", ".join(f"{k} (code={r})" for k, r, _, _ in failures)
-            config_details = (
-                f"total_bytes={_format_bytes(total_bytes)}, "
-                f"global_segment_size={_format_bytes(self.config.global_segment_size)}, "
-                f"local_buffer_size={_format_bytes(self.config.local_buffer_size)}, "
-                f"host_buffer_size={_format_bytes(self.config.host_buffer_size)}"
-            )
-            raise RuntimeError(
-                f"batch_put_from failed for keys: {failure_details}. "
-                f"{config_details}. Consider increasing Mooncake segment/buffer sizes "
-                "or reducing batch/sequence length/prefetch depth."
+            self._async_put_manager.submit(
+                keys,
+                buffer_ptrs,
+                sizes,
+                buf.ptr,
+                wait_event=copy_done,
             )
 
         shapes = {
@@ -184,13 +181,52 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if last_hidden_states is not None:
             shapes["last_hidden_states"] = tuple(last_hidden_states.shape)
 
-        logger.debug(
-            "put: completed key=%s, total_bytes=%s, shapes=%s",
-            key,
-            _format_bytes(total_bytes),
-            shapes,
-        )
+        logger.debug("put: completed key=%s, shapes=%s", key, shapes)
         return shapes
+
+    def flush(self) -> None:
+        """Block until all in-flight async puts have completed.
+
+        Called before returning mooncake keys to the controller so that
+        consumers can GET immediately.  Because ``put()`` stages DtoH on
+        ``_copy_stream``, the copies are typically finished by the time
+        this is called — the wait is only for the (fast) RDMA transfer.
+        """
+        self._async_put_manager.check_last_error()
+        self._async_put_manager.drain()
+        self._async_put_manager.check_last_error()
+
+    def _do_sync_batch_put(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+    ) -> None:
+        """Synchronous batch_put_from with error handling."""
+        total_bytes = sum(sizes)
+        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+        failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+        if failures:
+            for k in keys:
+                try:
+                    self._store.remove(k)
+                except Exception:
+                    logger.debug(
+                        "Failed to remove partial key %s after batch_put_from failure.",
+                        k,
+                    )
+            failure_details = ", ".join(f"{k} (code={r})" for k, r in failures)
+            config_details = (
+                f"total_bytes={_format_bytes(total_bytes)}, "
+                f"global_segment_size={_format_bytes(self.config.global_segment_size)}, "
+                f"local_buffer_size={_format_bytes(self.config.local_buffer_size)}, "
+                f"host_buffer_size={_format_bytes(self.config.host_buffer_size)}"
+            )
+            raise RuntimeError(
+                f"batch_put_from failed for keys: {failure_details}. "
+                f"{config_details}. Consider increasing Mooncake segment/buffer sizes "
+                "or reducing batch/sequence length/prefetch depth."
+            )
 
     @staticmethod
     def _stage_tensors_into_buffer(buf, tensors: List[torch.Tensor]) -> Tuple[List[int], List[int]]:
@@ -401,7 +437,6 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
             buf_size = buf.size()
             if buf_size != expected_size:
-                # DEBUG: Print detailed info
                 actual_elements = buf_size // element_size if element_size > 0 else 0
                 logger.error(
                     f"Size mismatch for {name} (key={keys[i]}): "

@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import List, Optional
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -106,6 +107,99 @@ class HostBufferPool:
         for buf in self._buffers:
             buf.free()
         self._buffers.clear()
+
+
+class AsyncPutManager:
+    """Runs batch_put_from on a background thread so the caller can return immediately.
+
+    Tracks one in-flight ``Future`` per host-buffer pointer.  Before a buffer is
+    reused the caller must call :meth:`wait_for_buffer` to block until the
+    previous transfer on that buffer completes.
+
+    Uses a ``ThreadPoolExecutor`` whose width matches the buffer pool size so
+    all transfers within a batch can run concurrently.
+    """
+
+    def __init__(self, store: Any, max_workers: int = 1):
+        self._store = store
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="async_put")
+        self._in_flight: Dict[int, Future] = {}
+        self._last_error: Optional[BaseException] = None
+
+    def check_last_error(self) -> None:
+        """Re-raise the first async failure that hasn't been surfaced yet."""
+        if self._last_error is not None:
+            err = self._last_error
+            self._last_error = None
+            raise err
+
+    def wait_for_buffer(self, buffer_ptr: int) -> None:
+        """Block until the in-flight transfer using *buffer_ptr* finishes.
+
+        Raises the original exception if the transfer failed.
+        """
+        future = self._in_flight.pop(buffer_ptr, None)
+        if future is None:
+            return
+        try:
+            future.result()
+        except Exception as exc:
+            self._last_error = exc
+            raise
+
+    def submit(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+        owner_buffer_ptr: int,
+        wait_event: Optional[Any] = None,
+    ) -> None:
+        """Submit a ``batch_put_from`` to the background thread.
+
+        *owner_buffer_ptr* is the base pointer of the host buffer that owns the
+        staged data — used as the key for :meth:`wait_for_buffer`.
+
+        *wait_event* is an optional CUDA event to synchronize on before the
+        RDMA transfer (used when DtoH staging runs on a separate stream).
+
+        GPU tensor lifetime is managed by the caller via
+        ``record_stream`` — the CUDA caching allocator keeps the underlying
+        memory alive until the copy stream passes the recorded point.
+        """
+        future = self._executor.submit(self._do_put, keys, buffer_ptrs, sizes, wait_event)
+        self._in_flight[owner_buffer_ptr] = future
+
+    def _do_put(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+        wait_event: Optional[Any] = None,
+    ) -> None:
+        if wait_event is not None:
+            wait_event.synchronize()
+        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+        failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+        if failures:
+            detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+            raise RuntimeError(f"async batch_put_from failed: {detail}")
+
+    def drain(self) -> None:
+        """Wait for every in-flight transfer to finish."""
+        for ptr, future in list(self._in_flight.items()):
+            try:
+                future.result()
+            except Exception as exc:
+                if self._last_error is None:
+                    self._last_error = exc
+                logger.warning("async put error during drain: %s", exc)
+        self._in_flight.clear()
+
+    def shutdown(self) -> None:
+        """Drain pending work and shut down the thread pool."""
+        self.drain()
+        self._executor.shutdown(wait=True)
 
 
 class _GPUBuffer:
