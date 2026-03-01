@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 import argparse
-import sys
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +27,19 @@ from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
 
 from torchspec.config.inference_config import InferenceConfig
+from torchspec.utils.logging import logger
+
+_LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
+
+
+def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
+    """True if *path* looks like a local file/directory rather than a HF Hub dataset ID."""
+    if path.startswith((".", "/", "~")):
+        return True
+    if os.path.splitext(path)[1].lower() in _LOCAL_DATA_EXTS:
+        return True
+    probe = os.path.join(base_dir, path) if base_dir is not None else path
+    return os.path.exists(probe)
 
 
 @dataclass
@@ -135,10 +148,51 @@ class Config:
     output_dir: str = ""
 
 
+_ALWAYS_LOCAL_PATH_KEYS = ("output_dir", "cache_dir", "model_download_dir")
+_DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
+
+
+def _resolve_relative_paths(config: DictConfig, base_dir: str) -> None:
+    """Resolve local relative paths in *config* against *base_dir* (in-place).
+
+    Always-local keys (output_dir, cache_dir, …) are absolutized unconditionally.
+    Data-path keys are only absolutized when ``is_local_data_path`` says they look
+    like filesystem paths (as opposed to HF Hub dataset IDs).
+    """
+    for dotted_key in (*_ALWAYS_LOCAL_PATH_KEYS, *_DATA_PATH_KEYS):
+        val = OmegaConf.select(config, dotted_key, default=None)
+        if not (isinstance(val, str) and val):
+            continue
+
+        expanded = os.path.expanduser(val)
+        if os.path.isabs(expanded):
+            if expanded != val:
+                OmegaConf.update(config, dotted_key, expanded)
+            continue
+
+        if dotted_key in _ALWAYS_LOCAL_PATH_KEYS or is_local_data_path(expanded, base_dir=base_dir):
+            OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
+
+
+def _save_config_snapshot(config: DictConfig) -> None:
+    """Save the resolved config to output_dir/config.yaml if output_dir is set."""
+    output_dir = OmegaConf.select(config, "output_dir", default=None)
+    if not output_dir:
+        return
+    dest = Path(output_dir) / "config.yaml"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        save_config(config, str(dest))
+        logger.info(f"Saved resolved config to {dest}")
+    except OSError as e:
+        logger.warning(f"Failed to save config to {dest}: {e}")
+
+
 def load_config(
     config_path: Optional[str] = None,
     cli_args: Optional[list] = None,
     base_config: Optional[DictConfig] = None,
+    save_snapshot: bool = False,
 ) -> DictConfig:
     schema = OmegaConf.structured(Config)
 
@@ -149,6 +203,7 @@ def load_config(
 
     if config_path is not None:
         file_config = OmegaConf.load(config_path)
+        _resolve_relative_paths(file_config, os.path.dirname(os.path.abspath(config_path)))
         configs_to_merge.append(file_config)
 
     if cli_args:
@@ -156,53 +211,9 @@ def load_config(
         configs_to_merge.append(cli_config)
 
     config = OmegaConf.merge(*configs_to_merge)
-    return config
-
-
-def parse_args_and_config() -> DictConfig:
-    parser = argparse.ArgumentParser(
-        description="Train Eagle3",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python train.py --config configs/llama3.yaml
-  python train.py --config configs/llama3.yaml training.micro_batch_size=4
-  python train.py --config configs/base.yaml --config configs/experiment.yaml
-  python train.py training.learning_rate=1e-5 model.target_model_path=/path/to/model
-        """,
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        action="append",
-        dest="configs",
-        help="Path to YAML config file(s). Can be specified multiple times to merge configs.",
-    )
-    parser.add_argument(
-        "--print-config",
-        action="store_true",
-        help="Print the final merged config and exit",
-    )
-
-    args, unknown = parser.parse_known_args()
-
-    schema = OmegaConf.structured(Config)
-    configs_to_merge = [schema]
-
-    if args.configs:
-        for config_path in args.configs:
-            file_config = OmegaConf.load(config_path)
-            configs_to_merge.append(file_config)
-
-    if unknown:
-        cli_config = OmegaConf.from_dotlist(unknown)
-        configs_to_merge.append(cli_config)
-
-    config = OmegaConf.merge(*configs_to_merge)
-
-    if args.print_config:
-        print(OmegaConf.to_yaml(config))
-        sys.exit(0)
+    _resolve_relative_paths(config, os.getcwd())
+    if save_snapshot:
+        _save_config_snapshot(config)
 
     return config
 

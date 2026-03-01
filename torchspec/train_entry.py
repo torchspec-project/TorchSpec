@@ -25,14 +25,14 @@ import sys
 import time
 from collections import namedtuple
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Generator
 
 import ray
 from omegaconf import OmegaConf
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from torchspec import AutoDraftModelConfig
-from torchspec.config.train_config import config_to_flat_args, load_config, save_config
+from torchspec.config.train_config import config_to_flat_args, load_config
 from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
     AsyncTrainingController,
@@ -105,11 +105,6 @@ def parse_config():
 
     The config is flattened via config_to_flat_args(), with mooncake and
     inference.sglang sections getting a name prefix (mooncake_*, sglang_*).
-
-    If ``output_dir`` is set, the resolved config is saved to
-    ``output_dir/config.yaml`` for reproducibility (creating the directory
-    if necessary).  If ``--print-config-only`` is passed, the resolved
-    config is printed and the process exits.
     """
 
     parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
@@ -120,26 +115,14 @@ def parse_config():
 
     args, unknown = parser.parse_known_args()
 
-    config = load_config(config_path=args.config, cli_args=unknown if unknown else None)
+    config = load_config(
+        config_path=args.config, cli_args=unknown if unknown else None, save_snapshot=True
+    )
 
     logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))
 
     if args.print_config_only:
         sys.exit(0)
-
-    # Persist the fully-resolved config (including CLI overrides) so the
-    # exact training configuration can be reproduced later.
-    if OmegaConf.select(config, "output_dir"):
-        output_dir = Path(config.output_dir)
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            save_config(config, str(output_dir / "config.yaml"))
-            logger.info(f"Saved resolved config to {output_dir / 'config.yaml'}")
-        except OSError as e:
-            logger.warning(
-                f"Failed to save resolved config to {output_dir / 'config.yaml'}: {e}. "
-                "Training will continue without saving the config."
-            )
 
     flat_args = config_to_flat_args(config)
 
@@ -210,8 +193,10 @@ def train_async_no_generation(args):
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
+        driver_node_id = ray.get_runtime_context().get_node_id()
         controller = AsyncTrainingController.options(
-            runtime_env={"env_vars": get_torchspec_env_vars()}
+            runtime_env={"env_vars": get_torchspec_env_vars()},
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, args.dp_size)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
