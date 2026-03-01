@@ -328,8 +328,12 @@ class AsyncTrainingController:
         return self.train_queues
 
     def get_pool_size(self) -> int:
-        """Get current size of sample pool."""
-        return len(self.sample_pool)
+        # Exclude eval samples during eval as inference has to run.
+        train_size = len(self.sample_pool)
+        if self._eval_expected_count > 0:
+            return train_size
+        with self._eval_pool_lock:
+            return train_size + len(self.eval_pool)
 
     def get_pool_bytes(self) -> int:
         """Get current bytes in sample pool (for Mooncake backpressure)."""
