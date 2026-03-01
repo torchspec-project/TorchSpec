@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -116,8 +117,9 @@ class AsyncPutManager:
     reused the caller must call :meth:`wait_for_buffer` to block until the
     previous transfer on that buffer completes.
 
-    Uses a ``ThreadPoolExecutor`` whose width matches the buffer pool size so
-    all transfers within a batch can run concurrently.
+    Multiple worker threads are used so DtoH-copy and event-synchronization can
+    overlap, but ``batch_put_from`` calls are serialized with ``_put_lock``
+    because ``MooncakeDistributedStore`` is not thread-safe for concurrent puts.
     """
 
     def __init__(self, store: Any, max_workers: int = 1):
@@ -125,6 +127,7 @@ class AsyncPutManager:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="async_put")
         self._in_flight: Dict[int, Future] = {}
         self._last_error: Optional[BaseException] = None
+        self._put_lock = threading.Lock()
 
     def check_last_error(self) -> None:
         """Re-raise the first async failure that hasn't been surfaced yet."""
@@ -189,7 +192,8 @@ class AsyncPutManager:
             if device_index is not None:
                 torch.cuda.set_device(device_index)
             wait_event.synchronize()
-        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+        with self._put_lock:
+            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
         failures = [(k, r) for k, r in zip(keys, results) if r != 0]
         if failures:
             for k in keys:

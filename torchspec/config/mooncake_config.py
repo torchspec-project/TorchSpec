@@ -173,6 +173,8 @@ class MooncakeConfig:
         os.environ["MOONCAKE_PROTOCOL"] = self.protocol
         os.environ["MOONCAKE_DEVICE_NAME"] = self.device_name
         os.environ["MOONCAKE_ENABLE_GPU_DIRECT"] = "1" if self.enable_gpu_direct else "0"
+        if self.async_put_pool_size is not None:
+            os.environ["MOONCAKE_ASYNC_PUT_POOL_SIZE"] = str(self.async_put_pool_size)
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
@@ -196,6 +198,9 @@ class MooncakeConfig:
         host_buffer_env = os.getenv("MOONCAKE_HOST_BUFFER_SIZE")
         host_buffer_size = int(host_buffer_env) if host_buffer_env is not None else None
 
+        pool_size_env = os.getenv("MOONCAKE_ASYNC_PUT_POOL_SIZE")
+        async_put_pool_size = int(pool_size_env) if pool_size_env is not None else None
+
         return cls(
             local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv(
@@ -210,6 +215,7 @@ class MooncakeConfig:
             ),
             local_buffer_size=int(os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", str(512 * 1024 * 1024))),
             host_buffer_size=host_buffer_size,
+            async_put_pool_size=async_put_pool_size,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE_NAME", ""),
             enable_gpu_direct=os.getenv("MOONCAKE_ENABLE_GPU_DIRECT", "0") == "1",

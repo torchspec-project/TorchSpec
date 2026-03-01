@@ -192,7 +192,7 @@ class SglEngine(InferenceEngine, RayActor):
         # extra_args can override them; protected keys are set after
         # extra_args and cannot be overridden.
         engine_kwargs = {
-            "log_level": "warning",
+            "log_level": "info",
         }
 
         # Apply extra_args (can override defaults above, but not protected keys)

@@ -93,17 +93,18 @@ class MooncakeHiddenStateStore(ABC):
             )
 
         pool_size = self.config.async_put_pool_size
-        self._host_buffer_pool = HostBufferPool(
-            buffer_size=self.config.host_buffer_size,
-            pool_size=pool_size,
-        )
-        self._host_buffer_pool.initialize()
+        if pool_size > 0:
+            self._host_buffer_pool = HostBufferPool(
+                buffer_size=self.config.host_buffer_size,
+                pool_size=pool_size,
+            )
+            self._host_buffer_pool.initialize()
 
-        for buf in self._host_buffer_pool._buffers:
-            self._register_buffer(buf.ptr, buf.size)
+            for buf in self._host_buffer_pool._buffers:
+                self._register_buffer(buf.ptr, buf.size)
 
-        self._async_put_manager = AsyncPutManager(store=self._store, max_workers=pool_size)
-        logger.info("Async put manager created (pool_size=%d)", pool_size)
+            self._async_put_manager = AsyncPutManager(store=self._store, max_workers=pool_size)
+            logger.info("Async put manager created (pool_size=%d)", pool_size)
 
         if self.config.enable_gpu_direct and torch.cuda.is_available():
             self._setup_gpu_direct(device)
@@ -198,6 +199,21 @@ class MooncakeHiddenStateStore(ABC):
             logger.warning("Failed to register buffer: %s", e)
 
         return False
+
+    def warmup_rdma(self) -> None:
+        """Do a small test PUT to warm up the RDMA data path."""
+        import uuid
+
+        self._ensure_initialized()
+        if self._host_buffer_pool is None:
+            logger.debug("Skipping RDMA warmup — no host buffer pool (get-only store)")
+            return
+        key = f"_warmup_{uuid.uuid4().hex[:8]}"
+        buf = self._host_buffer_pool.get_buffer()
+        size = 4096
+        self._store.batch_put_from([key], [buf.ptr], [size])
+        self._store.remove(key)
+        logger.info("RDMA warmup complete")
 
     def remove(self, key: str) -> None:
         """Remove data from Mooncake Store."""
