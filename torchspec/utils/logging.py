@@ -76,6 +76,11 @@ def setup_file_logging(
     if log_dir is None:
         return
 
+    for h in logger.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+
     try:
         from torchspec.utils.misc import get_current_node_ip
 
