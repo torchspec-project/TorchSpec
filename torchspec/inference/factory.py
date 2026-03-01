@@ -33,7 +33,7 @@ from torchspec.utils.logging import logger
 _alive_worker_engines: list = []
 
 
-def create_inference_engines(args, inference_pg, mooncake_config):
+def create_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines based on configured engine type (blocking).
 
     Supports "hf" and "sgl" engine types via inference_engine_type config.
@@ -50,7 +50,11 @@ def create_inference_engines(args, inference_pg, mooncake_config):
     logger.info(f"Using {engine_type} engine for inference")
 
     engines = init_engines(
-        args, inference_pg, engine_type=engine_type, mooncake_config=mooncake_config
+        args,
+        inference_pg,
+        engine_type=engine_type,
+        mooncake_config=mooncake_config,
+        engine_group=engine_group,
     )
 
     logger.info(
@@ -59,7 +63,7 @@ def create_inference_engines(args, inference_pg, mooncake_config):
     return engines
 
 
-def prepare_inference_engines(args, inference_pg, mooncake_config):
+def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines and fire init calls without waiting.
 
     Use this to parallelize engine initialization with other setup work
@@ -78,14 +82,14 @@ def prepare_inference_engines(args, inference_pg, mooncake_config):
     logger.info(f"Preparing {engine_type} inference engines...")
 
     if engine_type == "hf":
-        engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config)
+        engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config, engine_group)
     else:
-        engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config)
+        engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
 
     return engines, init_refs
 
 
-def init_engines(args, pg, engine_type: str, mooncake_config=None) -> list:
+def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize inference engines with Ray placement groups.
 
     Args:
@@ -98,14 +102,14 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None) -> list:
         List of head engines for dispatching requests.
     """
     if engine_type == "hf":
-        return _init_hf_engines(args, pg, mooncake_config)
+        return _init_hf_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "sgl":
-        return _init_sgl_engines(args, pg, mooncake_config)
+        return _init_sgl_engines(args, pg, mooncake_config, engine_group)
     else:
         raise ValueError(f"Unknown engine_type: {engine_type}")
 
 
-def _prepare_hf_engines(args, pg, mooncake_config=None) -> tuple[list, list]:
+def _prepare_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> tuple[list, list]:
     """Create HF engine actors and fire init calls without waiting.
 
     Returns:
@@ -128,17 +132,20 @@ def _prepare_hf_engines(args, pg, mooncake_config=None) -> tuple[list, list]:
         num_gpus_per_engine,
         HFRayActor,
         mooncake_config,
+        engine_group=engine_group,
     )
 
 
-def _init_hf_engines(args, pg, mooncake_config=None) -> list:
+def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize HF engines with Ray placement groups."""
-    engines, init_handles = _prepare_hf_engines(args, pg, mooncake_config)
+    engines, init_handles = _prepare_hf_engines(args, pg, mooncake_config, engine_group)
     _wait_for_init(init_handles, "HF", timeout=300)
     return engines
 
 
-def _prepare_sgl_engines(args, pg, mooncake_config=None) -> tuple[list, list]:
+def _prepare_sgl_engines(
+    args, pg, mooncake_config=None, engine_group: int = 0
+) -> tuple[list, list]:
     """Create SGL engine actors and fire init calls without waiting.
 
     Handles three cases:
@@ -201,6 +208,7 @@ def _prepare_sgl_engines(args, pg, mooncake_config=None) -> tuple[list, list]:
             base_gpu_id=base_gpu_id,
             num_gpus_per_engine=gpus_per_engine,
             node_rank=node_rank,
+            engine_group=engine_group,
         )
         engines.append(engine)
 
@@ -251,9 +259,9 @@ def _prepare_sgl_engines(args, pg, mooncake_config=None) -> tuple[list, list]:
     return engines, init_handles
 
 
-def _init_sgl_engines(args, pg, mooncake_config=None) -> list:
+def _init_sgl_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize SGLang engines with Ray placement groups (blocking)."""
-    head_engines, init_handles = _prepare_sgl_engines(args, pg, mooncake_config)
+    head_engines, init_handles = _prepare_sgl_engines(args, pg, mooncake_config, engine_group)
     nnodes = getattr(args, "sglang_nnodes", 1)
     init_timeout = getattr(args, "sglang_init_timeout", 300 if nnodes == 1 else 600)
     _wait_for_init(init_handles, "Sgl", timeout=init_timeout)
@@ -268,6 +276,7 @@ def _create_and_init_actors(
     ray_actor_cls,
     mooncake_config,
     extra_kwargs=None,
+    engine_group: int = 0,
 ) -> tuple[list, list]:
     """Create Ray actors and start their init calls.
 
@@ -279,6 +288,7 @@ def _create_and_init_actors(
         ray_actor_cls: The ray.remote-wrapped actor class.
         mooncake_config: Mooncake configuration dict.
         extra_kwargs: Extra kwargs to pass to actor constructor (e.g. num_gpus_per_engine for Sgl).
+        engine_group: Group index for log file disambiguation.
 
     Returns:
         Tuple of (engines list, init_handles list).
@@ -302,7 +312,12 @@ def _create_and_init_actors(
 
         env_vars = get_torchspec_env_vars()
 
-        constructor_kwargs = {"args": args, "rank": i, "base_gpu_id": base_gpu_id}
+        constructor_kwargs = {
+            "args": args,
+            "rank": i,
+            "base_gpu_id": base_gpu_id,
+            "engine_group": engine_group,
+        }
         if extra_kwargs:
             constructor_kwargs.update(extra_kwargs)
 
