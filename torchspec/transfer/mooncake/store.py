@@ -26,6 +26,7 @@ from mooncake.store import MooncakeDistributedStore
 
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.transfer.mooncake.buffers import (
+    AsyncPutManager,
     GPUReceiveBuffer,
     GPUSendBuffer,
     HostBufferPool,
@@ -48,9 +49,11 @@ class MooncakeHiddenStateStore(ABC):
         self._initialized = False
         self._registered_buffers: Dict[int, int] = {}
         self._host_buffer_pool: Optional[HostBufferPool] = None
+        self._async_put_manager: Optional[AsyncPutManager] = None
         self._gpu_receive_buffer: Optional[GPUReceiveBuffer] = None
         self._gpu_send_buffer: Optional[GPUSendBuffer] = None
         self._gpu_direct_available = False
+        self._copy_stream: Optional[torch.cuda.Stream] = None
 
     def setup(self, device: torch.device | int | None = None) -> None:
         """Initialize the Mooncake Store client."""
@@ -89,24 +92,34 @@ class MooncakeHiddenStateStore(ABC):
                 f"and metadata server is available at {self.config.metadata_server}"
             )
 
+        pool_size = self.config.async_put_pool_size
         self._host_buffer_pool = HostBufferPool(
             buffer_size=self.config.host_buffer_size,
-            pool_size=self.config.host_buffer_pool_size,
+            pool_size=pool_size,
         )
         self._host_buffer_pool.initialize()
 
         for buf in self._host_buffer_pool._buffers:
             self._register_buffer(buf.ptr, buf.size)
 
+        self._async_put_manager = AsyncPutManager(store=self._store, max_workers=pool_size)
+        logger.info("Async put manager created (pool_size=%d)", pool_size)
+
         if self.config.enable_gpu_direct and torch.cuda.is_available():
             self._setup_gpu_direct(device)
 
+        if torch.cuda.is_available():
+            cuda_device = device if device is not None else torch.device("cuda")
+            self._copy_stream = torch.cuda.Stream(device=cuda_device)
+            logger.info("DtoH copy stream created on %s", cuda_device)
+
         self._initialized = True
         logger.info(
-            "Mooncake Store client initialized (protocol=%s, device=%s, gpu_direct=%s)",
+            "Mooncake Store client initialized (protocol=%s, device=%s, gpu_direct=%s, pool_size=%d)",
             self.config.protocol,
             self.config.device_name or "(auto-discovery)",
             self._gpu_direct_available,
+            pool_size,
         )
 
     def _setup_gpu_direct(self, device: torch.device = None) -> None:
@@ -201,6 +214,9 @@ class MooncakeHiddenStateStore(ABC):
 
     def close(self) -> None:
         """Close the Mooncake Store client."""
+        if self._async_put_manager is not None:
+            self._async_put_manager.shutdown()
+            self._async_put_manager = None
         if self._gpu_send_buffer is not None:
             self._gpu_send_buffer.free()
             self._gpu_send_buffer = None
@@ -210,6 +226,7 @@ class MooncakeHiddenStateStore(ABC):
         if self._host_buffer_pool is not None:
             self._host_buffer_pool.shutdown()
             self._host_buffer_pool = None
+        self._copy_stream = None
         if self._store is not None and hasattr(self._store, "close"):
             self._store.close()
         self._initialized = False

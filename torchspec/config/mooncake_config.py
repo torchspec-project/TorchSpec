@@ -59,11 +59,10 @@ class MooncakeConfig:
     replica_num: int = 1
     enable_soft_pin: bool = False
     host_buffer_size: str | int | None = None
-    max_batch_size: int = 32
     get_batch_size: int = 1
     max_seq_len: int = 8192
     hidden_dim: int = 4096
-    host_buffer_pool_size: int = 1
+    async_put_pool_size: int | None = None
     store_full_error_codes: Tuple[int, ...] = (-200,)
     store_full_wait_seconds: float = 0.5
     store_full_log_interval_seconds: float = 5.0
@@ -90,7 +89,11 @@ class MooncakeConfig:
                 max_seq_len=self.max_seq_len,
                 batch_size=1,
                 hidden_dim=self.hidden_dim,
+                safety_margin=2.0,
             )
+
+        if self.async_put_pool_size is None:
+            self.async_put_pool_size = 1
 
         if self.gpu_buffer_size is None and self.enable_gpu_direct:
             # Size for a single get() call: get_batch_size samples (typically
@@ -135,7 +138,9 @@ class MooncakeConfig:
             "device_name": getattr(args, "mooncake_device_name", ""),
             "gpu_buffer_size": getattr(args, "mooncake_gpu_buffer_size", None),
             "enable_gpu_direct": getattr(args, "mooncake_enable_gpu_direct", False),
-            "max_batch_size": getattr(args, "mooncake_max_batch_size", 32),
+            "async_put_pool_size": getattr(
+                args, "mooncake_async_put_pool_size", getattr(args, "inference_batch_size", 1)
+            ),
             "get_batch_size": getattr(
                 args, "mooncake_get_batch_size", getattr(args, "per_dp_rank_batch_size", 1)
             ),

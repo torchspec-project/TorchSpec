@@ -2,21 +2,22 @@ torchspec sglang patch (base: 0f2df9370a)
 ---
  python/sglang/srt/entrypoints/engine.py            |  10 ++
  python/sglang/srt/entrypoints/http_server.py       |  17 +++
- python/sglang/srt/layers/logits_processor.py       |  57 ++++++++++
+ python/sglang/srt/layers/logits_processor.py       |  57 +++++++++
  python/sglang/srt/managers/detokenizer_manager.py  |   3 +
  python/sglang/srt/managers/io_struct.py            |  48 ++++++++
- python/sglang/srt/managers/schedule_batch.py       |  56 +++++++++-
- python/sglang/srt/managers/scheduler.py            |  46 ++++++++
- .../managers/scheduler_output_processor_mixin.py   | 124 ++++++++++++++++++---
+ python/sglang/srt/managers/schedule_batch.py       |  56 ++++++++-
+ python/sglang/srt/managers/scheduler.py            |  56 ++++++++-
+ .../managers/scheduler_output_processor_mixin.py   | 137 ++++++++++++++++++---
  python/sglang/srt/managers/tokenizer_manager.py    |  16 +++
+ python/sglang/srt/managers/utils.py                |   5 +-
  .../srt/model_executor/forward_batch_info.py       |   5 +-
  python/sglang/srt/model_executor/model_runner.py   |  16 +++
  python/sglang/srt/models/kimi_k25.py               |  14 +++
- python/sglang/srt/models/qwen3_next.py             |  65 ++++++++++-
+ python/sglang/srt/models/qwen3_next.py             |  65 +++++++++-
  python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
  python/sglang/srt/server_args.py                   |  21 ++++
- .../sglang/srt/speculative/spec_training_info.py   |  50 +++++++++
- 16 files changed, 528 insertions(+), 23 deletions(-)
+ .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
+ 17 files changed, 552 insertions(+), 27 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index 8d7ab8716..b2e633016 100644
@@ -137,7 +138,7 @@ index d0d7c9344..29e9c4d15 100644
          )
          del hidden_states
  
-+        # TODO: Support finegrained control over requests instead of
++        # TODO(ywang): Support finegrained control over requests instead of
 +        # forcing all requests to be spec training requests
 +
 +        # For offline spec training (prefill-only, no decode), skip sampling
@@ -455,7 +456,7 @@ index 8f3441b1b..31489b445 100644
 +    # For spec training
 +    has_spec_training: bool = False
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index e818deaa4..0854b7c95 100644
+index e818deaa4..0c89c718d 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -346,6 +346,26 @@ class Scheduler(
@@ -532,11 +533,35 @@ index e818deaa4..0854b7c95 100644
              )
              req.tokenizer = self.tokenizer
  
+@@ -2276,7 +2322,10 @@ class Scheduler(
+                     batch_result.copy_done = self.device_module.Event()
+                     if batch_result.delay_sample_func is None:
+                         self.future_map.store_to_map(future_indices, batch_result)
+-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
++                        batch_result.copy_to_cpu(
++                            return_logprob=batch.return_logprob,
++                            skip_hidden_states=batch.spec_training_info is not None,
++                        )
+                     else:
+                         batch_result.future_indices = future_indices
+ 
+@@ -2385,7 +2434,10 @@ class Scheduler(
+             _batch_result = batch_result.delay_sample_func()
+             assert _batch_result is batch_result
+             self.future_map.store_to_map(batch_result.future_indices, batch_result)
+-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
++            batch_result.copy_to_cpu(
++                return_logprob=self.cur_batch.return_logprob,
++                skip_hidden_states=self.cur_batch.spec_training_info is not None,
++            )
+ 
+     def process_batch_result(
+         self,
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index d79f929d3..5f72f0278 100644
+index d79f929d3..4f5a3e0b8 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-@@ -180,21 +180,21 @@ class SchedulerOutputProcessorMixin:
+@@ -180,21 +180,22 @@ class SchedulerOutputProcessorMixin:
                              )
                          logprob_pt += num_input_logprobs
  
@@ -566,13 +591,14 @@ index d79f929d3..5f72f0278 100644
 +                    )
 +                    if should_process_hidden_states:
 +                        self._process_hidden_states_for_req(
-+                            req, batch, logits_output, hidden_state_offset
++                            req, batch, logits_output, hidden_state_offset,
++                            copy_done_event=result.copy_done,
 +                        )
 +                        hidden_state_offset += len(req.origin_input_ids)
  
                      if req.grammar is not None:
                          # FIXME: this try-except block is for handling unexpected xgrammar issue.
-@@ -843,6 +843,65 @@ class SchedulerOutputProcessorMixin:
+@@ -843,6 +844,74 @@ class SchedulerOutputProcessorMixin:
          if req.input_token_ids_logprobs_idx is None:
              req.input_token_ids_logprobs_idx = []
  
@@ -582,6 +608,7 @@ index d79f929d3..5f72f0278 100644
 +        batch: ScheduleBatch,
 +        logits_output: LogitsProcessorOutput,
 +        hidden_state_offset: int,
++        copy_done_event=None,
 +    ):
 +        """Process hidden states during prefill for spec training or return_hidden_states."""
 +        seq_len = len(req.origin_input_ids)
@@ -595,7 +622,8 @@ index d79f929d3..5f72f0278 100644
 +            and self.eagle_mooncake_store is not None
 +        ):
 +            self._send_hidden_states_to_mooncake(
-+                req, batch, req_hidden_states, logits_output, hidden_state_offset
++                req, batch, req_hidden_states, logits_output, hidden_state_offset,
++                copy_done_event=copy_done_event,
 +            )
 +        else:
 +            pass
@@ -608,6 +636,7 @@ index d79f929d3..5f72f0278 100644
 +        hidden_states: torch.Tensor,
 +        logits_output: LogitsProcessorOutput,
 +        hidden_state_offset: int,
++        copy_done_event=None,
 +    ):
 +        import uuid
 +
@@ -625,6 +654,12 @@ index d79f929d3..5f72f0278 100644
 +                hidden_state_offset : hidden_state_offset + seq_len
 +            ]
 +
++        # When overlap is enabled, hidden_states is still on GPU (produced on
++        # the forward stream).  Establish cross-stream ordering so that put()'s
++        # _copy_stream DtoH sees the completed writes.
++        if hidden_states.is_cuda and copy_done_event is not None:
++            torch.cuda.current_stream().wait_event(copy_done_event)
++
 +        self.eagle_mooncake_store.put(
 +            key=key,
 +            hidden_states=hidden_states,
@@ -638,10 +673,13 @@ index d79f929d3..5f72f0278 100644
      def stream_output(
          self: Scheduler,
          reqs: List[Req],
-@@ -901,6 +960,15 @@ class SchedulerOutputProcessorMixin:
+@@ -901,6 +970,18 @@ class SchedulerOutputProcessorMixin:
          routed_experts = None
          customized_info = {}
  
++        if self.attn_tp_rank == 0 and self.eagle_mooncake_store is not None:
++            self.eagle_mooncake_store.flush()
++
 +        if self.attn_tp_rank == 0:
 +            spec_training_data_ids = []
 +            packed_loss_masks = []
@@ -654,7 +692,7 @@ index d79f929d3..5f72f0278 100644
          queue_times = []
          forward_entry_times = []
          prefill_launch_delays = []
-@@ -1022,6 +1090,13 @@ class SchedulerOutputProcessorMixin:
+@@ -1022,6 +1103,13 @@ class SchedulerOutputProcessorMixin:
                      spec_verify_ct.append(req.spec_verify_ct)
                      spec_accepted_tokens.append(req.spec_accepted_tokens)
  
@@ -668,7 +706,7 @@ index d79f929d3..5f72f0278 100644
                  if return_logprob:
                      if (
                          req.return_logprob
-@@ -1091,9 +1166,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1091,9 +1179,15 @@ class SchedulerOutputProcessorMixin:
                          output_token_ids_logprobs_idx.append([])
  
                  if req.return_hidden_states:
@@ -687,7 +725,7 @@ index d79f929d3..5f72f0278 100644
                  if req.return_routed_experts:
                      if routed_experts is None:
                          routed_experts = []
-@@ -1158,6 +1239,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1158,6 +1252,15 @@ class SchedulerOutputProcessorMixin:
                      placeholder_tokens_val=None,
                      retraction_counts=retraction_counts,
                      load=load,
@@ -737,6 +775,29 @@ index 69806de1d..411752d0b 100644
                  trace_req_finish(
                      rid,
                      ts=int(state.finished_time * 1e9),
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index 9eea302b7..66f5cab33 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -49,7 +49,7 @@ class GenerationBatchResult:
+     # metrics
+     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+ 
+-    def copy_to_cpu(self, return_logprob: bool):
++    def copy_to_cpu(self, return_logprob: bool, skip_hidden_states: bool = False):
+         """Copy tensors to CPU in overlap scheduling.
+         Only the tensors which are needed for processing results are copied,
+         e.g., next_token_ids, logits outputs
+@@ -63,7 +63,8 @@ class GenerationBatchResult:
+                 self.logits_output.input_token_logprobs = (
+                     self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                 )
+-        if self.logits_output.hidden_states is not None:
++        # When overlap is enabled, hidden_states stay on GPU for _copy_stream DtoH in put().
++        if self.logits_output.hidden_states is not None and not skip_hidden_states:
+             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                 "cpu", non_blocking=True
+             )
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
 index bcd1fda10..80f42f386 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py

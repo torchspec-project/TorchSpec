@@ -60,7 +60,6 @@ mooncake:
   device_name: ""
   local_hostname: null
   enable_gpu_direct: false
-  max_batch_size: 32
   max_seq_len: 8192
   hidden_dim: 4096
   gpu_buffer_size: null
