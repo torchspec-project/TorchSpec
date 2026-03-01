@@ -1,7 +1,54 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from torchspec.data import utils as data_utils
+from torchspec.data.utils import is_local_data_path
+
+
+# ---------------------------------------------------------------------------
+# is_local_data_path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "./data.jsonl",
+        "../data.jsonl",
+        "/absolute/data.jsonl",
+        "~/data.jsonl",
+        "train.json",
+        "train.parquet",
+        "data.csv",
+    ],
+)
+def test_is_local_data_path_true(path):
+    assert is_local_data_path(path) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "HuggingFaceH4/ultrachat_200k",
+        "allenai/tulu-v2-sft-mixture",
+        "namespace/dataset-name",
+    ],
+)
+def test_is_local_data_path_false_for_hub_ids(path):
+    assert is_local_data_path(path) is False
+
+
+def test_is_local_data_path_existing_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "my_dataset").mkdir()
+    assert is_local_data_path("my_dataset") is True
+
+
+# ---------------------------------------------------------------------------
+# load_hf_dataset
+# ---------------------------------------------------------------------------
 
 
 def test_load_hf_dataset_treats_existing_relative_dir_as_local(tmp_path, monkeypatch):

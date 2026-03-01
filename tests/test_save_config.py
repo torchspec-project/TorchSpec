@@ -73,8 +73,6 @@ def test_save_resolved_config_missing_output_dir():
     assert OmegaConf.select(config, "output_dir") is None
 
 
-
-
 def test_load_config_hub_dataset_id_not_absolutized(tmp_path):
     """Hub dataset ids should remain unchanged after config load."""
     cfg = tmp_path / "hub.yaml"
@@ -120,6 +118,7 @@ def test_load_config_no_snapshot_by_default(tmp_path):
 
     load_config(config_path=str(cfg), save_snapshot=True)
     assert (out_dir / "config.yaml").exists()
+
 
 def test_save_config_overwrites_existing(tmp_path):
     """Saving config twice overwrites the previous file."""
@@ -247,7 +246,9 @@ def test_parse_config_cli_overrides_saved(tmp_path, monkeypatch):
     assert reloaded.training.micro_batch_size == 32
 
 
-@pytest.mark.skipif(getattr(os, "getuid", lambda: -1)() == 0, reason="root ignores file permissions")
+@pytest.mark.skipif(
+    getattr(os, "getuid", lambda: -1)() == 0, reason="root ignores file permissions"
+)
 def test_parse_config_survives_readonly_output_dir(tmp_path, monkeypatch):
     """parse_config() logs warning but does not crash when output_dir is not writable."""
     output_dir = tmp_path / "readonly"

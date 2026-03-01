@@ -29,6 +29,17 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
+_LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
+
+
+def is_local_data_path(path: str) -> bool:
+    """True if *path* looks like a local file/directory rather than a HF Hub dataset ID."""
+    if path.startswith((".", "/", "~")):
+        return True
+    if os.path.splitext(path)[1].lower() in _LOCAL_DATA_EXTS:
+        return True
+    return os.path.exists(path)
+
 
 class DataCollatorWithPadding:
     def __init__(
@@ -368,16 +379,9 @@ def load_hf_dataset(data_path: str):
 
     Local paths are loaded directly; everything else goes to HF Hub.
     """
-
-    def is_local_path(path: str) -> bool:
-        if path.startswith((".", "/", "~")) or os.path.splitext(path)[1] != "":
-            return True
-        return os.path.exists(path)
-
     data_path = os.path.expanduser(data_path)
 
-    # local path
-    if is_local_path(data_path):
+    if is_local_data_path(data_path):
         if os.path.isfile(data_path):
             if data_path.endswith((".json", ".jsonl")):
                 return IterableDataset.from_generator(
@@ -398,7 +402,9 @@ def load_hf_dataset(data_path: str):
                 for g in globs:
                     files.extend(str(p) for p in Path(data_path).rglob(g))
                 if files:
-                    return load_dataset(fmt, data_files=sorted(files), split="train", streaming=True)
+                    return load_dataset(
+                        fmt, data_files=sorted(files), split="train", streaming=True
+                    )
             raise ValueError(f"No supported dataset files found in local directory: {data_path}")
 
         raise FileNotFoundError(f"Local dataset path not found: {data_path}")
