@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
 
 from torchspec.config.inference_config import InferenceConfig
+from torchspec.utils.logging import logger
 
 
 @dataclass
@@ -135,10 +137,60 @@ class Config:
     output_dir: str = ""
 
 
+_PATH_KEYS = [
+    "dataset.train_data_path",
+    "dataset.eval_data_path",
+    "output_dir",
+    "cache_dir",
+    "model_download_dir",
+]
+
+
+def _is_local_path_value(raw_value: str, expanded_value: str, base_dir: str) -> bool:
+    """Return whether a path-like config value should be treated as local filesystem path."""
+    if raw_value.startswith(("./", "../", "~")):
+        return True
+    if os.path.exists(expanded_value):
+        return True
+    return os.path.exists(os.path.join(base_dir, expanded_value))
+
+
+def _resolve_relative_paths(config: DictConfig, base_dir: str) -> None:
+    """Resolve local relative paths in *config* against *base_dir* (in-place)."""
+    for dotted_key in _PATH_KEYS:
+        val = OmegaConf.select(config, dotted_key, default=None)
+        if not (isinstance(val, str) and val):
+            continue
+
+        expanded = os.path.expanduser(val)
+        if os.path.isabs(expanded):
+            if expanded != val:
+                OmegaConf.update(config, dotted_key, expanded)
+            continue
+
+        if _is_local_path_value(val, expanded, base_dir):
+            OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
+
+
+def _save_config_snapshot(config: DictConfig) -> None:
+    """Save the resolved config to output_dir/config.yaml if output_dir is set."""
+    output_dir = OmegaConf.select(config, "output_dir", default=None)
+    if not output_dir:
+        return
+    dest = Path(output_dir) / "config.yaml"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        save_config(config, str(dest))
+        logger.info(f"Saved resolved config to {dest}")
+    except OSError as e:
+        logger.warning(f"Failed to save config to {dest}: {e}")
+
+
 def load_config(
     config_path: Optional[str] = None,
     cli_args: Optional[list] = None,
     base_config: Optional[DictConfig] = None,
+    save_snapshot: bool = False,
 ) -> DictConfig:
     schema = OmegaConf.structured(Config)
 
@@ -147,15 +199,21 @@ def load_config(
     if base_config is not None:
         configs_to_merge.append(base_config)
 
+    config_base_dir = os.getcwd()
     if config_path is not None:
         file_config = OmegaConf.load(config_path)
         configs_to_merge.append(file_config)
+        config_base_dir = os.path.dirname(os.path.abspath(config_path))
 
     if cli_args:
         cli_config = OmegaConf.from_dotlist(cli_args)
         configs_to_merge.append(cli_config)
 
     config = OmegaConf.merge(*configs_to_merge)
+    _resolve_relative_paths(config, config_base_dir)
+    if save_snapshot:
+        _save_config_snapshot(config)
+
     return config
 
 
@@ -192,6 +250,9 @@ Examples:
     if args.configs:
         for config_path in args.configs:
             file_config = OmegaConf.load(config_path)
+            _resolve_relative_paths(
+                file_config, os.path.dirname(os.path.abspath(config_path))
+            )
             configs_to_merge.append(file_config)
 
     if unknown:
@@ -199,10 +260,13 @@ Examples:
         configs_to_merge.append(cli_config)
 
     config = OmegaConf.merge(*configs_to_merge)
+    _resolve_relative_paths(config, os.getcwd())
 
     if args.print_config:
         print(OmegaConf.to_yaml(config))
         sys.exit(0)
+
+    _save_config_snapshot(config)
 
     return config
 

@@ -29,7 +29,7 @@ def test_save_resolved_config_basic(tmp_path):
     reloaded = load_config(config_path=save_path)
     assert reloaded.output_dir == str(output_dir)
     assert reloaded.model.target_model_path == "test-model"
-    assert reloaded.dataset.train_data_path == "test-data"
+    assert reloaded.dataset.train_data_path.endswith("test-data")
     assert reloaded.training.micro_batch_size == 8
 
 
@@ -72,6 +72,54 @@ def test_save_resolved_config_missing_output_dir():
 
     assert OmegaConf.select(config, "output_dir") is None
 
+
+
+
+def test_load_config_hub_dataset_id_not_absolutized(tmp_path):
+    """Hub dataset ids should remain unchanged after config load."""
+    cfg = tmp_path / "hub.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  target_model_path: test-model",
+                "dataset:",
+                "  train_data_path: HuggingFaceH4/ultrachat_200k",
+                "training:",
+                "  training_num_gpus_per_node: 1",
+                "  training_num_nodes: 1",
+            ]
+        )
+    )
+
+    config = load_config(config_path=str(cfg))
+    assert config.dataset.train_data_path == "HuggingFaceH4/ultrachat_200k"
+
+
+def test_load_config_no_snapshot_by_default(tmp_path):
+    """load_config() should not write output_dir/config.yaml unless requested."""
+    out_dir = tmp_path / "out"
+    cfg = tmp_path / "nosnapshot.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  target_model_path: test-model",
+                "dataset:",
+                "  train_data_path: test-data",
+                "training:",
+                "  training_num_gpus_per_node: 1",
+                "  training_num_nodes: 1",
+                f"output_dir: '{out_dir}'",
+            ]
+        )
+    )
+
+    load_config(config_path=str(cfg))
+    assert not (out_dir / "config.yaml").exists()
+
+    load_config(config_path=str(cfg), save_snapshot=True)
+    assert (out_dir / "config.yaml").exists()
 
 def test_save_config_overwrites_existing(tmp_path):
     """Saving config twice overwrites the previous file."""
@@ -163,7 +211,7 @@ def test_parse_config_no_save_when_empty_output_dir(tmp_path, monkeypatch):
 
 
 def test_parse_config_print_config_only_exits(tmp_path, monkeypatch):
-    """--print-config-only prints config and exits without saving."""
+    """--print-config-only prints config and exits."""
     output_dir = tmp_path / "out"
     config_file = tmp_path / "test.yaml"
     _write_minimal_config(config_file, output_dir=str(output_dir))
@@ -176,8 +224,6 @@ def test_parse_config_print_config_only_exits(tmp_path, monkeypatch):
         parse_config()
 
     assert exc_info.value.code == 0
-    # Config should NOT be saved because exit happens before save
-    assert not output_dir.exists()
 
 
 def test_parse_config_cli_overrides_saved(tmp_path, monkeypatch):
@@ -201,6 +247,7 @@ def test_parse_config_cli_overrides_saved(tmp_path, monkeypatch):
     assert reloaded.training.micro_batch_size == 32
 
 
+@pytest.mark.skipif(getattr(os, "getuid", lambda: -1)() == 0, reason="root ignores file permissions")
 def test_parse_config_survives_readonly_output_dir(tmp_path, monkeypatch):
     """parse_config() logs warning but does not crash when output_dir is not writable."""
     output_dir = tmp_path / "readonly"

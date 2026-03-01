@@ -20,9 +20,12 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
+from datasets import IterableDataset, load_dataset
+from huggingface_hub import hf_hub_download, list_repo_files
 
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
@@ -342,7 +345,6 @@ def _load_hub_json_files(data_path):
     Uses raw json module instead of load_dataset to avoid PyArrow schema
     inference failures on datasets with mixed-type columns.
     """
-    from huggingface_hub import hf_hub_download, list_repo_files
 
     files = list_repo_files(data_path, repo_type="dataset")
     all_json = sorted(f for f in files if f.endswith((".jsonl", ".json")))
@@ -361,23 +363,45 @@ def _load_hub_json_files(data_path):
         yield from load_local_json(local_path)
 
 
-def load_hf_dataset(data_path):
-    """Load dataset as a streaming iterator.
+def load_hf_dataset(data_path: str):
+    """Load dataset as a streaming IterableDataset.
 
-    Local JSON/JSONL and HF Hub JSON: uses raw json module to avoid PyArrow
-    schema inference failures on mixed-type columns.
-    Local Parquet/Arrow: uses load_dataset with streaming=True.
+    Local paths are loaded directly; everything else goes to HF Hub.
     """
-    from datasets import IterableDataset, load_dataset
 
-    if os.path.exists(data_path):
-        if data_path.endswith((".json", ".jsonl")):
-            return IterableDataset.from_generator(
-                load_local_json, gen_kwargs={"data_path": data_path}
-            )
-        ext = os.path.splitext(data_path)[1].lower()
-        fmt = {".parquet": "parquet", ".arrow": "arrow"}.get(ext, "json")
-        return load_dataset(fmt, data_files=data_path, split="train", streaming=True)
+    def is_local_path(path: str) -> bool:
+        if path.startswith((".", "/", "~")) or os.path.splitext(path)[1] != "":
+            return True
+        return os.path.exists(path)
 
-    # HF Hub dataset — download JSON files and read with raw json module
+    data_path = os.path.expanduser(data_path)
+
+    # local path
+    if is_local_path(data_path):
+        if os.path.isfile(data_path):
+            if data_path.endswith((".json", ".jsonl")):
+                return IterableDataset.from_generator(
+                    load_local_json, gen_kwargs={"data_path": data_path}
+                )
+            ext = os.path.splitext(data_path)[1].lower()
+            fmt = {".parquet": "parquet", ".arrow": "arrow"}.get(ext, "json")
+            return load_dataset(fmt, data_files=data_path, split="train", streaming=True)
+
+        if os.path.isdir(data_path):
+            patterns = {
+                "json": ["*.json", "*.jsonl"],
+                "parquet": ["*.parquet"],
+                "arrow": ["*.arrow"],
+            }
+            for fmt, globs in patterns.items():
+                files = []
+                for g in globs:
+                    files.extend(str(p) for p in Path(data_path).rglob(g))
+                if files:
+                    return load_dataset(fmt, data_files=sorted(files), split="train", streaming=True)
+            raise ValueError(f"No supported dataset files found in local directory: {data_path}")
+
+        raise FileNotFoundError(f"Local dataset path not found: {data_path}")
+
+    # hub path
     return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})

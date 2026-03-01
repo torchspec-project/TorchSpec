@@ -69,8 +69,12 @@ def setup_async_training_with_engines(
         )
 
     if controller is None:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        driver_node_id = ray.get_runtime_context().get_node_id()
         controller = AsyncTrainingController.options(
-            runtime_env={"env_vars": get_torchspec_env_vars()}
+            runtime_env={"env_vars": get_torchspec_env_vars()},
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, dp_size)
 
     max_concurrent = getattr(args, "max_concurrent_batches", 1)
