@@ -23,6 +23,7 @@
 import hashlib
 import os
 import time
+from functools import wraps
 from pathlib import Path
 
 import ray
@@ -125,7 +126,63 @@ def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
     return eval_metrics
 
 
-def run_training_loop(
+def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
+    """Best-effort teardown for inference manager and mooncake master actor."""
+    if inference_manager is not None:
+        try:
+            ray.get(inference_manager.stop.remote())
+        except Exception as exc:
+            logger.warning(f"Failed to stop inference manager: {exc}")
+        if inference_future is not None:
+            try:
+                ray.get(inference_future)
+            except Exception as exc:
+                logger.warning(
+                    f"Inference manager run loop exited with error during cleanup: {exc}"
+                )
+
+    mooncake_master_actor = getattr(args, "_mooncake_master_actor", None)
+    if mooncake_master_actor is not None:
+        try:
+            ray.get(mooncake_master_actor.shutdown.remote(), timeout=10)
+        except Exception as exc:
+            logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
+
+
+def _with_training_cleanup(fn):
+    @wraps(fn)
+    def _wrapped(
+        args,
+        controller,
+        inference_manager,
+        train_group,
+        inference_engines=None,
+        dataset_size=None,
+        eval_dataset_size=None,
+    ):
+        cleanup_state = {"inference_future": None}
+        try:
+            return fn(
+                args,
+                controller,
+                inference_manager,
+                train_group,
+                inference_engines=inference_engines,
+                dataset_size=dataset_size,
+                eval_dataset_size=eval_dataset_size,
+                cleanup_state=cleanup_state,
+            )
+        finally:
+            _safe_training_cleanup(
+                args=args,
+                inference_manager=inference_manager,
+                inference_future=cleanup_state["inference_future"],
+            )
+
+    return _wrapped
+
+
+def _run_training_loop_impl(
     args,
     controller,
     inference_manager,
@@ -133,6 +190,7 @@ def run_training_loop(
     inference_engines=None,
     dataset_size=None,
     eval_dataset_size=None,
+    cleanup_state: dict | None = None,
 ):
     """Run the training loop with sync training and async inference.
 
@@ -223,6 +281,8 @@ def run_training_loop(
             )
 
     inference_future = inference_manager.run.remote()
+    if cleanup_state is not None:
+        cleanup_state["inference_future"] = inference_future
     # Inference engine is alive. Run eval hs generation first.
     if eval_enabled and not eval_cache_loaded:
         _generate_eval_cache(
@@ -438,9 +498,6 @@ def run_training_loop(
 
     progress.close()
 
-    ray.get(inference_manager.stop.remote())
-    ray.get(inference_future)
-
     # Always save a final checkpoint unless saved.
     if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
@@ -455,4 +512,27 @@ def run_training_loop(
         f"Training completed: {completed_steps} steps in {final_status['elapsed_seconds']:.1f}s | "
         f"avg inference={final_status['avg_inference_speed']:.1f} entries/s | "
         f"avg training={final_status['avg_training_speed']:.1f} entries/s"
+    )
+
+
+@_with_training_cleanup
+def run_training_loop(
+    args,
+    controller,
+    inference_manager,
+    train_group,
+    inference_engines=None,
+    dataset_size=None,
+    eval_dataset_size=None,
+    cleanup_state: dict | None = None,
+):
+    return _run_training_loop_impl(
+        args,
+        controller,
+        inference_manager,
+        train_group,
+        inference_engines=inference_engines,
+        dataset_size=dataset_size,
+        eval_dataset_size=eval_dataset_size,
+        cleanup_state=cleanup_state,
     )
