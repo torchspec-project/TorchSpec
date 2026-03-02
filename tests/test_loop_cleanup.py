@@ -91,3 +91,30 @@ class TestTrainingLoopCleanup:
             inference_manager=inference_manager,
             inference_future="future-error",
         )
+
+
+def test_generate_eval_cache_waits_for_eval_dispatch_completion():
+    controller = mock.MagicMock()
+    train_group = mock.MagicMock()
+
+    # First dispatch loop: one required full eval batch is available.
+    # Completion loop: eval is still in flight once, then becomes complete.
+    controller.try_dispatch_eval_batch.remote.side_effect = [True, False]
+    controller.is_eval_dispatch_complete.remote.side_effect = [False, True]
+
+    with (
+        mock.patch("torchspec.controller.loop.ray.get", side_effect=lambda x: x),
+        mock.patch("torchspec.controller.loop.time.sleep") as mock_sleep,
+    ):
+        loop._generate_eval_cache(
+            controller=controller,
+            train_group=train_group,
+            num_dispatches=1,
+            samples_per_rank=4,
+            eval_cache_path=None,
+        )
+
+    train_group.cache_eval_samples.assert_called_once_with(4)
+    controller.finalize_eval_dispatch.remote.assert_called_once()
+    assert controller.is_eval_dispatch_complete.remote.call_count >= 2
+    mock_sleep.assert_called_once_with(0.5)

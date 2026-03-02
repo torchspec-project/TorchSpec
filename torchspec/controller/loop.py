@@ -100,8 +100,24 @@ def _generate_eval_cache(
             time.sleep(0.5)
     eval_progress.close()
 
+    # Wait until all eval samples have finished inference before clearing eval IDs.
+    # Otherwise, late eval results can be misrouted into the training pool.
+    while True:
+        if ray.get(controller.is_eval_dispatch_complete.remote()):
+            break
+        ok = ray.get(controller.try_dispatch_eval_batch.remote())
+        if ok:
+            train_group.cache_eval_samples(samples_per_rank)
+            dispatched += 1
+            logger.warning(
+                "Eval: dispatched extra full batch while waiting for completion; "
+                "check eval_dispatch_batch_size consistency"
+            )
+        else:
+            time.sleep(0.5)
+
     ray.get(controller.finalize_eval_dispatch.remote())
-    logger.info(f"Eval caching complete ({total_samples} samples per rank)")
+    logger.info(f"Eval caching complete ({dispatched * samples_per_rank} samples per rank)")
     if eval_cache_path:
         train_group.async_save_eval_cache(eval_cache_path)
         logger.info(f"Eval cache save started (async) to {eval_cache_path}")
