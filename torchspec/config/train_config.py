@@ -141,14 +141,24 @@ _ALWAYS_LOCAL_PATH_KEYS = ("output_dir", "cache_dir", "model_download_dir")
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
 
-def _resolve_relative_paths(config: DictConfig, base_dir: str) -> None:
+def _resolve_relative_paths(
+    config: DictConfig,
+    base_dir: str,
+    *,
+    skip_keys: frozenset[str] = frozenset(),
+) -> None:
     """Resolve local relative paths in *config* against *base_dir* (in-place).
 
     Always-local keys (output_dir, cache_dir, …) are absolutized unconditionally.
     Data-path keys are only absolutized when ``is_local_data_path`` says they look
     like filesystem paths (as opposed to HF Hub dataset IDs).
+
+    Keys listed in *skip_keys* are left untouched (useful for deferring
+    CWD-relative keys when resolving a file-level config).
     """
     for dotted_key in (*_ALWAYS_LOCAL_PATH_KEYS, *_DATA_PATH_KEYS):
+        if dotted_key in skip_keys:
+            continue
         val = OmegaConf.select(config, dotted_key, default=None)
         if not (isinstance(val, str) and val):
             continue
@@ -192,7 +202,11 @@ def load_config(
 
     if config_path is not None:
         file_config = OmegaConf.load(config_path)
-        _resolve_relative_paths(file_config, os.path.dirname(os.path.abspath(config_path)))
+        _resolve_relative_paths(
+            file_config,
+            os.path.dirname(os.path.abspath(config_path)),
+            skip_keys=frozenset(_ALWAYS_LOCAL_PATH_KEYS),
+        )
         configs_to_merge.append(file_config)
 
     if cli_args:

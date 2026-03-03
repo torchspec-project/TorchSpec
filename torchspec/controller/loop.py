@@ -21,7 +21,6 @@
 """Pipeline training loop: main training loop with sync training and async inference."""
 
 import time
-from functools import wraps
 
 import ray
 import wandb
@@ -63,40 +62,7 @@ def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
             logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
 
 
-def _with_training_cleanup(fn):
-    @wraps(fn)
-    def _wrapped(
-        args,
-        controller,
-        inference_manager,
-        train_group,
-        inference_engines=None,
-        dataset_size=None,
-        eval_dataset_size=None,
-    ):
-        cleanup_state = {"inference_future": None}
-        try:
-            return fn(
-                args,
-                controller,
-                inference_manager,
-                train_group,
-                inference_engines=inference_engines,
-                dataset_size=dataset_size,
-                eval_dataset_size=eval_dataset_size,
-                cleanup_state=cleanup_state,
-            )
-        finally:
-            _safe_training_cleanup(
-                args=args,
-                inference_manager=inference_manager,
-                inference_future=cleanup_state["inference_future"],
-            )
-
-    return _wrapped
-
-
-def _run_training_loop_impl(
+def training_loop(
     args,
     controller,
     inference_manager,
@@ -104,7 +70,6 @@ def _run_training_loop_impl(
     inference_engines=None,
     dataset_size=None,
     eval_dataset_size=None,
-    cleanup_state: dict | None = None,
 ):
     """Run the training loop with sync training and async inference.
 
@@ -139,27 +104,14 @@ def _run_training_loop_impl(
 
     # ── Eval setup ──────────────────────────────────────────────
     eval_state = setup_eval(controller, train_group, args, eval_dataset_size)
+
+    # Inference engine is alive. Run eval hs generation first.
+    if eval_state.eval_enabled and not eval_state.eval_cache_loaded:
+        generate_eval_cache(controller, train_group, eval_state)
+
     eval_interval = eval_state.eval_interval
     eval_enabled = eval_state.eval_enabled
-    eval_cache_loaded = eval_state.eval_cache_loaded
-    eval_cache_path = eval_state.eval_cache_path
     best_eval_score = eval_state.best_eval_score
-    num_dispatches = eval_state.num_dispatches
-    eval_samples_per_rank = eval_state.eval_samples_per_rank
-    dispatch_bs = args.per_dp_rank_batch_size * args.dp_size
-
-    inference_future = inference_manager.run.remote()
-    if cleanup_state is not None:
-        cleanup_state["inference_future"] = inference_future
-    # Inference engine is alive. Run eval hs generation first.
-    if eval_enabled and not eval_cache_loaded:
-        generate_eval_cache(
-            controller,
-            train_group,
-            num_dispatches,
-            eval_samples_per_rank,
-            eval_cache_path,
-        )
 
     # Submit training data AFTER eval hs generation so that training prompts don't
     # leak into the inference pipeline during eval.
@@ -222,7 +174,7 @@ def _run_training_loop_impl(
                         f"dispatch failed {dispatch_attempts} times "
                         f"(consecutive={consecutive_failures}), "
                         f"pool_size={status['sample_pool_size']}, "
-                        f"need={dispatch_bs}"
+                        f"need={status['dispatch_batch_size']}"
                     )
 
                 should_reload = False
@@ -232,13 +184,13 @@ def _run_training_loop_impl(
                     consecutive_failures >= 500
                     and (completed_steps > 0 or dispatches_done > 0)
                     and status is not None
-                    and status["sample_pool_size"] < dispatch_bs
+                    and status["sample_pool_size"] < status["dispatch_batch_size"]
                     and status.get("prompt_buffer_size", 0) == 0
                 ):
                     logger.warning(
                         f"Pool insufficient for dispatch "
                         f"(pool_size={status['sample_pool_size']}, "
-                        f"need={dispatch_bs}, "
+                        f"need={status['dispatch_batch_size']}, "
                         f"{dispatches_done}/{accumulation_steps} dispatches done, "
                         f"{steps_in_current_epoch}/{steps_per_epoch} steps in epoch). "
                         f"Reloading dataset."
@@ -383,7 +335,6 @@ def _run_training_loop_impl(
     )
 
 
-@_with_training_cleanup
 def run_training_loop(
     args,
     controller,
@@ -392,15 +343,21 @@ def run_training_loop(
     inference_engines=None,
     dataset_size=None,
     eval_dataset_size=None,
-    cleanup_state: dict | None = None,
 ):
-    return _run_training_loop_impl(
-        args,
-        controller,
-        inference_manager,
-        train_group,
-        inference_engines=inference_engines,
-        dataset_size=dataset_size,
-        eval_dataset_size=eval_dataset_size,
-        cleanup_state=cleanup_state,
-    )
+    inference_future = inference_manager.run.remote()
+    try:
+        return training_loop(
+            args,
+            controller,
+            inference_manager,
+            train_group,
+            inference_engines=inference_engines,
+            dataset_size=dataset_size,
+            eval_dataset_size=eval_dataset_size,
+        )
+    finally:
+        _safe_training_cleanup(
+            args=args,
+            inference_manager=inference_manager,
+            inference_future=inference_future,
+        )

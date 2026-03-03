@@ -483,13 +483,13 @@ class TestEmptyTensorShapes:
 class TestEvalDispatch:
     """Tests for eval dispatch pipeline in AsyncTrainingController."""
 
-    def _create_controller(self, per_dp_rank_batch_size=4, max_sample_pool_size=4):
+    def _create_controller(self, per_dp_rank_batch_size=4, max_sample_pool_size=4, dp_size=4):
         AsyncTrainingController = _create_controller_class()
         args = MockControllerArgs(
             per_dp_rank_batch_size=per_dp_rank_batch_size,
             max_sample_pool_size=max_sample_pool_size,
         )
-        return AsyncTrainingController(args, dp_size=1)
+        return AsyncTrainingController(args, dp_size=dp_size)
 
     def _setup_eval_and_push(self, controller, num_samples):
         """Set up eval dataset, push all inference results, return the eval data_ids."""
@@ -535,8 +535,8 @@ class TestEvalDispatch:
 
         from torchspec.training.data_fetcher import TrainSample
 
-        for _ in range(4):
-            sample = controller.eval_queues[0].get(timeout=5)
+        for q in controller.eval_queues:
+            sample = q.get(timeout=5)
             assert isinstance(sample, TrainSample)
 
     def test_try_dispatch_eval_batch_insufficient_samples(self):
@@ -545,14 +545,18 @@ class TestEvalDispatch:
 
         assert controller.try_dispatch_eval_batch() is False
 
-    def test_is_eval_dispatch_complete_all_arrived_and_drained(self):
-        controller = self._create_controller(max_sample_pool_size=4)
+    def test_finalize_eval_dispatch_all_arrived_and_drained(self):
+        controller = self._create_controller(max_sample_pool_size=4, dp_size=4)
         self._setup_eval_and_push(controller, 4)
 
         assert controller.try_dispatch_eval_batch() is True
-        assert controller.is_eval_dispatch_complete() is True
+        controller.finalize_eval_dispatch()
 
-    def test_is_eval_dispatch_complete_still_in_flight(self):
+        assert controller.get_eval_pool_size() == 0
+        assert len(controller._eval_data_ids) == 0
+        assert controller._eval_expected_count == 0
+
+    def test_finalize_eval_dispatch_fails_when_still_in_flight(self):
         controller = self._create_controller(max_sample_pool_size=4)
 
         dataset = [{"prompt": f"eval prompt {i}", "data_id": f"s{i}"} for i in range(8)]
@@ -571,10 +575,11 @@ class TestEvalDispatch:
         controller.push_inference_results(results)
 
         assert controller.try_dispatch_eval_batch() is True
-        assert controller.is_eval_dispatch_complete() is False
+        with pytest.raises(AssertionError, match="before all samples arrived"):
+            controller.finalize_eval_dispatch()
 
-    def test_finalize_eval_dispatch(self):
-        controller = self._create_controller(max_sample_pool_size=4)
+    def test_finalize_eval_dispatch_drops_remainder(self):
+        controller = self._create_controller(max_sample_pool_size=4, dp_size=4)
         self._setup_eval_and_push(controller, 6)
 
         controller.try_dispatch_eval_batch()
@@ -596,74 +601,17 @@ class TestEvalDispatch:
         assert len(controller.sample_pool) == 0
         assert len(controller.eval_pool) == 4
 
-    def test_without_hold_backpressure_can_admit_put_failed_pattern(self, monkeypatch):
-        """Demonstrate overflow pattern: backpressure admits new puts before old eval keys expire."""
-        monkeypatch.setenv("TORCHSPEC_EVAL_MOONCAKE_HOLD_SECONDS", "0")
-        AsyncTrainingController = _create_controller_class()
-        args = MockControllerArgs(per_dp_rank_batch_size=4, max_sample_pool_size=4)
-        controller = AsyncTrainingController(args, dp_size=1)
-
-        self._setup_eval_and_push(controller, 4)
-        assert controller.get_pool_size() == 4
-
-        # Dispatch eval to trainer-side read path. Actual Mooncake keys are still under lease.
-        assert controller.try_dispatch_eval_batch() is True
-        assert controller.get_pool_size() == 0
-
-        # Simulate engine admission based on controller backpressure signal only.
-        max_pool = 4
-        live_in_store = 4  # dispatched eval keys still exist in Mooncake until deferred delete.
-        inferred_capacity_from_signal = max_pool - controller.get_pool_size()
-        assert inferred_capacity_from_signal == 4
-
-        # Engine is admitted to put another full batch, which would exceed real live capacity.
-        next_put_batch = 4
-        with pytest.raises(RuntimeError, match="put failed"):
-            if live_in_store + next_put_batch > max_pool:
-                raise RuntimeError("put failed: Mooncake segment full")
-
-    def test_with_hold_backpressure_blocks_put_failed_pattern(self, monkeypatch):
-        """With hold enabled, controller pool signal preserves capacity guard during lease window."""
-        monkeypatch.setenv("TORCHSPEC_EVAL_MOONCAKE_HOLD_SECONDS", "5.5")
-        AsyncTrainingController = _create_controller_class()
-        import torchspec.controller.training_controller as training_controller_module
-
-        fake_now = [1000.0]
-        monkeypatch.setattr(training_controller_module.time, "time", lambda: fake_now[0])
-
-        args = MockControllerArgs(per_dp_rank_batch_size=4, max_sample_pool_size=4)
-        controller = AsyncTrainingController(args, dp_size=1)
-
-        self._setup_eval_and_push(controller, 4)
-        assert controller.get_pool_size() == 4
-
-        assert controller.try_dispatch_eval_batch() is True
-        # Held pressure keeps pool "full" even after dispatch.
-        assert controller.get_pool_size() == 4
-
-        max_pool = 4
-        inferred_capacity_from_signal = max_pool - controller.get_pool_size()
-        assert inferred_capacity_from_signal == 0
-
-        next_put_batch = 4
-        # Because inferred capacity is 0, scheduler should not admit this put burst.
-        assert next_put_batch > inferred_capacity_from_signal
-
-        # After hold expires, pressure drops and admission can resume.
-        fake_now[0] += 6.0
-        assert controller.get_pool_size() == 0
-
 
 class TestEvalEndToEnd:
     """End-to-end eval flow: set_eval_dataset → push results → dispatch batches → finalize."""
 
-    def _create_controller(self, max_sample_pool_size=2):
+    def _create_controller(self, max_sample_pool_size=2, dp_size=2):
         AsyncTrainingController = _create_controller_class()
         args = MockControllerArgs(
             per_dp_rank_batch_size=4,
             max_sample_pool_size=max_sample_pool_size,
         )
-        return AsyncTrainingController(args, dp_size=1)
+        return AsyncTrainingController(args, dp_size=dp_size)
 
     def test_full_chunked_drain(self):
         controller = self._create_controller(max_sample_pool_size=2)
@@ -693,8 +641,6 @@ class TestEvalEndToEnd:
 
         assert controller.get_eval_pool_size() == 1
 
-        assert controller.is_eval_dispatch_complete() is True
-
         controller.finalize_eval_dispatch()
 
         assert controller.get_eval_pool_size() == 0
@@ -704,9 +650,10 @@ class TestEvalEndToEnd:
 
         from torchspec.training.data_fetcher import TrainSample
 
-        for _ in range(6):
-            sample = controller.eval_queues[0].get(timeout=5)
-            assert isinstance(sample, TrainSample)
+        for q in controller.eval_queues:
+            for _ in range(3):
+                sample = q.get(timeout=5)
+                assert isinstance(sample, TrainSample)
 
 
 if __name__ == "__main__":

@@ -80,7 +80,8 @@ def setup_async_training_with_engines(
     )
 
     eval_queues = ray.get(controller.get_eval_queues.remote())
-    # per_dp_rank_batch_size must be 1 for eval to avoid padding.
+    # eval_from_cache re-collates individual samples with eval_micro_batch_size,
+    # so the fetcher must yield unbatched (batch_size=1) entries.
     train_group.set_eval_queues(eval_queues, mooncake_config, per_dp_rank_batch_size=1)
 
     return controller, inference_manager

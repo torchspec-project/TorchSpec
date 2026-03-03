@@ -43,12 +43,13 @@ class EvalSetupState:
     eval_cache_loaded: bool
     eval_cache_path: str | None
     best_eval_score: float
-    num_dispatches: int
-    eval_samples_per_rank: int
+    eval_dispatch_bs: int
+    eval_dataset_size: int
+    dp_size: int
 
 
 def _check_idle_timeout(
-    dispatched_count: int, last_progress_at: float, num_dispatches: int
+    dispatched_samples: int, last_progress_at: float, total_samples: int
 ) -> None:
     idle_for = time.monotonic() - last_progress_at
     if idle_for >= EVAL_CACHE_IDLE_TIMEOUT:
@@ -56,7 +57,7 @@ def _check_idle_timeout(
             "Timed out while waiting for eval cache generation "
             f"(no progress during eval for {idle_for:.1f}s, "
             f"idle_timeout={EVAL_CACHE_IDLE_TIMEOUT:.1f}s, "
-            f"dispatched={dispatched_count}/{num_dispatches})"
+            f"dispatched={dispatched_samples}/{total_samples} samples)"
         )
 
 
@@ -97,51 +98,37 @@ def update_checkpoint_eval_meta(
 def generate_eval_cache(
     controller,
     train_group,
-    num_dispatches: int,
-    samples_per_rank: int,
-    eval_cache_path: str | None,
+    eval_state: EvalSetupState,
 ) -> None:
-    """Drain eval results from inference and cache individual samples on each trainer."""
-    total_samples = num_dispatches * samples_per_rank
+    """Drain eval results from inference and cache on each trainer."""
+    eval_dataset_size = eval_state.eval_dataset_size
+    dp_size = eval_state.dp_size
+    dispatch_bs = eval_state.eval_dispatch_bs
+    eval_cache_path = eval_state.eval_cache_path
+
     last_progress_at = time.monotonic()
     logger.info(
         f"Caching eval hidden states from inference engine "
-        f"({num_dispatches} dispatches, {total_samples} samples per rank)..."
+        f"({eval_dataset_size} samples, dispatch_bs={dispatch_bs})..."
     )
-    dispatched = 0
-    eval_progress = tqdm(total=num_dispatches, desc="Eval caching", unit="dispatch")
-    while dispatched < num_dispatches:
+    dispatched_samples = 0
+    eval_progress = tqdm(total=eval_dataset_size, desc="Eval caching", unit="sample")
+
+    while dispatched_samples < eval_dataset_size:
         ok = ray.get(controller.try_dispatch_eval_batch.remote())
         if ok:
-            train_group.cache_eval_samples(samples_per_rank)
-            dispatched += 1
+            train_group.cache_eval_samples(dispatch_bs // dp_size)
+            dispatched_samples += dispatch_bs
             last_progress_at = time.monotonic()
-            eval_progress.update(1)
+            eval_progress.update(dispatch_bs)
         else:
-            _check_idle_timeout(dispatched, last_progress_at, num_dispatches)
-            time.sleep(0.5)
+            _check_idle_timeout(dispatched_samples, last_progress_at, eval_dataset_size)
+            time.sleep(0.01)
+
     eval_progress.close()
 
-    # Wait until all eval samples have finished inference before clearing eval IDs.
-    # Otherwise, late eval results can be misrouted into the training pool.
-    while True:
-        if ray.get(controller.is_eval_dispatch_complete.remote()):
-            break
-        ok = ray.get(controller.try_dispatch_eval_batch.remote())
-        if ok:
-            train_group.cache_eval_samples(samples_per_rank)
-            dispatched += 1
-            last_progress_at = time.monotonic()
-            logger.warning(
-                "Eval: dispatched extra full batch while waiting for completion; "
-                "check eval_dispatch_batch_size consistency"
-            )
-        else:
-            _check_idle_timeout(dispatched, last_progress_at, num_dispatches)
-            time.sleep(0.1)
-
     ray.get(controller.finalize_eval_dispatch.remote())
-    logger.info(f"Eval caching complete ({dispatched * samples_per_rank} samples per rank)")
+    logger.info(f"Eval caching complete ({dispatched_samples} samples)")
     if eval_cache_path:
         train_group.async_save_eval_cache(eval_cache_path)
         logger.info(f"Eval cache save started (async) to {eval_cache_path}")
@@ -172,26 +159,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
     eval_enabled = eval_dataset_size > 0
     eval_cache_path: str | None = None
     eval_cache_loaded = False
-    num_dispatches = 0
 
-    dispatch_bs = args.per_dp_rank_batch_size * args.dp_size
-    max_pool = getattr(args, "max_sample_pool_size", 0) or dispatch_bs
-    eval_samples_per_rank = max_pool // args.dp_size
-
-    if eval_enabled:
-        num_dispatches = eval_dataset_size // max_pool
-        if num_dispatches == 0:
-            logger.warning(
-                f"Eval dataset ({eval_dataset_size} samples) is smaller than "
-                f"max_sample_pool_size ({max_pool}). Disabling eval."
-            )
-            eval_enabled = False
-        else:
-            dropped = eval_dataset_size - num_dispatches * max_pool
-            if dropped > 0:
-                logger.info(
-                    f"Eval: {dropped} samples will be dropped (not enough for a full dispatch)"
-                )
+    eval_dispatch_bs = min(eval_dataset_size, args.dp_size)
 
     best_eval_score = -float("inf")
     if eval_enabled and args.checkpoint_dir:
@@ -207,8 +176,7 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
         cache_key = hashlib.md5(
             f"{getattr(args, 'eval_data_path', '')}|"
             f"{getattr(args, 'target_model_path', '')}|"
-            f"{getattr(args, 'max_seq_length', 0)}|"
-            f"{max_pool}".encode()
+            f"{getattr(args, 'max_seq_length', 0)}".encode()
         ).hexdigest()[:12]
         eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
 
@@ -220,11 +188,7 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
             )
         else:
             ray.get(controller.submit_eval_dataset.remote())
-            logger.info(
-                f"Eval: {eval_dataset_size} samples, "
-                f"{num_dispatches} dispatches, "
-                f"{eval_samples_per_rank} samples/rank"
-            )
+            logger.info(f"Eval: {eval_dataset_size} samples, dispatch_bs={eval_dispatch_bs}")
 
     return EvalSetupState(
         eval_interval=eval_interval,
@@ -232,6 +196,7 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
         eval_cache_loaded=eval_cache_loaded,
         eval_cache_path=eval_cache_path,
         best_eval_score=best_eval_score,
-        num_dispatches=num_dispatches,
-        eval_samples_per_rank=eval_samples_per_rank,
+        eval_dispatch_bs=eval_dispatch_bs,
+        eval_dataset_size=eval_dataset_size,
+        dp_size=args.dp_size,
     )

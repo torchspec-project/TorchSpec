@@ -145,8 +145,7 @@ class AsyncTrainingController:
 
         self.batch_id = 0
         self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
-        max_pool = getattr(args, "max_sample_pool_size", 0)
-        self.eval_dispatch_batch_size = max_pool or self.dispatch_batch_size
+        self.eval_dispatch_batch_size = dp_size
         self._data_id_counter = 0
 
         self._stored_dataset: list | None = None
@@ -527,33 +526,30 @@ class AsyncTrainingController:
         )
         return True
 
-    def is_eval_dispatch_complete(self) -> bool:
-        """True when all dispatchable eval batches have been sent to queues.
+    def finalize_eval_dispatch(self) -> None:
+        """Assert all eval batches were dispatched, then clean up tracking state.
 
-        Becomes true once all expected eval samples have completed inference
-        AND all full batches have been dispatched.  Remainder samples (less
-        than one batch) are not dispatched.
+        Raises AssertionError if not all expected samples have arrived or
+        undispatched full batches remain in the pool.
         """
-        if self._eval_expected_count == 0:
-            return False
         with self._eval_pool_lock:
             arrived = self._eval_dispatched_samples + len(self.eval_pool)
-        if arrived < self._eval_expected_count:
-            return False
-        # All samples arrived. Check if any full batch remains.
-        with self._eval_pool_lock:
-            return len(self.eval_pool) < self.eval_dispatch_batch_size
+            pool_remaining = len(self.eval_pool)
 
-    def finalize_eval_dispatch(self) -> None:
-        """Clean up eval tracking state after all batches have been cached.
+        assert self._eval_expected_count > 0 and arrived >= self._eval_expected_count, (
+            f"finalize_eval_dispatch called before all samples arrived "
+            f"(arrived={arrived}, expected={self._eval_expected_count})"
+        )
+        assert pool_remaining < self.eval_dispatch_batch_size, (
+            f"finalize_eval_dispatch called with undispatched full batches "
+            f"(pool={pool_remaining}, batch_size={self.eval_dispatch_batch_size})"
+        )
 
-        Drops remainder samples that didn't fill a full batch and resets
-        counters so the next eval cycle starts fresh.
-        """
         with self._eval_pool_lock:
-            remaining = len(self.eval_pool)
-            if remaining > 0:
-                logger.info(f"Eval: dropping {remaining} leftover samples that didn't fill a batch")
+            if pool_remaining > 0:
+                logger.info(
+                    f"Eval: dropping {pool_remaining} leftover samples that didn't fill a batch"
+                )
                 self.eval_pool.clear()
 
         self._eval_data_ids.clear()
