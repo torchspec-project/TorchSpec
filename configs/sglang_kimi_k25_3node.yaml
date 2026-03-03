@@ -72,8 +72,8 @@ mooncake:
   # device_name: mlx5_0,mlx5_1 # Please change this to correct network devices.
   # enable_gpu_direct: true
 
-output_dir: ./outputs/train_kimi25_mixed_3node
-cache_dir: ./cache
+output_dir: ../outputs/train_kimi25_mixed_3node
+cache_dir: ../cache
 model_download_dir: null
 
 debug:
