@@ -69,13 +69,13 @@ mooncake:
   local_buffer_size: 16GB
   protocol: rdma # Change this to RDMA for good performance.
   enable_gpu_direct: false
-  # device_name: mlx5_0,mlx5_1... # Please change this to correct network devices.
+  device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Please change this to correct network devices.
   # protocol: tcp # Switch to TCP if RDMA is not available.
   # kv_lease_ttl_s: 60 # If TCP transfer is slow, increase the lease TTL. Also increase the global_segment_size accordingly.
 
 
-output_dir: ../outputs/train_kimi25_2node_h200
-cache_dir: ../cache/train_kimi25_2node_h200
+output_dir: ./outputs/train_kimi25_2node_h200
+cache_dir: ./cache/train_kimi25_2node_h200
 model_download_dir: null
 
 debug:

@@ -50,8 +50,8 @@ mooncake:
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
-output_dir: ../outputs/train_entry_hf
-cache_dir: ../cache
+output_dir: ./outputs/train_entry_hf
+cache_dir: ./cache
 model_download_dir: null
 
 debug:

@@ -233,7 +233,16 @@ class AsyncTrainingController:
         eval_prompt_key = getattr(args, "eval_prompt_key", None)
         if eval_prompt_key:
             eval_args.prompt_key = eval_prompt_key
-        self._stored_eval_dataset = load_conversation_dataset(eval_args)
+        raw_dataset = load_conversation_dataset(eval_args)
+        raw_count = len(raw_dataset)
+        # Truncate to a multiple of dp_size so every dispatch is a full batch
+        usable = (raw_count // self.dp_size) * self.dp_size
+        if usable < raw_count:
+            logger.info(
+                f"Eval dataset truncated from {raw_count} to {usable} samples "
+                f"(dp_size={self.dp_size})"
+            )
+        self._stored_eval_dataset = raw_dataset[:usable] if usable > 0 else []
         count = len(self._stored_eval_dataset)
         logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")
         return count

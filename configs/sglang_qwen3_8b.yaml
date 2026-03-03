@@ -55,8 +55,8 @@ mooncake:
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
-output_dir: ../outputs/qwen3-8b-single-node
-cache_dir: ../cache/qwen3-8b-single-node
+output_dir: ./outputs/qwen3-8b-single-node
+cache_dir: ./cache/qwen3-8b-single-node
 model_download_dir: null
 
 debug:
