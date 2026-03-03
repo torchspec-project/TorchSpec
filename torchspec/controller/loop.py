@@ -20,126 +20,24 @@
 
 """Pipeline training loop: main training loop with sync training and async inference."""
 
-import hashlib
-import os
 import time
 from functools import wraps
-from pathlib import Path
 
 import ray
 import wandb
 from tqdm import tqdm
 
-from torchspec.training.checkpoint import (
-    _read_checkpoint_metadata,
-    _write_checkpoint_metadata,
+from torchspec.controller.eval import (
+    generate_eval_cache,
+    run_eval,
+    setup_eval,
+    update_checkpoint_eval_meta,
 )
 from torchspec.utils.logging import logger
 
 
 def _is_save_interval_step(step: int, interval: int) -> bool:
     return interval > 0 and step % interval == 0
-
-
-def _update_checkpoint_eval_meta(
-    checkpoint_dir: str | None,
-    step: int,
-    eval_metrics: dict,
-    current_best: float,
-) -> float:
-    """Append eval metrics to checkpoint meta.json and track best checkpoint."""
-    if not checkpoint_dir or not eval_metrics:
-        return current_best
-
-    base_dir = Path(checkpoint_dir).expanduser()
-    step_id = step + 1
-    meta_path = base_dir / f"iter_{step_id:07d}" / "meta.json"
-
-    metadata = _read_checkpoint_metadata(meta_path)
-    if not metadata:
-        logger.warning(f"Checkpoint meta.json not found at {meta_path}, skipping eval meta update")
-        return current_best
-
-    for key in ("eval/avg_loss", "eval/avg_acc", "eval/simulated_acc_len"):
-        if key in eval_metrics:
-            metadata[key] = eval_metrics[key]
-    _write_checkpoint_metadata(meta_path, metadata)
-
-    score = eval_metrics.get("eval/simulated_acc_len")
-    if score is not None and score > current_best:
-        current_best = score
-        (base_dir / "best_checkpointed_iteration.txt").write_text(str(step_id))
-        _write_checkpoint_metadata(base_dir / "best_meta.json", metadata)
-        logger.info(f"New best checkpoint: iter_{step_id:07d} (simulated_acc_len={score:.2f})")
-
-    return current_best
-
-
-def _generate_eval_cache(
-    controller,
-    train_group,
-    num_dispatches: int,
-    samples_per_rank: int,
-    eval_cache_path: str | None,
-) -> None:
-    """Drain eval results from inference and cache individual samples on each trainer."""
-    total_samples = num_dispatches * samples_per_rank
-    logger.info(
-        f"Caching eval hidden states from inference engine "
-        f"({num_dispatches} dispatches, {total_samples} samples per rank)..."
-    )
-    dispatched = 0
-    eval_progress = tqdm(total=num_dispatches, desc="Eval caching", unit="dispatch")
-    while dispatched < num_dispatches:
-        ok = ray.get(controller.try_dispatch_eval_batch.remote())
-        if ok:
-            train_group.cache_eval_samples(samples_per_rank)
-            dispatched += 1
-            eval_progress.update(1)
-        else:
-            time.sleep(0.5)
-    eval_progress.close()
-
-    # Wait until all eval samples have finished inference before clearing eval IDs.
-    # Otherwise, late eval results can be misrouted into the training pool.
-    while True:
-        if ray.get(controller.is_eval_dispatch_complete.remote()):
-            break
-        ok = ray.get(controller.try_dispatch_eval_batch.remote())
-        if ok:
-            train_group.cache_eval_samples(samples_per_rank)
-            dispatched += 1
-            logger.warning(
-                "Eval: dispatched extra full batch while waiting for completion; "
-                "check eval_dispatch_batch_size consistency"
-            )
-        else:
-            time.sleep(0.5)
-
-    ray.get(controller.finalize_eval_dispatch.remote())
-    logger.info(f"Eval caching complete ({dispatched * samples_per_rank} samples per rank)")
-    if eval_cache_path:
-        train_group.async_save_eval_cache(eval_cache_path)
-        logger.info(f"Eval cache save started (async) to {eval_cache_path}")
-
-
-def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
-    """Run forward-only eval from cache. Assumes eval cache is already populated."""
-    if not eval_enabled:
-        return {}
-    eval_results = train_group.run_eval()
-    eval_metrics = eval_results[0] if eval_results else {}
-    if eval_metrics:
-        eval_metrics["eval/step"] = step
-        if wandb.run is not None:
-            wandb.log(eval_metrics)
-        logger.info(
-            f"Step {step} eval: "
-            f"loss={eval_metrics.get('eval/avg_loss', 0):.4f}, "
-            f"acc={eval_metrics.get('eval/avg_acc', 0):.4f}, "
-            f"sim_acc_len={eval_metrics.get('eval/simulated_acc_len', 0):.2f}"
-        )
-    return eval_metrics
 
 
 def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
@@ -240,68 +138,22 @@ def _run_training_loop_impl(
         eval_dataset_size = ray.get(controller.get_eval_dataset_size.remote())
 
     # ── Eval setup ──────────────────────────────────────────────
-    # eval_interval=N>0: eval runs every N steps in addition to checkpoint saves.
-    eval_interval = args.eval_interval
-    eval_enabled = eval_dataset_size > 0
-    eval_cache_path: str | None = None
+    eval_state = setup_eval(controller, train_group, args, eval_dataset_size)
+    eval_interval = eval_state.eval_interval
+    eval_enabled = eval_state.eval_enabled
+    eval_cache_loaded = eval_state.eval_cache_loaded
+    eval_cache_path = eval_state.eval_cache_path
+    best_eval_score = eval_state.best_eval_score
+    num_dispatches = eval_state.num_dispatches
+    eval_samples_per_rank = eval_state.eval_samples_per_rank
     dispatch_bs = args.per_dp_rank_batch_size * args.dp_size
-    max_pool = getattr(args, "max_sample_pool_size", 0) or dispatch_bs
-    eval_samples_per_rank = max_pool // args.dp_size
-
-    if eval_enabled:
-        num_dispatches = eval_dataset_size // max_pool
-        if num_dispatches == 0:
-            logger.warning(
-                f"Eval dataset ({eval_dataset_size} samples) is smaller than "
-                f"max_sample_pool_size ({max_pool}). Disabling eval."
-            )
-            eval_enabled = False
-        else:
-            dropped = eval_dataset_size - num_dispatches * max_pool
-            if dropped > 0:
-                logger.info(
-                    f"Eval: {dropped} samples will be dropped (not enough for a full dispatch)"
-                )
-
-    best_eval_score = -float("inf")
-    if eval_enabled and args.checkpoint_dir:
-        best_meta_path = Path(args.checkpoint_dir).expanduser() / "best_meta.json"
-        if best_meta_path.exists():
-            existing = _read_checkpoint_metadata(best_meta_path)
-            if "eval/simulated_acc_len" in existing:
-                best_eval_score = existing["eval/simulated_acc_len"]
-                logger.info(f"Resumed best eval score: {best_eval_score:.2f}")
-
-    if eval_enabled:
-        cache_dir = os.path.abspath(getattr(args, "cache_dir", "./cache"))
-        cache_key = hashlib.md5(
-            f"{getattr(args, 'eval_data_path', '')}|"
-            f"{getattr(args, 'target_model_path', '')}|"
-            f"{getattr(args, 'max_seq_length', 0)}|"
-            f"{max_pool}".encode()
-        ).hexdigest()[:12]
-        eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
-
-        eval_cache_loaded = train_group.load_eval_cache(eval_cache_path)
-        if all(n > 0 for n in eval_cache_loaded):
-            logger.info(
-                f"Eval: loaded cached tensors from {eval_cache_path} ({eval_cache_loaded[0]} batches per rank)"
-            )
-        else:
-            eval_cache_loaded = None
-            ray.get(controller.submit_eval_dataset.remote())
-            logger.info(
-                f"Eval: {eval_dataset_size} samples, "
-                f"{num_dispatches} dispatches, "
-                f"{eval_samples_per_rank} samples/rank"
-            )
 
     inference_future = inference_manager.run.remote()
     if cleanup_state is not None:
         cleanup_state["inference_future"] = inference_future
     # Inference engine is alive. Run eval hs generation first.
     if eval_enabled and not eval_cache_loaded:
-        _generate_eval_cache(
+        generate_eval_cache(
             controller,
             train_group,
             num_dispatches,
@@ -472,7 +324,7 @@ def _run_training_loop_impl(
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
                 last_saved_step = completed_steps
-                best_eval_score = _update_checkpoint_eval_meta(
+                best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                 )
 
@@ -495,7 +347,7 @@ def _run_training_loop_impl(
                     )
                     train_group.save_model(completed_steps)
                     last_saved_step = completed_steps
-                    best_eval_score = _update_checkpoint_eval_meta(
+                    best_eval_score = update_checkpoint_eval_meta(
                         args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                     )
 
@@ -519,7 +371,7 @@ def _run_training_loop_impl(
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)
-        best_eval_score = _update_checkpoint_eval_meta(
+        best_eval_score = update_checkpoint_eval_meta(
             args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
         )
 

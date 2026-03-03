@@ -3,6 +3,7 @@ from unittest import mock
 
 import pytest
 
+from torchspec.controller import eval as eval_utils
 from torchspec.controller import loop
 
 
@@ -103,10 +104,10 @@ def test_generate_eval_cache_waits_for_eval_dispatch_completion():
     controller.is_eval_dispatch_complete.remote.side_effect = [False, True]
 
     with (
-        mock.patch("torchspec.controller.loop.ray.get", side_effect=lambda x: x),
-        mock.patch("torchspec.controller.loop.time.sleep") as mock_sleep,
+        mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x),
+        mock.patch("torchspec.controller.eval.time.sleep") as mock_sleep,
     ):
-        loop._generate_eval_cache(
+        eval_utils.generate_eval_cache(
             controller=controller,
             train_group=train_group,
             num_dispatches=1,
@@ -117,4 +118,28 @@ def test_generate_eval_cache_waits_for_eval_dispatch_completion():
     train_group.cache_eval_samples.assert_called_once_with(4)
     controller.finalize_eval_dispatch.remote.assert_called_once()
     assert controller.is_eval_dispatch_complete.remote.call_count >= 2
-    mock_sleep.assert_called_once_with(0.5)
+    mock_sleep.assert_called_once_with(0.1)
+
+
+def test_generate_eval_cache_times_out_when_eval_never_arrives():
+    controller = mock.MagicMock()
+    train_group = mock.MagicMock()
+
+    controller.try_dispatch_eval_batch.remote.return_value = False
+    with (
+        mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x),
+        mock.patch("torchspec.controller.eval.time.sleep") as mock_sleep,
+        mock.patch("torchspec.controller.eval.EVAL_CACHE_IDLE_TIMEOUT", 0.0),
+    ):
+        with pytest.raises(TimeoutError, match="Timed out while waiting for eval cache generation"):
+            eval_utils.generate_eval_cache(
+                controller=controller,
+                train_group=train_group,
+                num_dispatches=1,
+                samples_per_rank=4,
+                eval_cache_path=None,
+            )
+
+    train_group.cache_eval_samples.assert_not_called()
+    controller.finalize_eval_dispatch.remote.assert_not_called()
+    mock_sleep.assert_not_called()

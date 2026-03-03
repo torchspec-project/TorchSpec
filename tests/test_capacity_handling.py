@@ -596,6 +596,63 @@ class TestEvalDispatch:
         assert len(controller.sample_pool) == 0
         assert len(controller.eval_pool) == 4
 
+    def test_without_hold_backpressure_can_admit_put_failed_pattern(self, monkeypatch):
+        """Demonstrate overflow pattern: backpressure admits new puts before old eval keys expire."""
+        monkeypatch.setenv("TORCHSPEC_EVAL_MOONCAKE_HOLD_SECONDS", "0")
+        AsyncTrainingController = _create_controller_class()
+        args = MockControllerArgs(per_dp_rank_batch_size=4, max_sample_pool_size=4)
+        controller = AsyncTrainingController(args, dp_size=1)
+
+        self._setup_eval_and_push(controller, 4)
+        assert controller.get_pool_size() == 4
+
+        # Dispatch eval to trainer-side read path. Actual Mooncake keys are still under lease.
+        assert controller.try_dispatch_eval_batch() is True
+        assert controller.get_pool_size() == 0
+
+        # Simulate engine admission based on controller backpressure signal only.
+        max_pool = 4
+        live_in_store = 4  # dispatched eval keys still exist in Mooncake until deferred delete.
+        inferred_capacity_from_signal = max_pool - controller.get_pool_size()
+        assert inferred_capacity_from_signal == 4
+
+        # Engine is admitted to put another full batch, which would exceed real live capacity.
+        next_put_batch = 4
+        with pytest.raises(RuntimeError, match="put failed"):
+            if live_in_store + next_put_batch > max_pool:
+                raise RuntimeError("put failed: Mooncake segment full")
+
+    def test_with_hold_backpressure_blocks_put_failed_pattern(self, monkeypatch):
+        """With hold enabled, controller pool signal preserves capacity guard during lease window."""
+        monkeypatch.setenv("TORCHSPEC_EVAL_MOONCAKE_HOLD_SECONDS", "5.5")
+        AsyncTrainingController = _create_controller_class()
+        import torchspec.controller.training_controller as training_controller_module
+
+        fake_now = [1000.0]
+        monkeypatch.setattr(training_controller_module.time, "time", lambda: fake_now[0])
+
+        args = MockControllerArgs(per_dp_rank_batch_size=4, max_sample_pool_size=4)
+        controller = AsyncTrainingController(args, dp_size=1)
+
+        self._setup_eval_and_push(controller, 4)
+        assert controller.get_pool_size() == 4
+
+        assert controller.try_dispatch_eval_batch() is True
+        # Held pressure keeps pool "full" even after dispatch.
+        assert controller.get_pool_size() == 4
+
+        max_pool = 4
+        inferred_capacity_from_signal = max_pool - controller.get_pool_size()
+        assert inferred_capacity_from_signal == 0
+
+        next_put_batch = 4
+        # Because inferred capacity is 0, scheduler should not admit this put burst.
+        assert next_put_batch > inferred_capacity_from_signal
+
+        # After hold expires, pressure drops and admission can resume.
+        fake_now[0] += 6.0
+        assert controller.get_pool_size() == 0
+
 
 class TestEvalEndToEnd:
     """End-to-end eval flow: set_eval_dataset → push results → dispatch batches → finalize."""
