@@ -66,6 +66,82 @@ def compiled_forward_kl_loss(
 
 
 @torch.compile(dynamic=None)
+def compiled_lk_alpha_loss(
+    prenorm_hidden_states_flat,
+    target_p_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+):
+    """LK^α loss: -log(acceptance_rate).mean().
+
+    Directly optimizes the log acceptance rate α_i = Σ_x min(p_i(x), q_i(x)).
+    """
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    tp = target_p_flat.index_select(0, valid_idx)
+
+    # RMSNorm
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)  # (N, V_out)
+    q = F.softmax(logits.float(), dim=-1)
+
+    # Acceptance rate per position
+    alpha = torch.min(tp, q).sum(-1)  # (N,)
+    loss = -torch.log(alpha.clamp(min=1e-8)).mean()
+
+    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
+
+    return loss, acc, alpha.mean()
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_lambda_loss(
+    prenorm_hidden_states_flat,
+    target_p_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+    eta,
+):
+    """LK^λ loss: λ·KL(p‖q) + (1-λ)·TV(p,q) where λ = exp(-η·sg[α])."""
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    tp = target_p_flat.index_select(0, valid_idx)
+
+    # RMSNorm
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)  # (N, V_out)
+    q = F.softmax(logits.float(), dim=-1)
+    log_q = F.log_softmax(logits.float(), dim=-1)
+
+    # Acceptance rate (stop-gradient for λ computation)
+    alpha = torch.min(tp, q).sum(-1)  # (N,)
+    lam = torch.exp(-eta * alpha.detach())  # (N,)
+
+    # KL(p‖q) per position
+    kl = F.kl_div(log_q, tp, reduction="none").sum(-1)  # (N,)
+
+    # TV(p,q) per position
+    tv = 0.5 * (tp - q).abs().sum(-1)  # (N,)
+
+    # Combined loss
+    loss = (lam * kl + (1.0 - lam) * tv).mean()
+
+    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
+
+    return loss, acc, alpha.mean()
+
+
+@torch.compile(dynamic=None)
 def compiled_forward_kl_loss_from_hs(
     prenorm_hidden_states_flat,
     target_hidden_states_flat,
@@ -106,3 +182,78 @@ def compiled_forward_kl_loss_from_hs(
     acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
 
     return loss, acc
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_alpha_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+):
+    """LK^α loss from hidden states (LazyTarget path)."""
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx)
+
+    # Target probs
+    tp = F.softmax(F.linear(ths, target_lm_head_weight).float(), dim=-1)
+
+    # RMSNorm
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    q = F.softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(tp, q).sum(-1)
+    loss = -torch.log(alpha.clamp(min=1e-8)).mean()
+
+    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
+
+    return loss, acc, alpha.mean()
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_lambda_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+    eta,
+):
+    """LK^λ loss from hidden states (LazyTarget path)."""
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx)
+
+    # Target probs
+    tp = F.softmax(F.linear(ths, target_lm_head_weight).float(), dim=-1)
+
+    # RMSNorm
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    q = F.softmax(logits.float(), dim=-1)
+    log_q = F.log_softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(tp, q).sum(-1)
+    lam = torch.exp(-eta * alpha.detach())
+
+    kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
+    tv = 0.5 * (tp - q).abs().sum(-1)
+
+    loss = (lam * kl + (1.0 - lam) * tv).mean()
+
+    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
+
+    return loss, acc, alpha.mean()
