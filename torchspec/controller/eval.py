@@ -160,7 +160,7 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
     eval_cache_path: str | None = None
     eval_cache_loaded = False
 
-    eval_dispatch_bs = args.dp_size
+    eval_dispatch_bs = min(args.dp_size, eval_dataset_size)
 
     best_eval_score = -float("inf")
     if eval_enabled and args.checkpoint_dir:
