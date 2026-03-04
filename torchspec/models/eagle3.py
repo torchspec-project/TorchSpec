@@ -29,6 +29,10 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torchspec.models.ops.loss import (
     compiled_forward_kl_loss,
     compiled_forward_kl_loss_from_hs,
+    compiled_lk_alpha_loss,
+    compiled_lk_alpha_loss_from_hs,
+    compiled_lk_lambda_loss,
+    compiled_lk_lambda_loss_from_hs,
 )
 from torchspec.utils.tensor import padding
 
@@ -56,6 +60,8 @@ class Eagle3Model(nn.Module):
         length: int = 7,
         attention_backend="sdpa",
         gradient_checkpointing: bool = False,
+        loss_type: str = "forward_kl",
+        lk_eta: float = 3.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -63,6 +69,17 @@ class Eagle3Model(nn.Module):
         self.attention_backend = attention_backend
         self.gradient_checkpointing = gradient_checkpointing
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
+        self.loss_type = loss_type
+        self.lk_eta = lk_eta
+
+    def _select_loss_fns(self):
+        """Return (precomputed_fn, lazy_fn) based on self.loss_type."""
+        if self.loss_type == "lk_alpha":
+            return compiled_lk_alpha_loss, compiled_lk_alpha_loss_from_hs
+        elif self.loss_type == "lk_lambda":
+            return compiled_lk_lambda_loss, compiled_lk_lambda_loss_from_hs
+        else:
+            return compiled_forward_kl_loss, compiled_forward_kl_loss_from_hs
 
     def _calculate_loss(
         self,
@@ -74,38 +91,40 @@ class Eagle3Model(nn.Module):
         norm_weight: torch.Tensor,
         lm_head_weight: torch.Tensor,
         norm_eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute forward-KL loss and accuracy for one TTT step.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute loss, accuracy, and alpha for one TTT step.
 
         Both paths pass full (B*T, ...) flat views + valid_idx into the
         compiled function so torch.compile can fuse index_select with
         subsequent ops, avoiding separate (N_valid, V) copies outside.
 
-        - PrecomputedTarget (vocab pruning): compiled_forward_kl_loss
-          with pre-computed target probs.
-        - LazyTarget (no pruning): compiled_forward_kl_loss_from_hs
-          computes target softmax inside the compiled graph.
+        - PrecomputedTarget (vocab pruning): compiled loss with pre-computed target probs.
+        - LazyTarget (no pruning): compiled loss computes target softmax inside the graph.
+
+        Returns (loss, acc, alpha) where alpha is 0.0 for forward_kl.
         """
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         # Guard against all-masked positions to avoid nan from mean() on empty tensors.
         if valid_idx.numel() == 0:
             zero = hidden_states.new_tensor(0.0)
-            return zero, zero
+            return zero, zero, zero
         # Important as it prevents recompilation.
         torch._dynamo.mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+
+        precomputed_fn, lazy_fn = self._select_loss_fns()
+        is_lk = self.loss_type in ("lk_alpha", "lk_lambda")
 
         if isinstance(target, PrecomputedTarget):
             target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
             tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
             args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+            if self.loss_type == "lk_lambda":
+                args = args + (self.lk_eta,)
             if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
-                    compiled_forward_kl_loss,
-                    *args,
-                    use_reentrant=False,
-                )
-            return compiled_forward_kl_loss(*args)
+                result = torch_checkpoint(precomputed_fn, *args, use_reentrant=False)
+            else:
+                result = precomputed_fn(*args)
         else:
             # lazy
             ths_flat = target.hidden_states_padded[:, idx : idx + seq_length, :].reshape(
@@ -120,13 +139,18 @@ class Eagle3Model(nn.Module):
                 target.lm_head_weight,
                 norm_eps,
             )
+            if self.loss_type == "lk_lambda":
+                args = args + (self.lk_eta,)
             if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
-                    compiled_forward_kl_loss_from_hs,
-                    *args,
-                    use_reentrant=False,
-                )
-            return compiled_forward_kl_loss_from_hs(*args)
+                result = torch_checkpoint(lazy_fn, *args, use_reentrant=False)
+            else:
+                result = lazy_fn(*args)
+
+        if is_lk:
+            return result  # (loss, acc, alpha)
+        else:
+            loss, acc = result
+            return loss, acc, hidden_states.new_tensor(0.0)
 
     def forward(
         self,
@@ -137,7 +161,7 @@ class Eagle3Model(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
@@ -180,6 +204,7 @@ class Eagle3Model(nn.Module):
         plosses = []
         vlosses = []
         acces = []
+        alphas = []
         cache_keys = None
         cache_values = None
 
@@ -218,7 +243,7 @@ class Eagle3Model(nn.Module):
 
             hidden_states = hidden_states_out
 
-            loss, acc = self._calculate_loss(
+            loss, acc, alpha = self._calculate_loss(
                 hidden_states=hidden_states,
                 target=target,
                 mask=mask,
@@ -230,11 +255,12 @@ class Eagle3Model(nn.Module):
             )
             plosses.append(loss)
             acces.append(acc)
+            alphas.append(alpha)
 
             if not is_last:
                 input_ids = padding(input_ids, left=False)
                 mask = padding(mask, left=False)
-        return plosses, vlosses, acces
+        return plosses, vlosses, acces, alphas
 
 
 @torch.no_grad()

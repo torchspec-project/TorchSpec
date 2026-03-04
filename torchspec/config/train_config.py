@@ -100,6 +100,8 @@ class TrainingConfig:
 
     gradient_checkpointing: bool = False
     learning_rate: float = 1e-4
+    lk_eta: float = 3.0
+    loss_type: str = "forward_kl"
     load_path: Optional[str] = None
     lr_decay_style: str = "cosine"
     lr_total_steps: Optional[int] = None

@@ -93,6 +93,8 @@ class Eagle3Trainer(Trainer):
             length=self.args.ttt_length,
             attention_backend=self.args.attention_backend,
             gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+            loss_type=getattr(self.args, "loss_type", "forward_kl"),
+            lk_eta=getattr(self.args, "lk_eta", 3.0),
         )
 
         full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
@@ -213,7 +215,9 @@ class Eagle3Trainer(Trainer):
     # Forward / backward
     # ------------------------------------------------------------------
 
-    def _forward(self, batch: dict) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _forward(
+        self, batch: dict
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         input_ids = padding(batch["input_ids"], left=False).cuda()
         target_hidden_states = padding(batch["last_hidden_states"], left=False).cuda()
 
@@ -238,14 +242,14 @@ class Eagle3Trainer(Trainer):
             )
         del target_hidden_states
 
-        plosses, _, acces = self.model(
+        plosses, _, acces, alphas = self.model(
             input_ids=input_ids,
             attention_mask=batch["attention_mask"].cuda(),
             target=target,
             loss_mask=loss_mask,
             hidden_states=batch["hidden_states"].cuda(),
         )
-        return plosses, acces
+        return plosses, acces, alphas
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
         ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -260,10 +264,11 @@ class Eagle3Trainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position metrics."""
         with torch.no_grad():
-            plosses, acces = self._forward(batch)
+            plosses, acces, alphas = self._forward(batch)
         return {
             "plosses": torch.stack(plosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "alphas": torch.stack(alphas).detach(),
         }
 
     def eval_from_cache(self) -> dict:
@@ -299,9 +304,11 @@ class Eagle3Trainer(Trainer):
 
         avg_plosses = torch.stack([m["plosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
+        avg_alphas = torch.stack([m["alphas"] for m in all_step_metrics]).mean(dim=0)
 
         dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_alphas, op=dist.ReduceOp.AVG)
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -317,11 +324,13 @@ class Eagle3Trainer(Trainer):
         metrics: dict = {
             "eval/avg_loss": weighted_avg_loss,
             "eval/avg_acc": avg_acces.mean().item(),
+            "eval/avg_alpha": avg_alphas.mean().item(),
             "eval/simulated_acc_len": simulated_acc_len,
         }
         for i in range(avg_plosses.shape[0]):
             metrics[f"eval/ploss_{i}"] = avg_plosses[i].item()
             metrics[f"eval/acc_{i}"] = avg_acces[i].item()
+            metrics[f"eval/alpha_{i}"] = avg_alphas[i].item()
 
         if dist.get_rank() == 0:
             logger.info(
@@ -343,12 +352,13 @@ class Eagle3Trainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        plosses, acces = self._forward(batch)
+        plosses, acces, alphas = self._forward(batch)
         total_loss = self._backward(plosses, accumulation_steps=accumulation_steps)
 
         return {
             "plosses": torch.stack(plosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "alphas": torch.stack(alphas).detach(),
             "plosses_raw": [p.detach() for p in plosses],
             "acces_raw": [a.detach() for a in acces],
             "total_loss": total_loss.detach(),
@@ -384,12 +394,15 @@ class Eagle3Trainer(Trainer):
 
         plosses = [m["plosses"] for m in all_step_metrics]
         acces = [m["acces"] for m in all_step_metrics]
+        alphas_list = [m["alphas"] for m in all_step_metrics]
 
         avg_plosses = torch.stack(plosses).mean(dim=0)
         avg_acces = torch.stack(acces).mean(dim=0)
+        avg_alphas = torch.stack(alphas_list).mean(dim=0)
 
         dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_alphas, op=dist.ReduceOp.AVG)
 
         # Simulated acceptance length: acc_0 + acc_0*acc_1 + acc_0*acc_1*acc_2 + ...
         # Models the expected number of consecutively accepted draft tokens,
@@ -409,6 +422,7 @@ class Eagle3Trainer(Trainer):
         metrics = {
             "train/avg_loss": weighted_avg_loss,
             "train/avg_acc": avg_acces.mean().item(),
+            "train/avg_alpha": avg_alphas.mean().item(),
             "train/simulated_acc_len": simulated_acc_len,
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,
@@ -419,6 +433,7 @@ class Eagle3Trainer(Trainer):
         for i in range(avg_plosses.shape[0]):
             metrics[f"train/ploss_{i}"] = avg_plosses[i].item()
             metrics[f"train/acc_{i}"] = avg_acces[i].item()
+            metrics[f"train/alpha_{i}"] = avg_alphas[i].item()
 
         if dist.get_rank() == 0:
             logger.debug(f"step {step}: {metrics}")
