@@ -142,9 +142,11 @@ def _patched_forward(
     # Final normalization (only on last PP rank)
     hidden_states, _ = self.norm(hidden_states, residual)
 
-    # Store captured states (only on last PP rank and TP rank 0)
-    if should_capture and aux_hidden_states:
-        extension._store_captured_states(aux_hidden_states)  # noqa: SLF001
+    # Store captured states (only on last PP rank, TP rank 0, and during prefill)
+    if should_capture and not extension._prefill_complete:  # noqa: SLF001
+        if aux_hidden_states:
+            extension._store_captured_states(aux_hidden_states)  # noqa: SLF001
+        extension._store_last_hidden_states(hidden_states)  # noqa: SLF001
 
     return hidden_states
 
@@ -414,27 +416,30 @@ class VllmWorkerExtension:
             logger.error(f"Unexpected error in _ensure_mooncake_store: {e}", exc_info=True)
             return False
 
+    def _store_last_hidden_states(self, hidden_states: torch.Tensor) -> None:
+        """Store post-norm hidden states from a forward pass for use as last_hidden_states"""
+        if getattr(self, "_captured_last_hs", None) is None:
+            self._captured_last_hs = [hidden_states.clone()]
+        else:
+            self._captured_last_hs.append(hidden_states.clone())
+
     def _store_captured_states(self, aux_hidden_states: List[torch.Tensor]) -> None:
         """Store captured hidden states from a forward pass.
 
         Args:
             aux_hidden_states: List of tensors, one per target layer
         """
-        if getattr(self, "_captured_states", None) is None:
-            # First capture - initialize lists for each layer
+        if self._captured_states is None:
             self._captured_states = [[h] for h in aux_hidden_states]
         else:
-            # Append to existing lists
             for i, h in enumerate(aux_hidden_states):
                 self._captured_states[i].append(h)
 
-        # Track how many tokens were captured in this step
-        # Get from input_batch if available, otherwise use metadata
+        # Track per-request token counts for this scheduler step
         model_runner = getattr(self, "model_runner", None)
         input_batch = getattr(model_runner, "input_batch", None)
+        step_tokens: Dict[str, int] = {}
         if input_batch is not None and hasattr(input_batch, "req_ids"):
-            # Track by internal request IDs - will map to external IDs later
-            step_tokens = {}
             for req_id in input_batch.req_ids:
                 num_tokens = 0
                 req_idx = getattr(input_batch, "req_id_to_index", {}).get(req_id)
@@ -447,10 +452,21 @@ class VllmWorkerExtension:
                     ]
                     num_tokens = num_total - num_computed
                 step_tokens[req_id] = num_tokens
-            self._request_metadata.append(step_tokens)
-        else:
-            # Fallback: assume all requests in one step
-            self._request_metadata.append({})
+        self._request_metadata.append(step_tokens)
+
+        # With max_tokens=1 the prefill forward pass already generates the
+        # single allowed token, so no decode step is scheduled by vLLM.
+        # This check handles chunked prefill where multiple forward calls
+        # sum up to the total prefill token count.
+        if self._current_request_metadata and not self._prefill_complete:
+            expected = sum(self._current_request_metadata.values())
+            captured = sum(t.shape[0] for t in self._captured_states[0])
+            if captured == expected:
+                self._prefill_complete = True
+            elif captured > expected:
+                logger.warning(
+                    f"Captured more tokens than expected: {captured} > {expected}"
+                )
 
     def _store_input_ids(self, input_ids: torch.Tensor) -> None:
         """Store input_ids from a forward pass.
@@ -544,13 +560,15 @@ class VllmWorkerExtension:
         if not hasattr(self, "_layer_ids") or len(self._layer_ids) == 0:
             raise RuntimeError("Must call _setup_hidden_states_capture before capturing states")
         self._captured_states = None
+        self._captured_last_hs: Optional[List[torch.Tensor]] = None
         self._captured_input_ids: Optional[torch.Tensor] = None
+        self._prefill_complete = False
         self._request_metadata = []
         self._current_request_metadata = None
         self._packed_loss_mask_map = {}
         self._input_ids_map = {}
 
-    def _store_and_get_metadata(self) -> Optional[Dict[str, Dict[str, Any]]]:
+    def _store_and_get_metadata(self, internal_to_external: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Dict[str, Any]]]:
         """Store captured hidden states to Mooncake and return metadata.
 
         This method stores tensors directly to Mooncake from the worker process,
@@ -569,11 +587,15 @@ class VllmWorkerExtension:
         if get_tp_group().rank_in_group != 0:
             return None
         if self._captured_states is None:
+            logger.warning(
+                "_store_and_get_metadata: captured_states is None "
+                "(forward patch may not be running or no prefill occurred)"
+            )
             return None
 
         # Ensure Mooncake store is initialized and setup (with retry for V1 compatibility)
         if not self._ensure_mooncake_store():
-            logger.error(
+            logger.warning(
                 "Failed to initialize/setup Mooncake store, cannot store hidden states. "
                 "This may be due to CUDA context not being ready in V1 engine."
             )
@@ -585,49 +607,83 @@ class VllmWorkerExtension:
         ]
         total_captured_tokens = concatenated_layers[0].shape[0]
 
-        # Slice and group by request using external IDs
-        external_ids = (
-            list(self._current_request_metadata.keys()) if self._current_request_metadata else []
-        )
-        token_counts = (
-            list(self._current_request_metadata.values()) if self._current_request_metadata else []
-        )
-        total_expected_tokens = sum(token_counts) if token_counts else 0
+        # Concatenate post-norm hidden states for last_hidden_states
+        concatenated_last_hs = None
+        if getattr(self, "_captured_last_hs", None):
+            concatenated_last_hs = torch.cat(self._captured_last_hs, dim=0)
 
+        internal_to_external = internal_to_external or {}
+        ext_token_counts = dict(self._current_request_metadata) if self._current_request_metadata else {}
+
+        # Build worker-visible ID -> external ID lookup once.
+        # In V1, the worker sees "{counter}-{uuid8}" while internal_to_external
+        # maps bare counter strings (from output.request_id) to external data_ids.
+        worker_to_ext: Dict[str, str] = dict(internal_to_external)
+        for step_meta in self._request_metadata:
+            for worker_id in step_meta:
+                if worker_id not in worker_to_ext:
+                    for counter, ext_id in internal_to_external.items():
+                        if worker_id.startswith(f"{counter}-"):
+                            worker_to_ext[worker_id] = ext_id
+                            break
+
+        request_slices: List[tuple] = []  # (external_id, num_tokens)
+        seen_ext_ids: set = set()
+
+        for step_meta in self._request_metadata:
+            for int_id in step_meta.keys():
+                ext_id = worker_to_ext.get(int_id, int_id)
+                if ext_id not in seen_ext_ids:
+                    n_tokens = ext_token_counts.get(ext_id, 0)
+                    if n_tokens > 0:
+                        request_slices.append((ext_id, n_tokens))
+                        seen_ext_ids.add(ext_id)
+
+        # Fallback if _request_metadata didn't produce results
+        if not request_slices and ext_token_counts:
+            logger.warning("Internal request metadata mapping failed; falling back to external order")
+            for ext_id, n_tokens in ext_token_counts.items():
+                request_slices.append((ext_id, n_tokens))
+
+        if not request_slices:
+            logger.warning(
+                f"_store_and_get_metadata: request_slices is empty — cannot map "
+                f"captured tokens to requests. "
+                f"total_captured_tokens={total_captured_tokens}, "
+                f"_request_metadata steps={len(self._request_metadata)}, "
+                f"internal_to_external keys={list(internal_to_external.keys())[:5]}, "
+                f"ext_token_counts keys={list(ext_token_counts.keys())[:5]}, "
+                f"current_request_metadata={self._current_request_metadata is not None}"
+            )
+
+        total_expected_tokens = sum(n for _, n in request_slices)
+
+        if total_captured_tokens != total_expected_tokens and total_expected_tokens > 0:
+            logger.warning(
+                f"Token count mismatch: captured={total_captured_tokens}, "
+                f"expected={total_expected_tokens}"
+            )
+
+        num_aux_layers = len(concatenated_layers)
         request_chunks: defaultdict[str, List[List[torch.Tensor]]] = defaultdict(
-            lambda: [[] for _ in range(len(concatenated_layers))]
+            lambda: [[] for _ in range(num_aux_layers)]
         )
+        request_last_hs: defaultdict[str, List[torch.Tensor]] = defaultdict(list)
         current_idx = 0
 
-        # Handle multi-step scheduling:按比例分配实际捕获的tokens
-        if total_expected_tokens > 0 and total_captured_tokens > 0:
-            ratio = total_captured_tokens / total_expected_tokens
-            for req_idx, (external_id, expected_tokens) in enumerate(
-                zip(external_ids, token_counts)
-            ):
-                # 按比例分配实际捕获的token数
-                actual_tokens = int(expected_tokens * ratio)
-            for req_idx, (external_id, expected_tokens) in enumerate(
-                zip(external_ids, token_counts)
-            ):
-                # 按比例分配实际捕获的token数
-                actual_tokens = int(expected_tokens * ratio)
-                actual_tokens = min(actual_tokens, total_captured_tokens - current_idx)
-                if actual_tokens > 0:
-                    for layer_idx, layer_tensor in enumerate(concatenated_layers):
-                        chunk = (
-                            layer_tensor[current_idx : current_idx + actual_tokens].clone().cpu()
-                        )
-                        request_chunks[external_id][layer_idx].append(chunk)
-                    current_idx += actual_tokens
-        else:
-            # Fallback: simple sequential slicing
-            for req_idx, (external_id, num_tokens) in enumerate(zip(external_ids, token_counts)):
-                if current_idx < total_captured_tokens:
-                    for layer_idx, layer_tensor in enumerate(concatenated_layers):
-                        chunk = layer_tensor[current_idx : current_idx + num_tokens].clone().cpu()
-                        request_chunks[external_id][layer_idx].append(chunk)
-                    current_idx += num_tokens
+        for external_id, num_tokens in request_slices:
+            if current_idx >= total_captured_tokens:
+                break
+            actual_tokens = min(num_tokens, total_captured_tokens - current_idx)
+            if actual_tokens > 0:
+                for layer_idx, layer_tensor in enumerate(concatenated_layers):
+                    chunk = layer_tensor[current_idx : current_idx + actual_tokens]
+                    request_chunks[external_id][layer_idx].append(chunk)
+                if concatenated_last_hs is not None:
+                    request_last_hs[external_id].append(
+                        concatenated_last_hs[current_idx : current_idx + actual_tokens]
+                    )
+                current_idx += actual_tokens
 
         # Store to Mooncake and collect metadata
         result: Dict[str, Dict[str, Any]] = {}
@@ -636,16 +692,17 @@ class VllmWorkerExtension:
             if mooncake_key != req_id:
                 logger.debug(f"Sanitized key '{req_id}' -> '{mooncake_key}'")
 
-            # Concatenate all layer chunks for this request (keep on GPU)
             layer_tensors = [torch.cat(chunks, dim=0) for chunks in layer_chunks]
 
-            # Concatenate all layers along hidden dimension
             if len(layer_tensors) > 1:
                 hidden_states = torch.cat(layer_tensors, dim=-1)
             else:
                 hidden_states = layer_tensors[0]
 
-            last_hidden_states = layer_tensors[-1]
+            if req_id in request_last_hs and request_last_hs[req_id]:
+                last_hidden_states = torch.cat(request_last_hs[req_id], dim=0)
+            else:
+                last_hidden_states = layer_tensors[-1]
 
             # Use real input_ids from RPC, otherwise create dummy
             if req_id in self._input_ids_map:
@@ -694,10 +751,9 @@ class VllmWorkerExtension:
                     "input_ids_list": input_ids.cpu().tolist(),  # Serialize via RPC instead of Mooncake
                 }
             except Exception as e:
-                logger.error(
+                logger.warning(
                     f"Failed to store tensors to Mooncake for {req_id} (key={mooncake_key}): {e}"
                 )
-                # Continue with other requests even if one fails
                 continue
 
         # Flush to ensure all writes are complete before returning
@@ -706,6 +762,7 @@ class VllmWorkerExtension:
 
         # Clear intermediate storage to free memory
         self._captured_states = None
+        self._captured_last_hs = None
         self._captured_input_ids = None
         self._request_metadata = []
         self._input_ids_map = {}

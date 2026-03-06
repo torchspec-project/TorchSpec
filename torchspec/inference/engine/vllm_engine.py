@@ -27,9 +27,6 @@ extraction via model.forward patching in worker processes.
 
 import os
 import socket
-import tempfile
-import uuid
-from typing import Any
 
 import ray
 import torch
@@ -78,7 +75,7 @@ class VllmEngine(InferenceEngine, RayActor):
         self._mooncake_store = None
         self._hidden_size = None
         self.local_gpu_id = None
-        self._storage_path = None
+
         setup_file_logging("inference", self.rank, group=engine_group)
 
     def init(self, mooncake_config=None, dist_init_addr: str | None = None) -> None:
@@ -159,21 +156,8 @@ class VllmEngine(InferenceEngine, RayActor):
         mem_fraction: float,
         dist_init_addr: str | None,
     ) -> None:
-        """Initialize the vLLM engine using Worker Extension mode."""
-        self._init_worker_extension_mode(tp_size, pp_size, nnodes, mem_fraction, dist_init_addr)
-
-    def _init_worker_extension_mode(
-        self,
-        tp_size: int,
-        pp_size: int,
-        nnodes: int,
-        mem_fraction: float,
-        dist_init_addr: str | None,
-    ) -> None:
         """Initialize LLM with worker extension enabled."""
         from vllm import LLM
-
-        self._storage_path = tempfile.mkdtemp(prefix="vllm_hidden_states_")
 
         engine_kwargs = {
             "model": self.args.target_model_path,
@@ -202,12 +186,24 @@ class VllmEngine(InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTION_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
+        inference_batch_size = getattr(self.args, "inference_batch_size", None)
+        if inference_batch_size is not None:
+            comp_cfg = engine_kwargs.get("compilation_config", {})
+            if isinstance(comp_cfg, dict) and "max_cudagraph_capture_size" not in comp_cfg:
+                comp_cfg["max_cudagraph_capture_size"] = inference_batch_size
+                engine_kwargs["compilation_config"] = comp_cfg
+                logger.info(
+                    f"VllmEngine rank {self.rank}: defaulting "
+                    f"max_cudagraph_capture_size={inference_batch_size} from inference_batch_size"
+                )
+
+        # Disable prefix caching and chunked prefill
+        engine_kwargs["enable_prefix_caching"] = False
+        engine_kwargs["enable_chunked_prefill"] = False
+
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
             engine_kwargs["max_model_len"] = max_seq_length
-            # Disable chunked prefill to encourage single-step processing
-            if "enable_chunked_prefill" not in engine_kwargs:
-                engine_kwargs["enable_chunked_prefill"] = False
 
         if nnodes > 1:
             engine_kwargs["nnodes"] = nnodes
@@ -267,27 +263,6 @@ class VllmEngine(InferenceEngine, RayActor):
         multimodal_inputs: list[dict] | None = None,
     ) -> list[dict]:
         """Generate hidden states for training data using Worker Extension mode."""
-        return self._generate_worker_extension(
-            data_id,
-            input_ids_ref,
-            packed_loss_mask_list,
-            formatted_prompts,
-            return_last_hidden_states,
-            return_logits,
-            multimodal_inputs,
-        )
-
-    def _generate_worker_extension(
-        self,
-        data_id: str | list[str],
-        input_ids_ref: ray.ObjectRef | list[torch.Tensor] | None,
-        packed_loss_mask_list: list[str] | None,
-        formatted_prompts: list[str] | None,
-        return_last_hidden_states: bool,
-        return_logits: bool,
-        multimodal_inputs: list[dict] | None,
-    ) -> list[dict]:
-        """Generate using worker extension mode."""
         if self._engine is None:
             raise RuntimeError("VllmEngine not initialized. Call init() first.")
 
@@ -308,7 +283,7 @@ class VllmEngine(InferenceEngine, RayActor):
             if input_ids_list is None:
                 raise ValueError("input_ids_ref resolved to None")
             batch_size = len(input_ids_list)
-            prompts = self._convert_input_ids_to_prompts(input_ids_list)
+            prompts = self._format_input_ids_for_vllm(input_ids_list)
 
         if isinstance(data_id, str):
             data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
@@ -352,13 +327,40 @@ class VllmEngine(InferenceEngine, RayActor):
         except Exception as e:
             logger.warning(f"Could not reset capture via worker extension: {e}")
 
-        outputs = self._engine.generate(prompts, sampling_params)
+        outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
+
+        # outputs are sorted by int(request_id), matching submission order.
+        # Build mapping from vLLM's internal worker IDs ("{request_id}-{uuid}")
+        # to our external data_ids.
+        internal_to_external = {}
+        for i, output in enumerate(outputs):
+            internal_to_external[output.request_id] = data_ids[i]
+
+        # For the formatted_prompts path, request_metadata and input_ids_map
+        # were not set before generation (no input_ids available).  Build them
+        # from the outputs so the worker can map captured states to requests.
+        if use_prompts and not request_metadata:
+            for i, output in enumerate(outputs):
+                did = data_ids[i]
+                request_metadata[did] = len(output.prompt_token_ids)
+                input_ids_map[did] = list(output.prompt_token_ids)
+            try:
+                self._engine.collective_rpc(
+                    "_set_request_metadata",
+                    args=(request_metadata, packed_loss_mask_map, input_ids_map),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"VllmEngine rank {self.rank}: Could not set post-generation "
+                    f"request metadata: {e}"
+                )
 
         # Get metadata from workers (tensors are already stored in Mooncake by workers)
         metadata_by_request: dict[str, dict] = {}
         try:
-            # Workers store tensors directly to Mooncake and return metadata only
-            metadata_list = self._engine.collective_rpc("_store_and_get_metadata")
+            metadata_list = self._engine.collective_rpc(
+                "_store_and_get_metadata", args=(internal_to_external,)
+            )
             if isinstance(metadata_list, list):
                 for metadata in metadata_list:
                     if isinstance(metadata, dict):
@@ -367,6 +369,14 @@ class VllmEngine(InferenceEngine, RayActor):
                 metadata_by_request = metadata_list
         except Exception as e:
             logger.warning(f"Could not get metadata from worker extension: {e}")
+
+        if not metadata_by_request:
+            logger.error(
+                f"VllmEngine rank {self.rank}: metadata_by_request is EMPTY for "
+                f"data_ids={data_ids}. Worker returned metadata_list={metadata_list!r}. "
+                f"use_prompts={use_prompts}, request_metadata_keys={list(request_metadata.keys())}, "
+                f"internal_to_external={internal_to_external}"
+            )
 
         results = []
         for i, output in enumerate(outputs):
@@ -378,6 +388,7 @@ class VllmEngine(InferenceEngine, RayActor):
             if metadata is None:
                 logger.error(
                     f"VllmEngine rank {self.rank}: No metadata for data_id={data_id}. "
+                    f"metadata_by_request has keys={list(metadata_by_request.keys())}. "
                     f"Training may be corrupted."
                 )
                 continue
@@ -430,199 +441,7 @@ class VllmEngine(InferenceEngine, RayActor):
             return input_ids
         raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
-    def _get_sample_input_ids(
-        self,
-        index: int,
-        input_ids_list: list[torch.Tensor] | None,
-        output: Any,
-    ) -> torch.Tensor:
-        if input_ids_list is not None:
-            return self._normalize_input_ids(input_ids_list[index]).to(dtype=torch.long)
-        return torch.tensor(output.prompt_token_ids, dtype=torch.long)
-
-    def _merge_captured_states(
-        self,
-        captured_states: Any,
-    ) -> tuple[dict[str, list[torch.Tensor]], list[list[torch.Tensor]]]:
-        merged: dict[str, list[torch.Tensor]] = {}
-        ordered: list[list[torch.Tensor]] = []
-
-        # Handle different return types from collective_rpc
-        if captured_states is None:
-            return merged, ordered
-
-        # If it's a single dict, wrap it in a list
-        if isinstance(captured_states, dict):
-            captured_states = [captured_states]
-
-        if not isinstance(captured_states, list):
-            logger.warning(f"Unexpected captured_states type: {type(captured_states)}")
-            return merged, ordered
-
-        # Collect layer states from all workers for each request
-        # With tensor parallelism, we need to concatenate along hidden dim
-        request_states: dict[str, list[list[torch.Tensor]]] = {}
-
-        for reply in captured_states:
-            if not isinstance(reply, dict):
-                logger.debug(f"Skipping non-dict reply: {type(reply)}")
-                continue
-            for request_id, layer_states in reply.items():
-                if not isinstance(layer_states, list):
-                    logger.debug(
-                        f"Skipping non-list layer_states for {request_id}: {type(layer_states)}"
-                    )
-                    continue
-                if request_id not in request_states:
-                    request_states[request_id] = []
-                request_states[request_id].append(layer_states)
-
-        # Merge states: concatenate tensors from different workers along hidden dim
-        for request_id, worker_states_list in request_states.items():
-            if not worker_states_list:
-                continue
-
-            # Get number of layers from first worker
-            num_layers = len(worker_states_list[0])
-            logger.debug(
-                f"Merging {len(worker_states_list)} workers for request {request_id} with {num_layers} layers"
-            )
-
-            # Concatenate tensors from all workers for each layer
-            merged_layers = []
-            for layer_idx in range(num_layers):
-                layer_tensors = [
-                    worker_states[layer_idx]
-                    for worker_states in worker_states_list
-                    if layer_idx < len(worker_states)
-                ]
-
-                # Check if layer_tensors contains lists (nested structure)
-                if layer_tensors and isinstance(layer_tensors[0], list):
-                    # This shouldn't happen after proper extraction, but handle it
-                    logger.warning(f"Unexpected nested list structure for layer {layer_idx}")
-                    layer_tensors = [
-                        item
-                        for sublist in layer_tensors
-                        for item in (sublist if isinstance(sublist, list) else [sublist])
-                    ]
-
-                if len(layer_tensors) == 1:
-                    merged_layers.append(layer_tensors[0])
-                elif len(layer_tensors) > 1:
-                    # Concatenate along hidden dimension (dim=-1)
-                    merged_layers.append(torch.cat(layer_tensors, dim=-1))
-                else:
-                    # No tensors for this layer
-                    logger.warning(f"No tensors for layer {layer_idx} in request {request_id}")
-                    merged_layers.append(None)  # type: ignore[arg-type]
-
-            merged[request_id] = merged_layers
-            ordered.append(merged_layers)
-
-        return merged, ordered
-
-    def _store_tensors_to_mooncake(
-        self,
-        data_id: str,
-        input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
-        last_hidden_states: torch.Tensor | None,
-    ) -> tuple[str, dict[str, tuple[int, ...]], dict[str, torch.dtype]] | None:
-        if self._mooncake_store is None:
-            self._init_mooncake_store()
-        if self._mooncake_store is None:
-            return None
-
-        if input_ids.dtype != torch.long:
-            input_ids = input_ids.to(dtype=torch.long)
-        if hidden_states.dtype != torch.bfloat16:
-            hidden_states = hidden_states.to(dtype=torch.bfloat16)
-        if last_hidden_states is not None and last_hidden_states.dtype != torch.bfloat16:
-            last_hidden_states = last_hidden_states.to(dtype=torch.bfloat16)
-
-        mooncake_key = f"vllm_{self.rank}_{data_id}_{uuid.uuid4().hex}"
-        tensor_shapes = self._mooncake_store.put(
-            key=mooncake_key,
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            last_hidden_states=last_hidden_states,
-            target=None,
-        )
-        tensor_dtypes = {
-            "hidden_states": hidden_states.dtype,
-            "input_ids": input_ids.dtype,
-            "last_hidden_states": (
-                last_hidden_states.dtype if last_hidden_states is not None else hidden_states.dtype
-            ),
-        }
-        return mooncake_key, tensor_shapes, tensor_dtypes
-
-    def _store_sample_to_mooncake(
-        self,
-        data_id: str,
-        input_ids: torch.Tensor,
-        layer_states: list[torch.Tensor] | None,
-        hidden_states_path: str | None,
-    ) -> tuple[str, dict[str, tuple[int, ...]], dict[str, torch.dtype]] | None:
-        if layer_states:
-            # Debug: log the structure of layer_states
-            logger.debug(f"layer_states type: {type(layer_states)}, len: {len(layer_states)}")
-            if layer_states:
-                logger.debug(f"layer_states[0] type: {type(layer_states[0])}")
-                if isinstance(layer_states[0], list):
-                    logger.error(f"layer_states[0] is a list with len {len(layer_states[0])}")
-                    # Flatten the list if needed
-                    layer_states = [
-                        item
-                        for sublist in layer_states
-                        for item in (sublist if isinstance(sublist, list) else [sublist])
-                    ]
-                    logger.debug(f"After flattening: layer_states len: {len(layer_states)}")
-
-            # Filter out any non-tensor elements
-            layer_states = [ls for ls in layer_states if isinstance(ls, torch.Tensor)]
-
-            if not layer_states:
-                logger.error(f"No valid tensor layers found for data_id={data_id}")
-                return None
-
-            hidden_states = (
-                torch.cat(layer_states, dim=-1) if len(layer_states) > 1 else layer_states[0]
-            )
-            last_hidden_states = layer_states[-1]
-            return self._store_tensors_to_mooncake(
-                data_id=data_id,
-                input_ids=input_ids,
-                hidden_states=hidden_states,
-                last_hidden_states=last_hidden_states,
-            )
-
-        if hidden_states_path is None or not os.path.exists(hidden_states_path):
-            return None
-
-        data = torch.load(hidden_states_path, map_location="cpu")
-        hidden_states = data.get("hidden_states")
-        if not isinstance(hidden_states, torch.Tensor):
-            return None
-        stored_input_ids = data.get("input_ids")
-        if isinstance(stored_input_ids, torch.Tensor):
-            input_ids = self._normalize_input_ids(stored_input_ids)
-        last_hidden_states = data.get("last_hidden_states")
-        if not isinstance(last_hidden_states, torch.Tensor):
-            if self._hidden_size is not None and hidden_states.shape[-1] >= self._hidden_size:
-                last_hidden_states = hidden_states[:, -self._hidden_size :]
-            else:
-                last_hidden_states = hidden_states
-
-        return self._store_tensors_to_mooncake(
-            data_id=data_id,
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            last_hidden_states=last_hidden_states,
-        )
-
-    def _convert_input_ids_to_prompts(
+    def _format_input_ids_for_vllm(
         self, input_ids_list: list[torch.Tensor]
     ) -> list[dict[str, list[int]]]:
         prompts = []
@@ -644,14 +463,6 @@ class VllmEngine(InferenceEngine, RayActor):
         if self._engine is not None:
             del self._engine
             self._engine = None
-
-        if self._storage_path and os.path.exists(self._storage_path):
-            import shutil
-
-            try:
-                shutil.rmtree(self._storage_path)
-            except Exception:
-                pass
 
         logger.info(f"VllmEngine rank {self.rank}: shutdown complete")
 
