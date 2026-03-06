@@ -24,6 +24,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from torchspec.inference.engine.hf_engine import HFEngine
+from torchspec.inference.engine.sgl_engine import SglEngine
 from torchspec.inference.engine.vllm_engine import VllmEngine
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
@@ -166,7 +167,6 @@ def _prepare_sgl_engines(
         accept generate() calls. init_handles are ObjectRefs for ALL engines
         (head + worker) that must be waited on before use.
     """
-    from torchspec.inference.engine.sgl_engine import SglEngine
 
     nnodes = getattr(args, "sglang_nnodes", 1)
     num_gpus_total = getattr(args, "inference_num_gpus", 1)

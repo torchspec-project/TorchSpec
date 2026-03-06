@@ -27,9 +27,15 @@ try:
 except ModuleNotFoundError:
     SglEngine = None
 
+try:
+    from torchspec.inference.engine.vllm_engine import VllmEngine
+except ModuleNotFoundError:
+    VllmEngine = None
+
 __all__ = [
     "InferenceEngine",
     "HFEngine",
     "HFRunner",
     "SglEngine",
+    "VllmEngine",
 ]
