@@ -24,10 +24,6 @@ dataset:
   chat_template: qwen
   prompt_key: conversations
 
-# Use GPUs 4-7 to avoid zombie process on GPU 0-1
-# GPU 4-5: inference (vLLM, TP=2)
-# GPU 6-7: training (DP=2)
-
 training:
   attention_backend: flex_attention
   micro_batch_size: 1
@@ -66,7 +62,7 @@ mooncake:
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
-output_dir: ./outputs/vllm_qwen3_8b-single-node
+output_dir: ./outputs/qwen3-8b-single-node
 cache_dir: ./cache
 model_download_dir: null
 
