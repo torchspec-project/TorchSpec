@@ -57,12 +57,9 @@ def sort_key(x):
     return (node_ip_parts, gpu_id)
 
 
-def _create_placement_group(num_gpus, strategy="PACK", name=None, node_ip=None):
+def _create_placement_group(num_gpus, strategy="PACK", name=None):
     """Create a placement group with the specified number of GPUs."""
-    bundle = {"GPU": 1, "CPU": 1}
-    if node_ip:
-        bundle[f"node:{node_ip}"] = 0.001
-    bundles = [bundle.copy() for _ in range(num_gpus)]
+    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy=strategy, name=name)
     num_bundles = len(bundles)
 
@@ -196,16 +193,14 @@ def create_placement_groups(args):
         f"{num_training_gpus} GPUs for training..."
     )
 
-    pin_node_ip = os.environ.get("TORCHSPEC_PIN_NODE_IP")
-
     logger.info("Creating inference placement group...")
     inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
-        num_inference_gpus, strategy="PACK", name="inference_pg", node_ip=pin_node_ip
+        num_inference_gpus, strategy="PACK", name="inference_pg"
     )
 
     logger.info("Creating training placement group...")
     training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
-        num_training_gpus, strategy="PACK", name="training_pg", node_ip=pin_node_ip
+        num_training_gpus, strategy="PACK", name="training_pg"
     )
 
     return {
