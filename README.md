@@ -14,19 +14,19 @@ TorchSpec supports two inference backends:
 
 | Backend | Best For | Installation |
 |---------|----------|--------------|
-| **SGLang** | Production workloads, high throughput | `./tools/build_conda.sh 1 sglang` (default) |
 | **vLLM** | Flexibility, easier deployment | `./tools/build_conda.sh 1 vllm` |
+| **SGLang** | Production workloads, high throughput | `./tools/build_conda.sh 1 sglang` |
 | **Both** | Development, comparison testing | `./tools/build_conda.sh 1 both` |
 
 ### Quick Setup
 
 ```bash
-# Install with SGLang (default)
-./tools/build_conda.sh
+# Install with vLLM
+./tools/build_conda.sh 1 vllm
 micromamba activate torchspec
 
-# Or install with vLLM
-./tools/build_conda.sh 1 vllm
+# Or install with SGLang
+./tools/build_conda.sh
 micromamba activate torchspec
 ```
 
@@ -43,14 +43,14 @@ pip install -e ".[fa]"
 
 ### Backend-Specific Usage
 
-**SGLang (default):**
-```bash
-./examples/qwen3-8b-single-node/run.sh
-```
-
 **vLLM:**
 ```bash
 ./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml
+```
+
+**SGLang:**
+```bash
+./examples/qwen3-8b-single-node/run.sh
 ```
 
 TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model's forward pass and capture hidden states directly in the worker processes. This avoids RPC serialization issues and enables reliable hidden states extraction.
