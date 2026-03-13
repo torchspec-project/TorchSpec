@@ -21,13 +21,31 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
+from urllib.parse import urlparse
 
 import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 
-from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
+_IMAGE_CACHE_DIR = os.environ.get("TORCHSPEC_IMAGE_CACHE", "/data/ywang/image_cache")
+
+
+def resolve_image_url(url: str, cache_dir: str = _IMAGE_CACHE_DIR) -> str:
+    """Return local file path if a cached copy exists, otherwise the original URL."""
+    if not url or not url.startswith("http"):
+        return url
+    parsed = urlparse(url)
+    local_path = os.path.join(cache_dir, parsed.netloc, parsed.path.lstrip("/"))
+    if os.path.isfile(local_path):
+        return local_path
+    return url
+
+
+def resolve_image_urls(urls: list[str], cache_dir: str = _IMAGE_CACHE_DIR) -> list[str]:
+    """Resolve a list of image URLs to local paths where cached copies exist."""
+    return [resolve_image_url(u, cache_dir) for u in urls]
+
 
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
@@ -47,16 +65,8 @@ def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
 
 
 class DataCollatorWithPadding:
-    def __init__(
-        self,
-        assistant_header_ids: Optional[List[int]] = None,
-        end_token_ids: Optional[List[int]] = None,
-        dynamic_loss_mask: bool = False,
-    ):
+    def __init__(self):
         self.sp_degree = 1
-        self.assistant_header_ids = assistant_header_ids
-        self.end_token_ids = end_token_ids
-        self.dynamic_loss_mask = dynamic_loss_mask
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
@@ -71,33 +81,14 @@ class DataCollatorWithPadding:
         return outtensors
 
     def _get_loss_mask(self, item: Dict[str, Any]) -> torch.Tensor:
-        """Derive loss_mask for a single sample.
+        """Read the materialized loss_mask tensor from the item.
 
-        Priority:
-        1. dynamic_loss_mask flag → compute from input_ids token boundaries
-        2. packed_loss_mask string → unpack RLE-encoded mask
-        3. fallback → all-ones mask
+        Callers (e.g. MooncakeDataset) are responsible for computing and
+        attaching loss_mask before items reach the collator.
         """
-        if self.dynamic_loss_mask:
-            if self.assistant_header_ids is None or self.end_token_ids is None:
-                raise ValueError(
-                    "dynamic_loss_mask requires assistant_header_ids and "
-                    "end_token_ids to be set on the collator"
-                )
-            # TCP's input_ids are on CPU, so we can use input_ids_cpu directly.
-            input_ids = item.get("input_ids_cpu", item["input_ids"])
-            if input_ids.dim() == 2:
-                input_ids = input_ids.squeeze(0)
-            mask = compute_assistant_loss_mask(
-                input_ids, self.assistant_header_ids, self.end_token_ids
-            )
-            # Copy back to GPU.
-            return mask[None, :].to(item["input_ids"].device)
-
-        if "packed_loss_mask" not in item or item["packed_loss_mask"] is None:
-            seq_len = item["input_ids"].shape[-1]
-            return torch.ones(1, seq_len, dtype=torch.long, device=item["input_ids"].device)
-        return unpack_loss_mask(item["packed_loss_mask"])[None, :]
+        if "loss_mask" in item and isinstance(item["loss_mask"], torch.Tensor):
+            return item["loss_mask"]
+        raise KeyError(f"loss_mask not found in item: {item}")
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)
