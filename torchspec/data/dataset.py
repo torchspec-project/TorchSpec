@@ -156,13 +156,10 @@ def load_conversation_dataset(args):
         file_stat = f"-{st.st_size}-{st.st_mtime}"
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
-    max_images_cfg = getattr(args, "max_images_per_sample", None)
-    tokens_per_image_cfg = getattr(args, "tokens_per_image", 3000)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
-        f"-mimg={max_images_cfg}-tpi={tokens_per_image_cfg}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
@@ -195,43 +192,6 @@ def load_conversation_dataset(args):
         flatten_multimodal_content(messages, custom_template.image_placeholder)
         data_id = sample.get("id", f"sample_{idx}")
         raw_samples.append((data_id, messages, multimodal_inputs))
-
-    # Filter samples that would exceed max_seq_length after image token expansion
-    max_images = getattr(args, "max_images_per_sample", None)
-    tokens_per_image = getattr(args, "tokens_per_image", 3000)
-    pre_filter_count = len(raw_samples)
-    filtered_samples = []
-    for data_id, messages, multimodal_inputs in raw_samples:
-        num_images = 0
-        if multimodal_inputs and multimodal_inputs.get("images"):
-            num_images = len(multimodal_inputs["images"])
-
-        if max_images is not None and num_images > max_images:
-            logger.debug(
-                f"Dropping sample {data_id}: {num_images} images > max_images_per_sample={max_images}"
-            )
-            continue
-
-        text_chars = sum(
-            len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str)
-        )
-        estimated_tokens = text_chars // 4 + num_images * tokens_per_image
-        if estimated_tokens > max_length:
-            logger.debug(
-                f"Dropping sample {data_id}: estimated {estimated_tokens} tokens "
-                f"({text_chars} text chars + {num_images} images) > max_seq_length={max_length}"
-            )
-            continue
-
-        filtered_samples.append((data_id, messages, multimodal_inputs))
-
-    raw_samples = filtered_samples
-    if pre_filter_count - len(raw_samples) > 0:
-        logger.info(
-            f"Filtered {pre_filter_count - len(raw_samples)}/{pre_filter_count} samples "
-            f"exceeding estimated token budget (max_seq_length={max_length}, "
-            f"tokens_per_image={tokens_per_image}, max_images_per_sample={max_images})"
-        )
 
     logger.info(
         f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."
