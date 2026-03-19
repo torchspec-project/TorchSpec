@@ -182,6 +182,10 @@ class DFlashAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
+        # Q-norm and K-norm (Qwen3 architecture requirement)
+        self.q_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
         self.rotary_emb = DFlashRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -210,7 +214,8 @@ class DFlashAttention(nn.Module):
 
         # Q only from draft
         q = self.q_proj(draft_hidden)
-        q = q.view(bsz, draft_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(bsz, draft_len, self.num_heads, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)  # [B, num_heads, draft_len, head_dim]
 
         # K/V from both context and draft (shared projections)
         k_ctx = self.k_proj(context_hidden)
@@ -218,35 +223,31 @@ class DFlashAttention(nn.Module):
         k_draft = self.k_proj(draft_hidden)
         v_draft = self.v_proj(draft_hidden)
 
-        k_ctx = k_ctx.view(bsz, ctx_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v_ctx = v_ctx.view(bsz, ctx_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        k_draft = k_draft.view(bsz, draft_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v_draft = v_draft.view(bsz, draft_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Concatenate K and V along sequence dimension BEFORE normalization
+        # This matches SpecForge: concat → K-norm → RoPE
+        k = torch.cat([k_ctx, k_draft], dim=1)  # [B, ctx+draft, kv_dim]
+        v = torch.cat([v_ctx, v_draft], dim=1)
 
-        # RoPE for Q (draft positions) and K (context + draft positions)
         total_len = ctx_len + draft_len
+        k = k.view(bsz, total_len, self.num_kv_heads, self.head_dim)
+        k = self.k_norm(k).transpose(1, 2)  # [B, num_kv_heads, ctx+draft, head_dim]
+        v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # RoPE with concatenated position IDs (context + draft)
+        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         cos, sin = self.rotary_emb(q, seq_len=total_len)
         cos = cos.to(q.device)
         sin = sin.to(q.device)
 
-        # Apply RoPE to Q
+        # Apply RoPE to Q (using draft positions only — last draft_len of full_position_ids)
         cos_q = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
         sin_q = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
         q = (q * cos_q) + (_rotate_half(q) * sin_q)
 
-        # Apply RoPE to K_ctx
-        cos_ctx = cos.squeeze(1).squeeze(0)[context_position_ids].unsqueeze(1)
-        sin_ctx = sin.squeeze(1).squeeze(0)[context_position_ids].unsqueeze(1)
-        k_ctx = (k_ctx * cos_ctx) + (_rotate_half(k_ctx) * sin_ctx)
-
-        # Apply RoPE to K_draft
-        cos_draft = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        sin_draft = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        k_draft = (k_draft * cos_draft) + (_rotate_half(k_draft) * sin_draft)
-
-        # Concatenate context and draft KV along sequence dimension
-        k = torch.cat([k_ctx, k_draft], dim=2)  # [B, num_kv_heads, ctx+draft, head_dim]
-        v = torch.cat([v_ctx, v_draft], dim=2)
+        # Apply RoPE to K (using full concatenated positions)
+        cos_k = cos.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+        sin_k = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+        k = (k * cos_k) + (_rotate_half(k) * sin_k)
 
         # GQA expansion
         k = _repeat_kv(k, self.num_kv_groups)
@@ -402,25 +403,31 @@ class DFlashDraftModel(PreTrainedModel):
 
     def forward(
         self,
-        draft_input_ids: torch.Tensor,
+        draft_input_ids: Optional[torch.Tensor],
         context_feature: torch.Tensor,
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        noise_embedding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
 
         Args:
-            draft_input_ids: [B, draft_len] — token IDs (anchor + MASK tokens)
+            draft_input_ids: [B, draft_len] — token IDs (anchor + MASK tokens).
+                Ignored if noise_embedding is provided.
             context_feature: [B, ctx_len, D] — projected context from target
             draft_position_ids: [B, draft_len]
             context_position_ids: [B, ctx_len]
             block_mask: FlexAttention BlockMask
+            noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
 
         Returns:
             hidden_states: [B, draft_len, D] — pre-norm hidden states
         """
-        draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
+        if noise_embedding is not None:
+            draft_hidden = noise_embedding.to(context_feature.dtype)
+        else:
+            draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
         for layer in self.layers:
             draft_hidden = layer(

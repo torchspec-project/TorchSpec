@@ -32,7 +32,7 @@ training:
   learning_rate: 1e-4
   max_concurrent_batches: 1
   max_grad_norm: 0.5
-  max_seq_length: 16384
+  max_seq_length: 4096
   num_epochs: 1
   seed: 42
   training_num_gpus_per_node: 2
