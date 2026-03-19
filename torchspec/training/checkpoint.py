@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -211,9 +212,11 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
     still hold pre-checkpoint (random init) values.  The first optimizer step
     would copy these back to the model, overwriting the loaded weights.
 
-    Strategy: load fp32 params from the optimizer checkpoint (lossless), then
-    clear the Adam state so the optimizer is fresh.  Falls back to copying from
-    the bf16 model weights if the optimizer checkpoint is unavailable.
+    Strategy: temporarily load the optimizer checkpoint to recover the fp32 master
+    params, then restore the freshly configured param_groups and clear Adam state
+    so continual training still uses the new optimizer hyperparameters. Falls
+    back to copying from the bf16 model weights if the optimizer checkpoint is
+    unavailable.
     """
     opt = actor.optimizer
     if not hasattr(opt, "fp32_params"):
@@ -221,9 +224,18 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
     if optim_dir.exists() and (optim_dir / ".metadata").exists():
         try:
+            fresh_param_groups = [
+                {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
+                for group in opt.optimizer.param_groups
+            ]
             optim_state = OptimizerState(actor.model, opt)
             optim_sd = {"optim_state": optim_state}
             dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
+            for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
+                params = group["params"]
+                group.clear()
+                group.update(copy.deepcopy(fresh_group))
+                group["params"] = params
             opt.optimizer.state.clear()
             logger.info(f"Loaded fp32 master params from {optim_dir}")
             return
