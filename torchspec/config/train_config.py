@@ -93,6 +93,7 @@ class ModelConfig:
 class TrainingConfig:
     attention_backend: str = "sdpa"
     colocate: bool = False
+    continual_training: bool = False
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
@@ -109,7 +110,6 @@ class TrainingConfig:
     max_concurrent_batches: int = 1
     max_grad_norm: float = 0.5
     max_seq_length: int = 8192
-    no_save_optim: bool = False
     num_epochs: int = 10
     num_train_steps: Optional[int] = None
     micro_batch_size: int = 2
@@ -309,6 +309,8 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     flat["checkpoint_dir"] = (
         str(Path(flat["output_dir"]) / "checkpoints") if flat.get("output_dir") else None
     )
+    if flat.get("continual_training") and not flat.get("load_path"):
+        logger.warning("continual_training=True but no training.load_path was provided")
 
     return argparse.Namespace(**flat)
 
