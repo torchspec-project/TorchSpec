@@ -1,6 +1,6 @@
 # TorchSpec
 
-TorchSpec is a torch-native speculative decoding training framework for disaggregated draft-model training. It decouples target-model inference from draft-model training and streams hidden states directly from inference engine groups to distributed training workers through Mooncake, so inference and training can scale independently.
+TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via [Mooncake](https://github.com/kvcache-ai/Mooncake) store, allowing each side to scale independently.
 
 TorchSpec currently includes training flows and examples for:
 
