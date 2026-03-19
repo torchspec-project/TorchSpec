@@ -33,6 +33,7 @@ training:
   ttt_length: 7
   save_per_epoch: true
   warmup_ratio: 0.015
+  train_env_vars: '{"TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS": "ATEN,TRITON"}'
 
   # DFlash-specific parameters
   dflash_block_size: 16
