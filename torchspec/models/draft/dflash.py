@@ -406,8 +406,7 @@ class DFlashDraftModel(PreTrainedModel):
         Returns:
             context_feature: [B, seq_len, hidden_size]
         """
-        selected = [all_hidden_states[i] for i in range(len(all_hidden_states))]
-        concatenated = torch.cat(selected, dim=-1).to(self.context_proj.weight.dtype)
+        concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
         projected = self.context_proj(concatenated)
         return self.context_norm(projected)
 

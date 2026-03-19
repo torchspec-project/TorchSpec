@@ -29,17 +29,17 @@ training:
   attention_backend: flex_attention
   micro_batch_size: 1
   draft_accumulation_steps: 1
-  learning_rate: 1e-4
+  learning_rate: 6e-4
   max_concurrent_batches: 1
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
   max_seq_length: 4096
-  num_epochs: 1
+  num_epochs: 6
   seed: 42
   training_num_gpus_per_node: 2
   training_num_nodes: 1
   ttt_length: 7
   save_per_epoch: true
-  warmup_ratio: 0.015
+  warmup_ratio: 0.04
 
   # DFlash-specific parameters
   dflash_block_size: 16

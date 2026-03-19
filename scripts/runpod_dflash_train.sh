@@ -185,10 +185,14 @@ print('  TorchSpec DFlash imports: OK')
 "
 
 else
-    # SKIP_SETUP=1: just activate venv
-    export PATH="$VENV_DIR/bin:$PATH"
-    PY="$VENV_DIR/bin/python"
-    cd "$WORKSPACE/TorchSpec"
+    # SKIP_SETUP=1: use existing venv or system Python (e.g. Docker image)
+    if [ -d "$VENV_DIR" ]; then
+        export PATH="$VENV_DIR/bin:$PATH"
+        PY="$VENV_DIR/bin/python"
+    else
+        PY="$(which python3)"
+    fi
+    cd "${TORCHSPEC_DIR:-$WORKSPACE/TorchSpec}"
     echo "Skipping setup (SKIP_SETUP=1). Using existing env."
 fi
 

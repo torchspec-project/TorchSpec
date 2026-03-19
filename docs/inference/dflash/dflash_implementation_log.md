@@ -883,19 +883,132 @@ zip-based torch archives.
 **Solution**: Use the internal `_load_state_dict()` API with `no_dist=True`, matching the
 pattern in `tools/convert_to_hf.py`.
 
-### Pending Work
+---
 
-1. **Training data**: Need larger, more diverse dataset (ShareGPT, OpenHermes, etc.)
-   - Consider saving curated training data to repo for reproducibility
-   - Minimum: 50K conversations for meaningful draft model quality
+## Session 8: 2026-03-19 — Phase B: 4-GPU SGLang Validation & Inference Benchmark
 
-2. **Longer training**: Run 10K-50K steps with proper LR schedule and evaluation
+### Goal
+
+Validate the full DFlash training pipeline on 4× H100 GPUs with SGLang inference backend,
+then benchmark inference performance before Phase C (full training).
+
+### Infrastructure
+
+- **RunPod Pod**: 4× H100 80GB, `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
+- **GPU allocation**: GPU 0-1 inference (SGLang, duplicate mode), GPU 2-3 training (FSDP2)
+- **SSH**: Requires PTY allocation via `expect` — standard SSH commands fail with "Your SSH client doesn't support PTY"
+- **File transfer**: SCP doesn't work on RunPod; use base64 encoding through expect+SSH
+
+### Training Runs
+
+#### Run 1 — Eval Timeout
+**Error**: `TimeoutError: Timed out while waiting for eval cache generation (no progress during eval for 300.0s, dispatched=0/64 samples)`
+**Cause**: Eval data path `../examples/data/eval_conversations.jsonl` didn't exist on RunPod.
+**Fix**: Disable eval with CLI overrides: `dataset.eval_data_path=null dataset.eval_interval=0`
+
+#### Run 2 — Mooncake Size Mismatch (Critical Bug Found)
+**Error**: `RuntimeError: Size mismatch for hidden_states: got 3670016 bytes (1835008 elements), expected 4587520 bytes (2293760 elements). Expected shape: (112, 20480)`
+**Root cause**: `build_target_layer_ids()` produced `[1, 10, 18, 26, 35]` instead of SpecForge's `[1, 9, 17, 25, 33]`.
+- Old TorchSpec formula: `interval = (num_hidden_layers - 2) / (num_target_layers - 1)` → reached too close to last layer
+- Layer 35 + SGLang's +1 capture offset = 36, which is out of bounds for `range(36)`, so only 4 of 5 hooks fired
+- Result: inference sent 4×4096=16384 elements, training expected 5×4096=20480
+
+**Fix**: Rewrote `build_target_layer_ids()` to match SpecForge exactly:
+```python
+start = 1
+end = num_hidden_layers - 3  # = 33 for Qwen3-8B (36 layers)
+span = end - start
+# → [1, 9, 17, 25, 33]
+```
+
+Also set explicit `target_layer_ids: [1, 9, 17, 25, 33]` in `dflash_draft_config.json` as safety net.
+
+**Key insight**: SGLang patch applies `+1` offset by design — `set_eagle3_layers_to_capture([val + 1 for val in layer_ids])`. The Qwen3NextModel forward loop captures hidden states at the start of each iteration (before the layer runs), so position `k+1` captures output of layer `k`.
+
+#### Run 3 — SUCCESS (200/200 Steps)
+Training completed successfully with the fixed layer IDs.
+- Config: `configs/sglang_qwen3_8b_dflash.yaml` with overrides:
+  ```
+  training.num_train_steps=200
+  training.training_num_gpus_per_node=2
+  inference.inference_num_gpus=2
+  inference.inference_num_gpus_per_engine=1
+  inference.inference_num_gpus_per_node=2
+  dataset.eval_data_path=null
+  dataset.eval_interval=0
+  ```
+
+### Inference Benchmark Results (200-step checkpoint)
+
+| Metric | Baseline (target-only) | DFlash |
+|--------|----------------------|--------|
+| Throughput | 61.8 tok/s | 41.2 tok/s |
+| Acceptance length (τ) | — | 1.03 |
+| Speedup | 1.0x | 0.67x |
+
+**τ=1.03 is expected** — 200 steps on tiny sample data is nowhere near sufficient for convergence. The pipeline works correctly end-to-end.
+
+### FSDP Checkpoint Extraction
+
+**Gotcha**: The extraction script uses `--checkpoint_dir` (underscores) and `--output`, not `--checkpoint-dir` / `--output-dir`. Python argparse maps hyphens to underscores for `dest`, but extra unrecognized args cause failure.
+
+Working command:
+```bash
+python3 scripts/extract_dflash_checkpoint.py \
+    --checkpoint_dir outputs/qwen3-8b-dflash/checkpoints/iter_0000201 \
+    --output /tmp/dflash_draft.pt
+```
+
+### Cross-Check vs SpecForge — Findings
+
+Thorough review of draft model, training wrapper, and pipeline against SpecForge reference.
+
+**Not bugs (intentional design divergences):**
+| Aspect | TorchSpec | SpecForge | Reason |
+|--------|-----------|-----------|--------|
+| Architecture | Standalone PreTrainedModel | Extends Qwen3PreTrainedModel | TorchSpec is model-agnostic |
+| RoPE | Computed on-the-fly per layer | Pre-computed, passed as embeddings | Both produce same result |
+| Context projection | In `extract_context_feature()` | In draft model `forward()` | Same operation, different location |
+| Forward signature | Separate ctx/draft position IDs | Combined position_ids | TorchSpec more explicit |
+| KV cache | Not supported (recomputes) | Supported via past_key_values | Future TorchSpec TODO |
+| Block mask CUDA-only | `if device.type == "cuda"` else None | Always created | FlexAttention requires CUDA; CPU path is for testing only |
+| Hidden states input | List of per-layer tensors | Concatenated tensor | Split/concat at different points |
+
+**Real issues fixed:**
+| Issue | Old Value | New Value | Source |
+|-------|-----------|-----------|--------|
+| `learning_rate` | 1e-4 | **6e-4** | SpecForge default |
+| `warmup_ratio` | 0.015 | **0.04** | SpecForge default |
+| `max_grad_norm` | 0.5 | **1.0** | SpecForge default |
+| `num_epochs` | 1 | **6** | SpecForge default |
+| `extract_context_feature` | Redundant list copy | Direct `torch.cat()` | Code cleanup |
+
+### Reference: SpecForge Eagle3 Production Performance
+
+| Model | τ (acceptance length) | Speedup |
+|-------|----------------------|---------|
+| Llama-3.1-8B | 1.8–3.1 | 1.0–1.7x |
+| Llama-3.3-70B | 1.4–3.2 | 1.1–2.0x |
+| Qwen3-30B-A3B | 2.6–5.3 | 1.4–2.5x |
+| Llama-4-Scout | 2.1–3.0 | 1.5–2.7x |
+
+**DFlash target**: τ ≥ 3.0 with full training (no published SpecForge DFlash benchmarks yet).
+
+### Pending Work (Phase C)
+
+1. **Full training**: PerfectBlend 50K+ samples × 6 epochs on 4× H100
+   - Dataset: `mlabonne/open-perfectblend` (~1.4M samples), tokenized with Qwen3 tokenizer
+   - Prepare with SpecForge's `scripts/prepare_data.py --dataset perfectblend`
+   - Each sample needs minimum `2 × block_size = 32` loss tokens
+   - Estimated: ~4-5 hours for 50K samples × 6 epochs
+
+2. **Inference benchmark**: Extract converged checkpoint, target τ ≥ 3.0
 
 3. **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` for efficient
    inference (currently recomputes full context each cycle)
 
-4. **Eagle3 inference comparison**: Run Eagle3 inference benchmark for side-by-side comparison
+4. **Eagle3 inference comparison**: Side-by-side benchmark with Eagle3
 
 ---
 
-*Implementation Log v9 — 2026-03-19*
+*Implementation Log v10 — 2026-03-19*
