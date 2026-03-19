@@ -69,8 +69,8 @@ mooncake:
   enable_gpu_direct: false
   kv_lease_ttl_s: 3.0
 
-output_dir: ???
-cache_dir: ???
+output_dir: ./outputs/sglang_minimax_m25_5node
+cache_dir: ./cache/sglang_minimax_m25_5node
 model_download_dir: null
 
 debug:
