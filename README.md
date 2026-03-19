@@ -69,6 +69,17 @@ Override any config value via CLI:
 ./examples/qwen3-8b-single-node/run.sh training.learning_rate=5e-5 training.num_train_steps=500
 ```
 
+## Examples
+
+| Example | Backend | Model |
+|---------|---------|-------|
+| [hf-quickstart](examples/hf-quickstart/) | HuggingFace | Qwen3-8B |
+| [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference Engine | Qwen3-8B |
+| [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference Engine | Kimi-K2.5 |
+| [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference Engine | Kimi-K2.5 |
+
+See [examples/README.md](examples/README.md) for details.
+
 ## Resume Vs Continual Training
 
 TorchSpec supports two different ways to start from an existing checkpoint. They both use
@@ -135,17 +146,6 @@ Use continual training when:
 
 If you want to continue the same run, use normal resume mode and leave `continual_training` unset or `false`.
 If you want to start a new run from pretrained draft weights, set `continual_training: true` and point `output_dir` to a new directory.
-
-## Examples
-
-| Example | Backend | Model |
-|---------|---------|-------|
-| [hf-quickstart](examples/hf-quickstart/) | HuggingFace | Qwen3-8B |
-| [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference Engine | Qwen3-8B |
-| [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference Engine | Kimi-K2.5 |
-| [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference Engine | Kimi-K2.5 |
-
-See [examples/README.md](examples/README.md) for details.
 
 ## Checkpoint Conversion
 
