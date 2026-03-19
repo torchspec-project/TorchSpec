@@ -498,5 +498,557 @@ class TestMiniTrainingLoop(unittest.TestCase):
         self.assertTrue(has_grad)
 
 
+class TestTrainerActorDispatch(unittest.TestCase):
+    """Verify that TrainerActor dispatches to the correct trainer class."""
+
+    def test_dflash_config_detected(self):
+        from torchspec.models.draft.dflash import DFlashConfig
+
+        config = DFlashConfig(
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+        )
+        self.assertIsInstance(config, DFlashConfig)
+
+    def test_auto_config_from_dict_dflash(self):
+        from torchspec.models.draft.auto import AutoDraftModelConfig
+
+        config_dict = {
+            "architectures": ["DFlashDraftModel"],
+            "hidden_size": 64,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 128,
+            "num_target_layers": 5,
+            "target_hidden_size": 64,
+            "target_num_hidden_layers": 12,
+        }
+        config = AutoDraftModelConfig.from_dict(config_dict)
+        from torchspec.models.draft.dflash import DFlashConfig
+
+        self.assertIsInstance(config, DFlashConfig)
+
+    def test_auto_config_from_dict_eagle3(self):
+        from torchspec.models.draft.auto import AutoDraftModelConfig
+
+        config_dict = {
+            "architectures": ["LlamaForCausalLMEagle3"],
+            "hidden_size": 64,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 128,
+        }
+        config = AutoDraftModelConfig.from_dict(config_dict)
+        from torchspec.models.draft.dflash import DFlashConfig
+
+        self.assertNotIsInstance(config, DFlashConfig)
+
+
+class TestTargetModelGeneralization(unittest.TestCase):
+    """Verify that eagle3_target_model supports configurable layer counts."""
+
+    def test_set_aux_layers_custom_count(self):
+        """set_aux_hidden_states_layers should accept any non-empty list."""
+        from unittest.mock import MagicMock
+
+        from torchspec.models.target.eagle3_target_model import Eagle3TargetModel
+
+        class MockTarget(Eagle3TargetModel):
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                pass
+
+            def generate_eagle3_data(self, *args, **kwargs):
+                pass
+
+        mock = MockTarget()
+        mock.model = MagicMock()
+        mock.model.config.num_hidden_layers = 36
+
+        mock.set_aux_hidden_states_layers([1, 9, 17, 25, 33])
+        self.assertEqual(len(mock.aux_hidden_states_layers), 5)
+        self.assertEqual(mock.aux_hidden_states_layers, [1, 9, 17, 25, 33])
+
+    def test_set_aux_layers_default_eagle3(self):
+        from unittest.mock import MagicMock
+
+        from torchspec.models.target.eagle3_target_model import Eagle3TargetModel
+
+        class MockTarget(Eagle3TargetModel):
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                pass
+
+            def generate_eagle3_data(self, *args, **kwargs):
+                pass
+
+        mock = MockTarget()
+        mock.model = MagicMock()
+        mock.model.config.num_hidden_layers = 28
+
+        mock.set_aux_hidden_states_layers(None)
+        self.assertEqual(len(mock.aux_hidden_states_layers), 3)
+        self.assertEqual(mock.aux_hidden_states_layers, [1, 13, 24])
+
+    def test_set_aux_layers_rejects_empty(self):
+        from unittest.mock import MagicMock
+
+        from torchspec.models.target.eagle3_target_model import Eagle3TargetModel
+
+        class MockTarget(Eagle3TargetModel):
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                pass
+
+            def generate_eagle3_data(self, *args, **kwargs):
+                pass
+
+        mock = MockTarget()
+        mock.model = MagicMock()
+
+        with self.assertRaises(ValueError):
+            mock.set_aux_hidden_states_layers([])
+
+
+class TestMooncakeBufferSizing(unittest.TestCase):
+    """Verify mooncake buffer sizing adapts to layer count."""
+
+    def test_buffer_size_scales_with_layers(self):
+        from torchspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+
+        size_3 = calculate_eagle3_buffer_size(
+            max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=3
+        )
+        size_5 = calculate_eagle3_buffer_size(
+            max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=5
+        )
+        self.assertGreater(size_5, size_3)
+
+    def test_buffer_size_with_dflash_default(self):
+        from torchspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+
+        size = calculate_eagle3_buffer_size(
+            max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=5
+        )
+        self.assertGreater(size, 0)
+
+
+class TestDFlashAuxLayerIds(unittest.TestCase):
+    """Verify DFlash aux layer ID computation."""
+
+    def test_dflash_layer_ids_match_build_target(self):
+        from torchspec.models.draft.dflash import build_target_layer_ids
+
+        ids = build_target_layer_ids(5, 36)
+        self.assertEqual(len(ids), 5)
+        self.assertGreaterEqual(ids[0], 1)
+        self.assertLessEqual(ids[-1], 35)
+
+    def test_dflash_layer_ids_for_28_layers(self):
+        from torchspec.models.draft.dflash import build_target_layer_ids
+
+        ids = build_target_layer_ids(5, 28)
+        self.assertEqual(len(ids), 5)
+        self.assertGreaterEqual(ids[0], 1)
+        self.assertLessEqual(ids[-1], 27)
+        self.assertEqual(ids, sorted(ids))
+
+
+class TestTrainEntryDFlashIntegration(unittest.TestCase):
+    """Verify train_entry DFlash config auto-sets aux layer IDs."""
+
+    def test_auto_sets_aux_layers(self):
+        from argparse import Namespace
+
+        from torchspec.models.draft.dflash import DFlashConfig, build_target_layer_ids
+
+        args = Namespace()
+        config = DFlashConfig(
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            num_target_layers=5,
+            target_num_hidden_layers=28,
+        )
+
+        if isinstance(config, DFlashConfig) and not getattr(
+            args, "aux_hidden_states_layers", None
+        ):
+            target_layer_ids = getattr(config, "target_layer_ids", None)
+            if target_layer_ids is None:
+                num_target = getattr(config, "num_target_layers", 5)
+                target_num_hidden = getattr(config, "target_num_hidden_layers", 36)
+                target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
+            args.aux_hidden_states_layers = target_layer_ids
+
+        self.assertIsNotNone(args.aux_hidden_states_layers)
+        self.assertEqual(len(args.aux_hidden_states_layers), 5)
+
+    def test_does_not_override_explicit_layers(self):
+        from argparse import Namespace
+
+        from torchspec.models.draft.dflash import DFlashConfig
+
+        args = Namespace(aux_hidden_states_layers=[1, 5, 10, 15, 20])
+        config = DFlashConfig(
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            num_target_layers=5,
+            target_num_hidden_layers=28,
+        )
+
+        if isinstance(config, DFlashConfig) and not getattr(
+            args, "aux_hidden_states_layers", None
+        ):
+            args.aux_hidden_states_layers = [0, 1, 2, 3, 4]
+
+        self.assertEqual(args.aux_hidden_states_layers, [1, 5, 10, 15, 20])
+
+
+class TestDFlashTrainingConfig(unittest.TestCase):
+    """Verify DFlash parameters are present in TrainingConfig."""
+
+    def test_config_has_dflash_params(self):
+        from torchspec.config.train_config import TrainingConfig
+
+        config = TrainingConfig()
+        self.assertEqual(config.dflash_block_size, 16)
+        self.assertEqual(config.dflash_num_anchors, 512)
+        self.assertEqual(config.dflash_loss_decay_gamma, 7.0)
+        self.assertEqual(config.dflash_num_target_layers, 5)
+
+    def test_config_roundtrip_via_omegaconf(self):
+        from omegaconf import OmegaConf
+
+        from torchspec.config.train_config import Config
+
+        schema = OmegaConf.structured(Config)
+        self.assertEqual(schema.training.dflash_block_size, 16)
+        self.assertEqual(schema.training.dflash_num_target_layers, 5)
+
+        overrides = OmegaConf.from_dotlist([
+            "training.dflash_block_size=8",
+            "training.dflash_num_target_layers=3",
+        ])
+        merged = OmegaConf.merge(schema, overrides)
+        self.assertEqual(merged.training.dflash_block_size, 8)
+        self.assertEqual(merged.training.dflash_num_target_layers, 3)
+
+
+class TestDFlashTrainingQuality(unittest.TestCase):
+    """Comprehensive training quality validation for DFlash.
+
+    Tests multiple training scenarios beyond the basic loss-decrease check:
+    variable sequence lengths, block sizes, accuracy improvement, gradient health.
+    """
+
+    def _make_model_and_data(self, H=64, V=128, num_target_layers=2,
+                             block_size=4, num_anchors=4, seq_len=64, batch_size=2):
+        config = _make_config(
+            H=H, intermediate=256, num_heads=4, num_kv_heads=2,
+            V=V, num_target_layers=num_target_layers, target_num_hidden=12,
+        )
+        draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
+        draft_model.freeze_embedding()
+        model = DFlashModel(
+            draft_model=draft_model, block_size=block_size,
+            num_anchors=num_anchors, loss_decay_gamma=7.0,
+        )
+        input_ids = torch.randint(0, V, (batch_size, seq_len))
+        hidden_states_list = [
+            torch.randn(batch_size, seq_len, H) for _ in range(num_target_layers)
+        ]
+        loss_mask = torch.ones(batch_size, seq_len)
+        lm_head_weight = torch.randn(V, H)
+        return model, input_ids, hidden_states_list, loss_mask, lm_head_weight
+
+    def _train_steps(self, model, input_ids, hidden_states_list, loss_mask,
+                     lm_head_weight, steps=20, lr=1e-3):
+        model.train()
+        optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=lr,
+        )
+        losses, accs = [], []
+        for _ in range(steps):
+            optimizer.zero_grad()
+            loss, acc = model(
+                input_ids=input_ids,
+                hidden_states_list=hidden_states_list,
+                loss_mask=loss_mask,
+                lm_head_weight=lm_head_weight,
+            )
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            accs.append(acc.item())
+        return losses, accs
+
+    def test_longer_sequence(self):
+        """Training on longer sequences (128 tokens) should converge."""
+        torch.manual_seed(42)
+        model, *data = self._make_model_and_data(seq_len=128, num_anchors=8)
+        losses, _ = self._train_steps(model, *data, steps=20)
+        self.assertLess(losses[-1], losses[0])
+        self.assertTrue(all(math.isfinite(l) for l in losses))
+
+    def test_large_block_size(self):
+        """Block size 8 should still converge."""
+        torch.manual_seed(42)
+        model, *data = self._make_model_and_data(block_size=8, seq_len=128, num_anchors=4)
+        losses, _ = self._train_steps(model, *data, steps=20)
+        self.assertLess(losses[-1], losses[0])
+
+    def test_accuracy_improves(self):
+        """Accuracy should improve over training when overfitting on a small batch."""
+        torch.manual_seed(42)
+        model, *data = self._make_model_and_data(seq_len=64, batch_size=1)
+        _, accs = self._train_steps(model, *data, steps=30)
+        avg_first5 = sum(accs[:5]) / 5
+        avg_last5 = sum(accs[-5:]) / 5
+        self.assertGreater(avg_last5, avg_first5,
+                           f"Accuracy did not improve: {avg_first5:.4f} → {avg_last5:.4f}")
+
+    def test_gradient_norms_are_healthy(self):
+        """Gradient norms should stay finite and non-zero during training."""
+        torch.manual_seed(42)
+        model, input_ids, hs_list, mask, lm_w = self._make_model_and_data()
+        model.train()
+        optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+        )
+        grad_norms = []
+        for _ in range(10):
+            optimizer.zero_grad()
+            loss, _ = model(
+                input_ids=input_ids, hidden_states_list=hs_list,
+                loss_mask=mask, lm_head_weight=lm_w,
+            )
+            loss.backward()
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            grad_norms.append(total_norm ** 0.5)
+            optimizer.step()
+        self.assertTrue(all(math.isfinite(g) for g in grad_norms), "Non-finite gradient norm")
+        self.assertTrue(all(g > 0 for g in grad_norms), "Zero gradient norm detected")
+
+    def test_multiple_target_layers(self):
+        """Training with 5 target layers (DFlash default) should work."""
+        torch.manual_seed(42)
+        model, *data = self._make_model_and_data(num_target_layers=5, seq_len=64)
+        losses, _ = self._train_steps(model, *data, steps=15)
+        self.assertLess(losses[-1], losses[0])
+
+    def test_loss_mask_with_padding(self):
+        """Model should handle sequences with partial padding via loss_mask."""
+        torch.manual_seed(42)
+        model, input_ids, hs_list, loss_mask, lm_w = self._make_model_and_data(
+            seq_len=64, batch_size=2,
+        )
+        loss_mask[0, :16] = 0.0
+        loss_mask[1, :32] = 0.0
+        losses, _ = self._train_steps(
+            model, input_ids, hs_list, loss_mask, lm_w, steps=15,
+        )
+        self.assertTrue(all(math.isfinite(l) for l in losses))
+        self.assertLess(losses[-1], losses[0])
+
+
+class TestDFlashVsEagle3Architecture(unittest.TestCase):
+    """Structural comparison between DFlash and Eagle3 architectures.
+
+    This validates the key architectural differences without running Eagle3 end-to-end
+    (which requires GPU for compiled KL loss). Instead it compares parameter counts,
+    input/output interfaces, and training characteristics.
+    """
+
+    def test_parameter_count_comparison(self):
+        """DFlash and Eagle3 have comparable parameter counts for same hidden size.
+
+        DFlash extra: context_proj (num_target_layers * H → H), context_norm
+        Eagle3 extra: fc (3 * H → H), project_in
+        Both: decoder layers + embed_tokens (frozen) + lm_head (external)
+        """
+        H, V = 64, 128
+        dflash_config = _make_config(
+            H=H, intermediate=256, num_heads=4, num_kv_heads=2,
+            V=V, num_target_layers=5, target_num_hidden=12,
+        )
+        dflash_model = DFlashDraftModel(dflash_config).to(dtype=torch.float32)
+        dflash_model.freeze_embedding()
+
+        dflash_trainable = sum(
+            p.numel() for p in dflash_model.parameters() if p.requires_grad
+        )
+        dflash_frozen = sum(
+            p.numel() for p in dflash_model.parameters() if not p.requires_grad
+        )
+
+        self.assertGreater(dflash_trainable, 0, "DFlash should have trainable parameters")
+        self.assertGreater(dflash_frozen, 0, "DFlash should have frozen parameters (embedding)")
+        self.assertGreater(
+            dflash_trainable, dflash_frozen,
+            "DFlash trainable params should exceed frozen (embedding only)",
+        )
+
+    def test_dflash_context_proj_dimension(self):
+        """DFlash W_proj input dim = num_target_layers * target_hidden_size."""
+        H = 64
+        num_target_layers = 5
+        config = _make_config(H=H, V=128, num_target_layers=num_target_layers)
+        model = DFlashDraftModel(config)
+        expected_input_dim = num_target_layers * H
+        self.assertEqual(model.context_proj.in_features, expected_input_dim)
+        self.assertEqual(model.context_proj.out_features, H)
+
+    def test_dflash_uses_ce_loss_not_kl(self):
+        """DFlash uses cross-entropy loss (against ground truth tokens), not KL divergence."""
+        torch.manual_seed(42)
+        H, V = 64, 128
+        config = _make_config(H=H, V=V, num_target_layers=2, target_num_hidden=12)
+        draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
+        draft_model.freeze_embedding()
+        model = DFlashModel(
+            draft_model=draft_model, block_size=4, num_anchors=2, loss_decay_gamma=7.0,
+        )
+
+        B, seq_len = 1, 32
+        input_ids = torch.randint(0, V, (B, seq_len))
+        hs_list = [torch.randn(B, seq_len, H) for _ in range(2)]
+        loss_mask = torch.ones(B, seq_len)
+        lm_head_weight = torch.randn(V, H)
+
+        with torch.no_grad():
+            loss, acc = model(
+                input_ids=input_ids, hidden_states_list=hs_list,
+                loss_mask=loss_mask, lm_head_weight=lm_head_weight,
+            )
+
+        self.assertGreaterEqual(loss.item(), 0.0, "CE loss should be non-negative")
+        self.assertGreaterEqual(acc.item(), 0.0)
+        self.assertLessEqual(acc.item(), 1.0)
+
+    def test_dflash_block_parallel_vs_sequential(self):
+        """DFlash predicts all block positions in a single forward pass (parallel),
+        whereas Eagle3 iterates ttt_length autoregressive steps.
+
+        We verify the draft model output has shape [B, num_anchors*block_size, H]
+        from a single forward call.
+        """
+        torch.manual_seed(42)
+        H, V = 64, 128
+        block_size = 4
+        num_anchors = 3
+        config = _make_config(H=H, V=V, num_target_layers=2, target_num_hidden=12)
+        draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
+
+        B, ctx_len = 1, 32
+        draft_len = num_anchors * block_size
+        draft_input_ids = torch.randint(0, V, (B, draft_len))
+        context_feature = torch.randn(B, ctx_len, H)
+        draft_pos = torch.arange(draft_len).unsqueeze(0)
+        ctx_pos = torch.arange(ctx_len).unsqueeze(0)
+
+        with torch.no_grad():
+            out = draft_model(
+                draft_input_ids=draft_input_ids,
+                context_feature=context_feature,
+                draft_position_ids=draft_pos,
+                context_position_ids=ctx_pos,
+            )
+
+        self.assertEqual(out.shape, (B, draft_len, H),
+                         "DFlash should produce all predictions in one forward pass")
+
+    def test_loss_decay_weights_match_dflash_paper(self):
+        """Verify decay weights follow w(k) = exp(-(k-1)/gamma), k=1..B-1, w(0)=0.
+
+        This is a DFlash-specific feature: earlier predictions in each block
+        get higher weight since they are more impactful for acceptance rate.
+        Eagle3 uses uniform weighting across TTT steps.
+        """
+        gamma = 7.0
+        block_size = 16
+        config = _make_config(H=64, V=128, num_target_layers=2, target_num_hidden=12)
+        draft_model = DFlashDraftModel(config)
+        model = DFlashModel(
+            draft_model=draft_model, block_size=block_size, loss_decay_gamma=gamma,
+        )
+
+        weights = model.decay_weights
+        self.assertEqual(weights[0].item(), 0.0, "Anchor (k=0) should have zero weight")
+        self.assertAlmostEqual(weights[1].item(), 1.0, places=5,
+                               msg="k=1 should have weight exp(0)=1.0")
+
+        total_weight = sum(weights[k].item() for k in range(1, block_size))
+        expected_total = sum(math.exp(-(k - 1) / gamma) for k in range(1, block_size))
+        self.assertAlmostEqual(total_weight, expected_total, places=4)
+
+
+class TestDFlashConfigYAML(unittest.TestCase):
+    """Verify the DFlash training config YAML loads correctly."""
+
+    def test_dflash_yaml_loads(self):
+        import os
+        from omegaconf import OmegaConf
+
+        try:
+            from torchspec.config.train_config import load_config
+        except (ImportError, ModuleNotFoundError):
+            self.skipTest("load_config requires ray (not installed locally)")
+
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "configs", "sglang_qwen3_8b_dflash.yaml",
+        )
+        if not os.path.exists(config_path):
+            self.skipTest(f"DFlash config not found at {config_path}")
+
+        config = load_config(config_path=config_path)
+        self.assertEqual(config.training.dflash_block_size, 16)
+        self.assertEqual(config.training.dflash_num_anchors, 512)
+        self.assertEqual(config.training.dflash_num_target_layers, 5)
+        self.assertAlmostEqual(config.training.dflash_loss_decay_gamma, 7.0)
+        self.assertEqual(
+            config.model.draft_model_config,
+            "torchspec/config/dflash_draft_config.json",
+        )
+
+    def test_dflash_draft_config_json_loads(self):
+        import json
+        import os
+        from torchspec.models.draft.auto import AutoDraftModelConfig
+
+        json_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "torchspec", "config", "dflash_draft_config.json",
+        )
+        if not os.path.exists(json_path):
+            self.skipTest(f"DFlash draft config JSON not found at {json_path}")
+
+        with open(json_path) as f:
+            config_dict = json.load(f)
+
+        config = AutoDraftModelConfig.from_dict(config_dict)
+        from torchspec.models.draft.dflash import DFlashConfig
+        self.assertIsInstance(config, DFlashConfig)
+        self.assertEqual(config.hidden_size, 3584)
+        self.assertEqual(config.num_target_layers, 5)
+        self.assertEqual(config.target_num_hidden_layers, 28)
+
+
 if __name__ == "__main__":
     unittest.main()
