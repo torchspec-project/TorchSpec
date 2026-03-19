@@ -20,6 +20,7 @@
 
 import torch
 import torch._dynamo as dynamo
+import torch._inductor.config as inductor_config
 from torch.nn.attention.flex_attention import (
     create_block_mask,
     flex_attention,
@@ -31,6 +32,9 @@ try:
     dynamo.config.recompile_limit = 64
 except AttributeError:
     dynamo.config.cache_size_limit = 64
+
+if "ATEN" not in getattr(inductor_config, "max_autotune_gemm_backends", ""):
+    inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
 
 
 # Reference Implementation https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/flex_attention.py
