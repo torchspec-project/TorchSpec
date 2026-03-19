@@ -259,13 +259,12 @@ echo "  DFlash config: $DFLASH_CONFIG"
 
 echo ""
 echo "━━━ WandB Configuration ━━━"
-if [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "  WANDB_API_KEY not set."
-    echo "  Continuing without WandB (metrics in stdout/logs only)."
-    WANDB_ARGS=()
-else
+if [ -n "${WANDB_API_KEY:-}" ]; then
     WANDB_ARGS=(training.report_to=wandb training.wandb_project="$WANDB_PROJECT")
     echo "  WandB enabled: project=$WANDB_PROJECT"
+else
+    echo "  WANDB_API_KEY not set — metrics in stdout/logs only."
+    WANDB_ARGS=()
 fi
 
 # ─────────────────────────────────────────────────────────────────
