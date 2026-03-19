@@ -99,6 +99,7 @@ def preprocess_conversations(
     add_generation_prompt: bool = False,
     return_formatted_text: bool = False,
     last_turn_loss_only: bool = False,
+    min_loss_tokens: int = 0,
     **kwargs,
 ) -> Dict[str, List]:
     """
@@ -161,7 +162,7 @@ def preprocess_conversations(
             last_turn_only=last_turn_loss_only,
         )
 
-        if loss_mask.sum() == 0:
+        if loss_mask.sum() < max(1, min_loss_tokens):
             continue
 
         results["input_ids"].append(input_ids[None, :])
