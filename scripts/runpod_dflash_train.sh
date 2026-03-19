@@ -83,11 +83,11 @@ if [ -d "$VENV_DIR" ]; then
         echo "  Reusing existing venv"
     else
         rm -rf "$VENV_DIR"
-        "$PYTHON" -m venv "$VENV_DIR"
+        "$PYTHON" -m venv --system-site-packages "$VENV_DIR"
     fi
 else
-    "$PYTHON" -m venv "$VENV_DIR"
-    echo "  Created venv at $VENV_DIR"
+    "$PYTHON" -m venv --system-site-packages "$VENV_DIR"
+    echo "  Created venv (inheriting system packages)"
 fi
 
 export PATH="$VENV_DIR/bin:$PATH"
