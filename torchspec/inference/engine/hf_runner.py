@@ -36,7 +36,7 @@ import torch.distributed as dist
 from torchspec.config.inference_config import HFInferenceConfig
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.models.target import HFTargetModel
-from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE, EagleMooncakeStore
 from torchspec.utils.logging import logger
 
 
@@ -239,9 +239,9 @@ class HFRunner:
                     last_hidden_states=sample["last_hidden_states"],
                 )
 
-                dtypes = {"hidden_states": sample["hidden_states"].dtype}
+                dtypes = {"hidden_states": HIDDEN_STATES_STORAGE_DTYPE}
                 if sample["target"] is not None:
-                    dtypes["target"] = sample["target"].dtype
+                    dtypes["target"] = HIDDEN_STATES_STORAGE_DTYPE
 
                 results.append(
                     {

@@ -676,15 +676,18 @@ class VllmWorkerExtension:
 
                 logger.debug(f"Successfully stored to Mooncake: key={mooncake_key}")
 
-                # Convert dtype to string for RPC serialization
-                # Include input_ids as a list for reconstruction (avoids Mooncake storage issues)
+                # Report post-cast dtypes so readers interpret bytes correctly.
+                # EagleMooncakeStore.put() casts to HIDDEN_STATES_STORAGE_DTYPE.
+                from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
+
+                _hs_dtype_str = str(HIDDEN_STATES_STORAGE_DTYPE).replace("torch.", "")
                 result[req_id] = {
                     "mooncake_key": mooncake_key,
                     "tensor_shapes": tensor_shapes,
                     "tensor_dtypes": {
-                        "hidden_states": str(hidden_states.dtype).replace("torch.", ""),
+                        "hidden_states": _hs_dtype_str,
                         "input_ids": str(input_ids.dtype).replace("torch.", ""),
-                        "last_hidden_states": str(last_hidden_states.dtype).replace("torch.", ""),
+                        "last_hidden_states": _hs_dtype_str,
                     },
                     "num_layers": len(layer_tensors),
                     "packed_loss_mask": self._packed_loss_mask_map.get(req_id),
