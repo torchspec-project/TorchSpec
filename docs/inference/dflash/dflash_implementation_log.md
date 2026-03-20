@@ -1011,4 +1011,189 @@ Thorough review of draft model, training wrapper, and pipeline against SpecForge
 
 ---
 
-*Implementation Log v10 — 2026-03-19*
+## Session 9: 2026-03-20 — Phase C: Full Training & OOM/Crash Debugging
+
+### Goal
+
+Full DFlash training with PerfectBlend 50K samples × 6 epochs on 4× H100 GPUs to achieve τ ≥ 3.0.
+
+### Infrastructure
+
+- **RunPod Pod**: 4× H100 80GB (same pod as Session 8)
+- **GPU allocation**: GPU 0-1 training (FSDP2), GPU 2-3 inference (SGLang duplicate mode)
+- **Dataset**: `/workspace/data/perfectblend_50k.jsonl` (47,480 valid samples from `mlabonne/open-perfectblend`)
+- **Output**: `./outputs/qwen3-8b-dflash-phase-c`
+
+### Training Attempts
+
+#### Attempt 1 — OOM during FlexAttention forward (step 1)
+
+**Config**: `micro_batch_size=4`, `num_anchors=512`
+**Error**: `torch.OutOfMemoryError: Tried to allocate 35.25 GiB. GPU 0 has 79.18 GiB total, 28.68 GiB free.`
+**Location**: `flex_attention_hop` with Q_LEN=8192, KV_LEN=9024
+
+**Root cause**: `num_anchors=512 × block_size=16 = 8192` draft tokens. With `micro_batch_size=4`, FlexAttention's Q×KV attention matrix is massive: `4 × 32_heads × 8192 × 12288 × 2_bytes ≈ 25 GiB` just for scores.
+
+**Fix**: Reduced `micro_batch_size=1`, added `draft_accumulation_steps=4` to maintain effective batch size of 4.
+
+#### Attempt 2 — OOM during FlexAttention backward (step 1)
+
+**Config**: `micro_batch_size=1`, `num_anchors=512`, `draft_accumulation_steps=4`
+**Error**: `torch.OutOfMemoryError: Tried to allocate 9.08 GiB. GPU 1 has 79.18 GiB total, 7.17 GiB free.`
+**Location**: `flex_attention_backward` — `grad_softmax_scores - sum_scores + grad_logsumexp.unsqueeze(-1)`
+
+**Root cause**: Even with batch_size=1, the backward pass for 8192 Q tokens is too large. GPU 1 already uses 72GB for model + optimizer + activations + forward tensors.
+
+**Fix**: Reduced `num_anchors` from 512 to 256 (halves Q_LEN from 8192 to 4096, roughly halves attention memory).
+
+#### Attempt 3 — Collator crash (step 6)
+
+**Config**: `micro_batch_size=1`, `num_anchors=256`, `draft_accumulation_steps=4`
+**Error**: `RuntimeError: zeros: Dimension size must be non-negative` in `paddingtensor2D`
+**Location**: `torchspec/data/utils.py:61`
+
+**Root cause**: The data collator computes `max_length` from `input_ids.shape[1]` (line 76) but doesn't handle cases where `loss_mask` is longer than `input_ids`. When `packed_loss_mask` unpacks to more tokens than the corresponding `input_ids` for a sample, `N - n` becomes negative.
+
+**Fix**: Added truncation guard in both `paddingtensor2D` and `paddingtensor`:
+```python
+if n > N:
+    return intensors[:, :N]  # Truncate to target length
+```
+
+Committed as `398138a` and pushed to `fork/feature/dflash-training`.
+
+#### Attempt 4 — STABLE (running)
+
+**Config**:
+```yaml
+micro_batch_size: 1
+draft_accumulation_steps: 4
+num_anchors: 256
+max_seq_length: 4096
+learning_rate: 6e-4
+warmup_ratio: 0.04
+max_grad_norm: 1.0
+num_epochs: 6
+dflash_block_size: 16
+dflash_loss_decay_gamma: 7.0
+PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+```
+
+**Metrics at step 71**:
+| Metric | Value |
+|--------|-------|
+| Loss | 6.8-7.9 (down from 12.5 at step 1) |
+| Accuracy | 0.04-0.05 (starting to learn) |
+| Speed | ~1.5s/step |
+| Total steps | 35,610 |
+| GPU memory | 48-52 GB training, 58 GB inference |
+| GPU utilization | 100% on training GPUs |
+| Estimated time | ~15 hours |
+
+### Issues Encountered & Solutions
+
+#### Issue 17: FlexAttention OOM with Large num_anchors
+
+**Problem**: FlexAttention with `num_anchors=512 × block_size=16 = 8192` Q tokens requires massive memory for attention scores and backward gradients. On 2 training GPUs (80GB each), OOM occurs even with `micro_batch_size=1`.
+
+**Memory breakdown (per GPU, approximate)**:
+| Component | Memory |
+|-----------|--------|
+| Draft model (1B params, bf16) | ~2 GB |
+| Optimizer states (Adam, fp32) | ~8 GB |
+| Target model head (frozen) | ~1 GB |
+| Hidden states from Mooncake | ~2 GB (per sample, 5 layers) |
+| FlexAttention forward | ~6-12 GB (depends on Q_LEN × KV_LEN) |
+| FlexAttention backward | ~9-18 GB (larger due to score/grad storage) |
+| Gradient buffers | ~4 GB |
+| PyTorch overhead | ~5-10 GB |
+
+With `num_anchors=512`: Q_LEN=8192, KV_LEN≈12288 → attention backward needs ~18 GB → OOM.
+With `num_anchors=256`: Q_LEN=4096, KV_LEN≈8192 → attention backward needs ~9 GB → fits.
+
+**SpecForge comparison**: SpecForge uses `num_anchors=512` but with 4+ training GPUs (FSDP sharded, not replicated), distributing memory across more GPUs.
+
+**Solution**: `num_anchors=256` on 2 training GPUs. This means each training step samples fewer anchor positions, but with `draft_accumulation_steps=4`, we accumulate gradients across 4 different anchor samplings before each optimizer step, partially compensating.
+
+#### Issue 18: Collator Negative Padding Dimension
+
+**Problem**: `paddingtensor2D` crashes when a tensor's sequence dimension exceeds `max_length`.
+
+**Root cause**: `max_length` is computed from `input_ids.shape[1]` only (line 76 in utils.py). If `packed_loss_mask` unpacks to more tokens than `input_ids`, the collator tries to create a negative-sized padding tensor.
+
+This can happen when:
+1. The inference engine (SGLang) truncates input_ids internally but packed_loss_mask passes through untruncated
+2. Data preprocessing creates a loss_mask with different length than input_ids
+
+**Solution**: Guard both padding functions to truncate instead of crash:
+```python
+if n > N:
+    return intensors[:, :N]  # or [:, :N, :] for 3D
+```
+
+#### Issue 19: HF Cache Miss in Ray Workers (from Attempt 0, Session 8)
+
+**Problem**: Ray TrainerActor workers default to `/root/.cache/huggingface/` which is empty. The cached model at `/workspace/.cache/huggingface/` (16 GB) is not used, causing workers to re-download Qwen3-8B.
+
+**Solution**: `rm -rf /root/.cache/huggingface && ln -s /workspace/.cache/huggingface /root/.cache/huggingface` + `export HF_HOME=/workspace/.cache/huggingface`
+
+### Performance Analysis: Why 15 Hours?
+
+Current rate: ~1.5s/step × 35,610 steps = ~14.8 hours
+
+**Bottleneck identified: `aot_eager` compile backend**
+
+TorchSpec's `flex_attention.py` (line 62-64):
+```python
+self._compiled_flex_attention = torch.compile(
+    flex_attention,
+    backend="aot_eager",  # ← SLOW: eager fallback, no kernel fusion
+)
+```
+
+SpecForge's `flex_attention.py` (line 36-39):
+```python
+self._compiled_flex_attention = torch.compile(
+    flex_attention,
+    # mode="max-autotune-no-cudagraphs",  # ← Uses DEFAULT inductor backend
+)
+```
+
+**Impact**: `aot_eager` only decomposes autograd but runs ops eagerly (no Triton kernel fusion, no memory planning). The default `inductor` backend generates fused Triton kernels that can be 2-10x faster for attention backward.
+
+**Why TorchSpec used `aot_eager`**: Session 5 Issue 10 — the `inductor` backend crashed with `NoValidChoicesError` during kernel autotuning. The workaround was to switch to `aot_eager`. The `max_autotune_gemm_backends = "ATEN,TRITON"` fix was added at the same time but `aot_eager` was kept.
+
+**Additional optimization: `dynamic=True`**
+
+Neither TorchSpec nor SpecForge pass `dynamic=True` to `torch.compile`. For variable-length sequences, this causes recompilation for each new shape. The `recompile_limit = 64` workaround allows up to 64 cached specializations before erroring, but recompilation overhead is significant.
+
+**Optimization plan** (for next run or mid-training restart if worth it):
+1. Remove `backend="aot_eager"` → use default inductor backend
+2. The `max_autotune_gemm_backends = "ATEN,TRITON"` fix from Issue 10 should prevent the original crash
+3. Consider adding `dynamic=True` if recompilation is still an issue
+4. Estimated speedup: 2-5x on FlexAttention ops → total training time ~5-8 hours
+
+### Training Speed Comparison (Estimates)
+
+| Configuration | Steps/sec | Total Time | Notes |
+|--------------|-----------|-----------|-------|
+| Current (aot_eager, 256 anchors, 2 train GPUs) | ~0.67 | ~15 hours | Running now |
+| With inductor backend (estimated) | ~1.5-3.0 | ~4-7 hours | Fix compile backend |
+| SpecForge (8 GPU, 512 anchors, 4 train GPUs) | ~5-10 | ~1-2 hours | More parallelism |
+
+### Current Status
+
+- **Training**: Running stable at ~1.5s/step, loss decreasing (12.5 → 7.0 in 71 steps)
+- **ETA**: ~15 hours from 2026-03-20 00:37 UTC → completion ~2026-03-20 15:30 UTC
+- **Log file**: `/tmp/phase_c5.log`
+- **Tmux session**: `phase_c`
+
+### Commits
+
+| Hash | Description |
+|------|-------------|
+| `398138a` | Fix collator crash when loss_mask length differs from input_ids |
+
+---
+
+*Implementation Log v11 — 2026-03-20*
