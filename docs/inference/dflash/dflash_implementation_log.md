@@ -1473,22 +1473,115 @@ Training was paused at step ~4,200 (17%, epoch 1/4) with ~2.7 hours remaining.
 | `/workspace/` (volume) | ✅ | ❌ |
 | HuggingFace Hub (private repo) | ✅ | ✅ |
 
-### How to Resume Training
+### How to Resume Training After Pod Restart
 
-The training loop auto-resumes from the latest checkpoint. On pod restart:
+Pod restart wipes the **container disk** (`/tmp/`, `/root/`, all pip-installed packages).
+Only `/workspace/` (volume) survives. This means every restart requires reinstalling
+the full software stack before training can resume.
 
+#### What survives vs what's lost
+
+| Survives (on `/workspace/`) | Lost (container disk) |
+|---|---|
+| Git repo (`/workspace/TorchSpec/`) — **directories only, files may be deleted** | All pip packages (torch, sglang, torchspec, etc.) |
+| Checkpoints (`outputs/.../checkpoints/`) | System packages (`libibverbs`, etc.) |
+| Training data (`/workspace/data/`) | Ray state, logs in `/tmp/` |
+| HF model cache (`/workspace/.cache/huggingface`) | Torch inductor cache |
+
+> **Critical**: After pod restart, git-tracked `.py` files may appear as "deleted"
+> in `git status` even though the directories still exist. Always run `git restore .`
+> first to recover them.
+
+#### Step-by-step resume procedure
+
+**Step 0: SSH into pod** (requires `expect` for RunPod PTY):
 ```bash
-# SSH into pod, then:
+# Standard SSH does NOT work — RunPod requires PTY allocation via expect.
+# Use the helper script:
+bash scripts/runpod_ssh.sh USER@ssh.runpod.io "your-command-here"
+
+# For interactive sessions:
+expect -c '
+set timeout 60
+spawn ssh -o StrictHostKeyChecking=no -o RequestTTY=force \
+    -i ~/.ssh/id_ed25519 USER@ssh.runpod.io
+expect -re {[#\$] }
+interact
+'
+```
+
+**Step 1: Restore git files** (pod restart deletes .py files from volume):
+```bash
+cd /workspace/TorchSpec
+git restore .
+```
+
+**Step 2: Install system libraries** (RDMA libs for mooncake):
+```bash
+apt-get update -qq && apt-get install -y libibverbs-dev librdmacm-dev libnuma-dev
+ldconfig
+```
+
+**Step 3: Install PyTorch 2.6+** (pod resets to 2.4.1):
+```bash
+# Fast method: reuse system CUDA, only download torch + missing libs (~900 MB)
+pip3 install --no-deps torch==2.6.0+cu124 torchvision==0.21.0+cu124 \
+    torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+pip3 install --upgrade typing_extensions sympy triton \
+    nvidia-cusparselt-cu12 nvidia-nvjitlink-cu12
+```
+
+**Step 4: Install SGLang from source + apply patches**:
+```bash
+cd /workspace/TorchSpec
+
+# Checkout correct SGLang commit
+git -C _sglang checkout 0f2df9370a1de1b4fb11b071d39ab3ce2287a350
+git -C _sglang reset --hard HEAD
+
+# Install SGLang
+pip3 install -e "_sglang/python[all]"
+
+# Apply TorchSpec patches (adds enable_aux_hidden_states support)
+# IMPORTANT: remove pre-existing patch artifacts first, then apply
+rm -f _sglang/python/sglang/srt/speculative/spec_training_info.py
+cd _sglang
+git apply /workspace/TorchSpec/patches/sglang/v0.5.8.post1/sglang.patch
+cd /workspace/TorchSpec
+
+# Install flashinfer
+pip3 install flashinfer-jit-cache==0.6.2 --index-url https://flashinfer.ai/whl/cu124
+```
+
+**Step 5: Install TorchSpec**:
+```bash
+cd /workspace/TorchSpec
+pip3 install -e ".[dev]"
+```
+
+**Step 6: Verify** (all should print OK):
+```bash
+python -c 'import torch; print(f"PyTorch {torch.__version__}, CUDA {torch.cuda.is_available()}")'
+python -c 'import sglang; print("SGLang OK")'
+python -c 'import torchspec; print("TorchSpec OK")'
+```
+
+**Step 7: Restore checkpoint** (only if `/workspace/` was lost):
+```bash
+export HF_HOME=/workspace/.cache/huggingface
+huggingface-cli download Xingh3/qwen3-8b-dflash-checkpoint-phase-c \
+  --local-dir /workspace/TorchSpec/outputs/qwen3-8b-dflash-phase-c/checkpoints/
+```
+
+**Step 8: Launch training with checkpoint resume**:
+```bash
 export HF_HOME=/workspace/.cache/huggingface
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd /workspace/TorchSpec
 
-# If checkpoint was lost, restore from HF first:
-# huggingface-cli download Xingh3/qwen3-8b-dflash-checkpoint-phase-c \
-#   --local-dir /workspace/TorchSpec/outputs/qwen3-8b-dflash-phase-c/checkpoints/
-
-# Resume training (auto-detects checkpoint at step 4001)
-python -m torchspec.train_entry \
+# CRITICAL: training.load_path is REQUIRED for checkpoint resume.
+# Without it, training starts from step 0 (no auto-detection from output_dir).
+nohup python -m torchspec.train_entry \
   --config configs/sglang_qwen3_8b_dflash.yaml \
   training.micro_batch_size=4 \
   training.draft_accumulation_steps=1 \
@@ -1501,6 +1594,7 @@ python -m torchspec.train_entry \
   training.save_interval=1000 \
   training.max_checkpoints=1 \
   training.dflash_num_anchors=256 \
+  training.load_path=./outputs/qwen3-8b-dflash-phase-c/checkpoints \
   dataset.train_data_path=/workspace/data/perfectblend_50k.jsonl \
   dataset.eval_data_path=null \
   dataset.eval_interval=0 \
@@ -1508,13 +1602,45 @@ python -m torchspec.train_entry \
   inference.inference_num_gpus_per_engine=1 \
   inference.inference_num_gpus_per_node=2 \
   output_dir=./outputs/qwen3-8b-dflash-phase-c \
-  2>&1 | tee /tmp/phase_c_resume.log
+  > /tmp/phase_c_resume.log 2>&1 &
 ```
 
-**Resume mechanism**: `loop.py` line 167 reads `get_global_step()` from loaded checkpoint →
-`start_step=4000` → skips first 4000 steps → resumes dataset at correct epoch/offset.
+#### Verifying resume is working
 
-**Expected remaining time**: ~19,740 steps at 2.0 step/s ≈ **2.7 hours**.
+Check the log after ~5 minutes (model loading takes ~3 min):
+```bash
+tail -20 /tmp/phase_c_resume.log
+```
+
+**Good signs** (checkpoint loaded):
+- Progress bar shows `step 4001+/23704` (not starting from 0)
+- Loss in 2.9-4.6 range (not 10-12)
+- Accuracy 0.15-0.29 (not 0.000)
+- Log message: `Resuming from step XXXX (epoch N)`
+
+**Bad signs** (checkpoint NOT loaded):
+- Progress bar shows `0/23704` or `1/23704`
+- Loss starts at 10-12 with accuracy 0.000
+- No "Resuming from step" message → check that `training.load_path` is set
+
+#### Resume mechanism
+
+`checkpoint.py` reads `training.load_path` → finds `latest_checkpointed_iteration.txt`
+→ loads model/optimizer/lr_scheduler/rng from `iter_NNNNNNN/` → `trainer.global_step`
+is set → `loop.py` reads `get_global_step()` → `start_step=N` → skips first N steps
+→ resumes dataset at correct epoch/offset.
+
+#### Common pitfalls
+
+| Pitfall | Symptom | Fix |
+|---------|---------|-----|
+| Missing `training.load_path` | Starts from step 0 with loss ~12 | Add `training.load_path=./outputs/.../checkpoints` |
+| Git files deleted after restart | `No module named torchspec` | Run `git restore .` in `/workspace/TorchSpec` |
+| Missing system RDMA libs | `ImportError: libibverbs.so.1` | `apt-get install -y libibverbs-dev librdmacm-dev libnuma-dev` |
+| PyTorch too old (2.4.1) | FlexAttention import errors | Upgrade to 2.6+, see Step 3 |
+| SGLang not installed | `No module named 'sglang'` | Install from `_sglang/python`, see Step 4 |
+| SGLang patch not applied | `unexpected keyword argument 'enable_aux_hidden_states'` | Remove `spec_training_info.py` then `git apply` patch |
+| Standard SSH fails | `Your SSH client doesn't support PTY` | Use `expect` via `scripts/runpod_ssh.sh` |
 
 ### After Training Completes
 
