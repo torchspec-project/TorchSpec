@@ -1302,30 +1302,151 @@ Eval during training is not critical for DFlash — we benchmark inference perfo
 
 **Lesson**: `compile_backend` is NOT a TorchSpec config option. The inductor backend is used automatically by FlexAttention's internal `torch.compile(flex_attention)` call in `torchspec/models/ops/flex_attention.py`. No user configuration needed.
 
-#### Attempt 11 — RUNNING (current)
+#### Issue 22: `eval_interval=0` Not Sufficient to Disable Eval
 
-**Config** (final, all issues resolved):
+**Problem**: Setting `dataset.eval_interval=0` disables periodic eval during training, but the
+initial eval cache generation (`generate_eval_cache()` in `loop.py:177`) still runs at startup.
+The guard is `eval_state.eval_enabled` which is `True` whenever `eval_dataset_size > 0` — i.e.,
+whenever `eval_data_path` points to a valid file.
+
+**Result**: Training hangs at `Eval caching: 0%|          | 0/64` then crashes with timeout.
+
+**Solution**: Must set **both** `dataset.eval_data_path=null` AND `dataset.eval_interval=0` to
+fully disable eval. Setting `eval_data_path=null` makes `eval_dataset_size=0`, which sets
+`eval_enabled=False`, skipping the cache generation step entirely.
+
+**Recommended CLI override for DFlash training**:
+```
+dataset.eval_data_path=null dataset.eval_interval=0
+```
+
+#### Attempt 11 — Eval Cache Hang (eval_data_path not null)
+
+Passed `eval_interval=0` but NOT `eval_data_path=null`. Stuck at eval cache generation.
+Fixed by adding `dataset.eval_data_path=null`.
+
+#### Attempt 12 — Stable but Slow (baseline)
+
+**Config**: `micro_batch_size=1, accum=4, seq=4096, anchors=512, epochs=6`
+**Speed**: 1.5 step/s | **Total steps**: 35,610 | **ETA**: ~6.6 hours
+**GPU memory**: 40 GB / 80 GB
+
+Training worked but 6.6 hours was too slow. Began speed optimization analysis.
+
+### Training Speed Optimization
+
+#### Bottleneck Analysis
+
+From training metrics: `T=12-17` (training samples/s) vs `I=56-70` (inference samples/s).
+**Training is 4-5x slower than inference** — the clear bottleneck.
+
+Per-step time breakdown (forward + backward):
+```
+1. Context projection: cat(5 layers × 4096) → proj → 4096       [small, ~5%]
+2. Anchor sampling: select N positions from sequence              [tiny, <1%]
+3. Draft token generation: N anchors × 16 block_size = Q tokens   [LARGE, ~15%]
+4. FlexAttention: Q_LEN × KV_LEN attention scores + backward     [DOMINANT, ~60%]
+5. Loss computation: Q_LEN output logits × 151936 vocab           [moderate, ~20%]
+```
+
+**FlexAttention is the #1 bottleneck** — attention is O(Q×KV) where Q = num_anchors × block_size.
+
+#### Speed Optimization Attempts
+
+| Attempt | Config Changes | Speed | Steps | ETA | GPU Mem | Status |
+|---------|---------------|-------|-------|-----|---------|--------|
+| **12 (baseline)** | batch=1, accum=4, seq=4096, anchors=512, epochs=6 | 1.5 step/s | 35,610 | 6.6 hr | 40 GB | Stable, too slow |
+| **13** | batch=2, accum=2, seq=**2048**, anchors=512, epochs=**4** | 1.4 step/s | 23,704 | 4.7 hr | 53 GB | Stable, batch=2 slightly slower per step |
+| **14** | batch=2, accum=2, seq=2048, anchors=**256**, epochs=4 | **1.88 step/s** | 23,704 | **3.4 hr** | 38 GB | **Big win from reducing anchors** |
+| **15 (current)** | batch=**4**, accum=**1**, seq=2048, anchors=256, epochs=4 | **2.1 step/s** | 23,740 | **~3.1 hr** | 50 GB | Running, fastest config |
+
+#### Key Insights
+
+1. **`num_anchors` is the biggest lever**: Reducing from 512→256 halves Q_LEN (8192→4096),
+   roughly halving FlexAttention compute. This gave the largest single speedup: 1.4→1.88 step/s.
+
+2. **`max_seq_length` reduction helps inference more than training**: Shorter sequences
+   (4096→2048) speed up inference generation and reduce hidden state transfer size, but
+   FlexAttention Q_LEN is dominated by num_anchors × block_size, not sequence length.
+
+3. **`micro_batch_size` has diminishing returns**: batch=2→4 improved from 1.88→2.1 step/s
+   (only 12% gain) because FlexAttention scales with total Q tokens (batch × anchors × block_size).
+   Larger batch = more Q tokens per step = more compute.
+
+4. **`draft_accumulation_steps` doesn't affect wall-clock time**: Total training time =
+   total micro-batches / micro-batch throughput. Accumulation only changes optimizer update
+   frequency, not total samples processed.
+
+5. **Effective batch size matters for convergence quality**: All configs maintain effective
+   batch = micro_batch × accum × dp_size = 4 (SpecForge default per GPU).
+
+#### Training Throughput Formula
+
+```
+total_micro_batches = dataset_size × epochs / dp_size
+samples_per_second = micro_batch_size × step_per_second × dp_size
+total_time = total_micro_batches / (samples_per_second / dp_size)
+
+Example (current config):
+  micro_batches = 47,480 × 4 / 2 = 94,960
+  samples/s = 4 × 2.1 × 2 = 16.8  (matches thru=17 from logs)
+  time = 94,960 / (16.8 / 2) / 2 = 94,960 / 16.8 ≈ 5,652s ≈ 1.6 hr per dp rank...
+
+  Actually: time = total_steps × time_per_step = 23,740 / 2.1 = 11,305s ≈ 3.1 hr
+```
+
+#### Per-Step Compute Cost by Config
+
+| Config | Q_LEN per sample | Total Q (batch×Q) | FlexAttention FLOPs (relative) |
+|--------|-----------------|-------------------|-------------------------------|
+| anchors=512, batch=1 | 8192 | 8,192 | **1.0x** (baseline) |
+| anchors=512, batch=2 | 8192 | 16,384 | 2.0x (OOM risk) |
+| anchors=256, batch=2 | 4096 | 8,192 | **1.0x** (same as baseline!) |
+| anchors=256, batch=4 | 4096 | 16,384 | 2.0x (fits in 50 GB) |
+| anchors=128, batch=4 | 2048 | 8,192 | **1.0x** (fastest possible) |
+
+**Key**: anchors=256 + batch=2 has the same FlexAttention cost as the original anchors=512 + batch=1,
+but processes 2x the data per optimizer step.
+
+### Current Training Run (Attempt 15)
+
+**Config**:
 ```yaml
-micro_batch_size: 1
-draft_accumulation_steps: 4
-num_epochs: 6
-max_seq_length: 4096
+micro_batch_size: 4
+draft_accumulation_steps: 1
+num_epochs: 4
+max_seq_length: 2048
 learning_rate: 6e-4
 warmup_ratio: 0.04
 max_grad_norm: 1.0
 save_per_epoch: true
 save_interval: 1000
 max_checkpoints: 1
-eval_interval: 0              # Disabled — benchmark τ post-training
+eval_data_path: null
+eval_interval: 0
 dflash_block_size: 16
-dflash_num_anchors: 512
+dflash_num_anchors: 256
 dflash_loss_decay_gamma: 7.0
 PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 ```
 
+**Metrics at step 184** (3 minutes in):
+| Metric | Value |
+|--------|-------|
+| Speed | 2.0-2.1 step/s |
+| Loss | 5.3-6.3 (decreasing from initial ~8) |
+| Accuracy | 0.05-0.11 (starting to learn) |
+| thru | 17 samples/s |
+| I (inference) | 69-71 samples/s |
+| T (training) | 19-20 samples/s |
+| GPU memory (training) | 50 GB / 80 GB |
+| GPU utilization | 100% |
+| Total steps | 23,740 |
+| ETA | ~3.1 hours (~10:40 UTC) |
+
 **Dataset**: `/workspace/data/perfectblend_50k.jsonl` (47,480 samples)
-**Log**: `/tmp/phase_c11.log`
-**ETA**: ~5.5 hours
+**Log**: `/tmp/phase_c_fast3.log`
+**Tmux session**: `phase_c`
 
 ### Commits
 
@@ -1334,7 +1455,8 @@ PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 | `398138a` | Fix collator crash when loss_mask length differs from input_ids |
 | `fee3156` | Switch FlexAttention from aot_eager to inductor backend for 3x speedup |
 | `c7c6605` | Add checkpoint rotation to prevent disk quota exceeded during training |
+| `ba3cd02` | Document Phase C crash debugging: disk quota, eval timeout, checkpoint rotation |
 
 ---
 
-*Implementation Log v12 — 2026-03-20*
+*Implementation Log v13 — 2026-03-20*
