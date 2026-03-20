@@ -1430,23 +1430,130 @@ dflash_loss_decay_gamma: 7.0
 PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 ```
 
-**Metrics at step 184** (3 minutes in):
+**Training progress** (attempt 15):
+| Time | Step | Progress | Loss | Accuracy | Speed |
+|------|------|----------|------|----------|-------|
+| 3 min | 184 | 1% (epoch 1) | 5.3-6.3 | 0.05-0.11 | 2.1 step/s |
+| 12 min | 1,091 | 5% (epoch 1) | 4.0-5.8 | 0.10-0.17 | 2.0 step/s |
+| 38 min | 3,952 | 17% (epoch 1) | **2.9-4.6** | **0.16-0.29** | 2.0 step/s |
+| **38 min** | **~4,200** | **PAUSED** | — | — | — |
+
+**Runtime metrics (stable)**:
 | Metric | Value |
 |--------|-------|
-| Speed | 2.0-2.1 step/s |
-| Loss | 5.3-6.3 (decreasing from initial ~8) |
-| Accuracy | 0.05-0.11 (starting to learn) |
-| thru | 17 samples/s |
-| I (inference) | 69-71 samples/s |
-| T (training) | 19-20 samples/s |
-| GPU memory (training) | 50 GB / 80 GB |
+| thru | 16-17 samples/s |
+| I (inference) | 63-70 samples/s |
+| T (training) | 17-20 samples/s |
+| GPU memory (training) | 50-51 GB / 80 GB |
 | GPU utilization | 100% |
 | Total steps | 23,740 |
-| ETA | ~3.1 hours (~10:40 UTC) |
 
 **Dataset**: `/workspace/data/perfectblend_50k.jsonl` (47,480 samples)
 **Log**: `/tmp/phase_c_fast3.log`
-**Tmux session**: `phase_c`
+
+### Checkpoint & Backup
+
+Training was paused at step ~4,200 (17%, epoch 1/4) with ~2.7 hours remaining.
+
+**Checkpoint saved**:
+- Location: `/workspace/TorchSpec/outputs/qwen3-8b-dflash-phase-c/checkpoints/`
+- Latest: `iter_0004001` (step 4,000)
+- Size: ~15 GB per checkpoint (30 GB total with iter_0003001)
+- Includes: model weights, optimizer state, lr_scheduler, rng state, meta.json
+
+**HuggingFace backup**:
+- Repo: [`Xingh3/qwen3-8b-dflash-checkpoint-phase-c`](https://huggingface.co/Xingh3/qwen3-8b-dflash-checkpoint-phase-c) (private)
+- Contains both `iter_0003001` and `iter_0004001`
+- Uploaded successfully (~30 GB)
+
+**Storage safety levels**:
+| Location | Survives Pod Stop | Survives Pod Delete |
+|----------|:-:|:-:|
+| `/tmp/`, `/root/` (container disk) | ❌ | ❌ |
+| `/workspace/` (volume) | ✅ | ❌ |
+| HuggingFace Hub (private repo) | ✅ | ✅ |
+
+### How to Resume Training
+
+The training loop auto-resumes from the latest checkpoint. On pod restart:
+
+```bash
+# SSH into pod, then:
+export HF_HOME=/workspace/.cache/huggingface
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+cd /workspace/TorchSpec
+
+# If checkpoint was lost, restore from HF first:
+# huggingface-cli download Xingh3/qwen3-8b-dflash-checkpoint-phase-c \
+#   --local-dir /workspace/TorchSpec/outputs/qwen3-8b-dflash-phase-c/checkpoints/
+
+# Resume training (auto-detects checkpoint at step 4001)
+python -m torchspec.train_entry \
+  --config configs/sglang_qwen3_8b_dflash.yaml \
+  training.micro_batch_size=4 \
+  training.draft_accumulation_steps=1 \
+  training.num_epochs=4 \
+  training.max_seq_length=2048 \
+  training.learning_rate=6e-4 \
+  training.warmup_ratio=0.04 \
+  training.max_grad_norm=1.0 \
+  training.save_per_epoch=true \
+  training.save_interval=1000 \
+  training.max_checkpoints=1 \
+  training.dflash_num_anchors=256 \
+  dataset.train_data_path=/workspace/data/perfectblend_50k.jsonl \
+  dataset.eval_data_path=null \
+  dataset.eval_interval=0 \
+  inference.inference_num_gpus=2 \
+  inference.inference_num_gpus_per_engine=1 \
+  inference.inference_num_gpus_per_node=2 \
+  output_dir=./outputs/qwen3-8b-dflash-phase-c \
+  2>&1 | tee /tmp/phase_c_resume.log
+```
+
+**Resume mechanism**: `loop.py` line 167 reads `get_global_step()` from loaded checkpoint →
+`start_step=4000` → skips first 4000 steps → resumes dataset at correct epoch/offset.
+
+**Expected remaining time**: ~19,740 steps at 2.0 step/s ≈ **2.7 hours**.
+
+### After Training Completes
+
+1. **Extract checkpoint** for inference:
+   ```bash
+   python scripts/extract_dflash_checkpoint.py \
+     --checkpoint_dir outputs/qwen3-8b-dflash-phase-c/checkpoints/iter_NNNNNNN \
+     --output /tmp/dflash_draft_phase_c.pt
+   ```
+
+2. **Benchmark τ (acceptance length)**:
+   ```bash
+   python scripts/benchmark_dflash_inference.py \
+     --target_model Qwen/Qwen3-8B \
+     --draft_checkpoint /tmp/dflash_draft_phase_c.pt \
+     --num_prompts 20 --max_new_tokens 256
+   ```
+
+3. **Target**: τ ≥ 3.0, speedup ≥ 1.5x over baseline.
+
+### All Phase C Attempts Summary
+
+| # | Config | Speed | Issue | Resolution |
+|---|--------|-------|-------|------------|
+| 1 | batch=4, anchors=512, seq=4096 | — | OOM forward (35 GiB alloc) | Reduce batch→1 |
+| 2 | batch=1, anchors=512, seq=4096 | — | OOM backward (9 GiB alloc) | Reduce anchors→256 |
+| 3 | batch=1, anchors=256, seq=4096 | — | Collator negative padding | Truncation guard |
+| 4 | batch=1, anchors=256, seq=4096, aot_eager | 0.67 step/s | Too slow (15hr ETA) | Switch to inductor |
+| 5 | batch=1, anchors=256, seq=4096, inductor | — | NoValidChoicesError | ATEN,TRITON backends fix |
+| 6 | batch=1, anchors=512, seq=4096, inductor | 1.9 step/s | **Disk quota at step 15K** | Checkpoint rotation |
+| 7 | (same + save_interval=0) | — | No resume point | Re-enable saves |
+| 8 | (same + save_interval=5000) | — | Still disk quota risk | save_interval=1000 |
+| 9 | (same + compile_backend=inductor) | — | ConfigKeyError | Remove invalid key |
+| 10 | (same) | — | Eval timeout (300s) | eval_interval=0 |
+| 11 | (same + eval_interval=0) | — | Eval still runs (eval_data_path set) | eval_data_path=null |
+| 12 | batch=1, anchors=512, seq=4096 | 1.5 step/s | Stable, 6.6hr ETA | Speed optimization |
+| 13 | batch=2, anchors=512, seq=**2048**, epochs=**4** | 1.4 step/s | 4.7hr, per-step slow | Reduce anchors |
+| 14 | batch=2, anchors=**256**, seq=2048 | **1.88** step/s | 3.4hr, good | Try larger batch |
+| **15** | **batch=4**, anchors=256, seq=2048 | **2.1 step/s** | **3.1hr, paused at 17%** | **Resume tomorrow** |
 
 ### Commits
 
@@ -1456,7 +1563,8 @@ PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 | `fee3156` | Switch FlexAttention from aot_eager to inductor backend for 3x speedup |
 | `c7c6605` | Add checkpoint rotation to prevent disk quota exceeded during training |
 | `ba3cd02` | Document Phase C crash debugging: disk quota, eval timeout, checkpoint rotation |
+| `dddcd2a` | Document training speed optimization: 6.6hr → 3.1hr |
 
 ---
 
-*Implementation Log v13 — 2026-03-20*
+*Implementation Log v14 — 2026-03-20*
