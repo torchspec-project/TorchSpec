@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -157,8 +158,10 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.error(f"Failed to load model from {model_dir}: {e}")
         return None
 
-    # Load optimizer state + fp32 master params (optional)
-    load_optimizer = not getattr(actor.args, "no_load_optim", False) and hasattr(actor, "optimizer")
+    continual_training = getattr(actor.args, "continual_training", False)
+
+    # Keep optimizer/LR state out of continual training so it starts fresh.
+    load_optimizer = not continual_training and hasattr(actor, "optimizer")
     if load_optimizer and optimizer_dir.exists():
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
@@ -171,7 +174,9 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.info(f"Optimizer checkpoint not found at {optimizer_dir}, skipping optimizer load.")
 
     # Load LR scheduler state (optional)
-    load_lr_scheduler = hasattr(actor, "lr_scheduler") and lr_scheduler_dir.exists()
+    load_lr_scheduler = (
+        not continual_training and hasattr(actor, "lr_scheduler") and lr_scheduler_dir.exists()
+    )
     if load_lr_scheduler:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
@@ -196,7 +201,50 @@ def load(actor: Any) -> dict[str, Any] | None:
         "rng": rng_state,
         "metadata": metadata,
         "iteration": target_step,
+        "optimizer_dir": optimizer_dir,
     }
+
+
+def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
+    """Sync BF16Optimizer's fp32 master params after model-only checkpoint load.
+
+    When optimizer state is skipped for continual training, the fp32 master copies
+    still hold pre-checkpoint (random init) values.  The first optimizer step
+    would copy these back to the model, overwriting the loaded weights.
+
+    Strategy: temporarily load the optimizer checkpoint to recover the fp32 master
+    params, then restore the freshly configured param_groups and clear Adam state
+    so continual training still uses the new optimizer hyperparameters. Falls
+    back to copying from the bf16 model weights if the optimizer checkpoint is
+    unavailable.
+    """
+    opt = actor.optimizer
+    if not hasattr(opt, "fp32_params"):
+        return
+
+    if optim_dir.exists() and (optim_dir / ".metadata").exists():
+        try:
+            fresh_param_groups = [
+                {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
+                for group in opt.optimizer.param_groups
+            ]
+            optim_state = OptimizerState(actor.model, opt)
+            optim_sd = {"optim_state": optim_state}
+            dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
+            for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
+                params = group["params"]
+                group.clear()
+                group.update(copy.deepcopy(fresh_group))
+                group["params"] = params
+            opt.optimizer.state.clear()
+            logger.info(f"Loaded fp32 master params from {optim_dir}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to load fp32 params from optimizer checkpoint: {e}")
+
+    if hasattr(opt, "sync_fp32_params_from_model"):
+        opt.sync_fp32_params_from_model()
+        logger.info("Synced optimizer fp32 master params from bf16 model weights (lossy)")
 
 
 def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None:
@@ -204,7 +252,9 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         dist.barrier()
         return
 
-    if checkpoint_payload.get("rng") is not None and not getattr(actor.args, "no_load_rng", False):
+    continual_training = getattr(actor.args, "continual_training", False)
+
+    if checkpoint_payload.get("rng") is not None and not continual_training:
         rng_state = checkpoint_payload["rng"]
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
@@ -213,14 +263,17 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
 
     metadata = checkpoint_payload.get("metadata") or {}
     iteration = checkpoint_payload.get("iteration")
-    if metadata:
+    if metadata and not continual_training:
         actor.global_step = int(metadata.get("global_step", actor.global_step))
         next_step = metadata.get("next_step") or metadata.get("next_inference_id")
         if next_step is not None:
             actor.args.start_step = next_step
-    elif iteration is not None:
+    elif iteration is not None and not continual_training:
         if getattr(actor.args, "start_step", None) is None:
             actor.args.start_step = iteration
+
+    if continual_training and hasattr(actor, "optimizer"):
+        _restore_fp32_master_params(actor, checkpoint_payload["optimizer_dir"])
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -253,15 +306,12 @@ def save(actor: Any, step: int) -> None:
     state_dict = {"model_state": model_state}
     dcp.save(state_dict, checkpoint_id=str(model_dir))
 
-    # Save optimizer state + fp32 master params (skip if --no-save-optim is set)
-    save_optimizer_state = not getattr(actor.args, "no_save_optim", False)
-    if save_optimizer_state and hasattr(actor, "optimizer") and actor.optimizer is not None:
+    if hasattr(actor, "optimizer") and actor.optimizer is not None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
         dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
 
-    # Save LR scheduler state (skip if --no-save-optim is set)
-    if save_optimizer_state and hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
+    if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
         dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
