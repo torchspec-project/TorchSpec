@@ -651,6 +651,76 @@ ssh -o RequestTTY=force -i ~/.ssh/id_ed25519 sguy1wcn46v8zr-64411b9f@ssh.runpod.
 tail -f /tmp/phase_c_resume3.log
 ```
 
+## Session 11: 2026-03-21 — Speed Regression Investigation (torch 2.6→2.9.1)
+
+### Context
+
+Training speed regressed 3x after PyTorch 2.6.0→2.9.1 migration: **0.48 s/step → 1.5-1.7 s/step**. GPU utilization showed bursty compute (~30% average) with long idle gaps, indicating the bottleneck was not in model computation itself.
+
+### Investigation: SpecForge vs TorchSpec Comparison
+
+Compared DFlash implementations across both codebases to identify code-level differences:
+
+| Component | TorchSpec | SpecForge | Impact |
+|-----------|-----------|-----------|--------|
+| RMSNorm | `@torch.compile(dynamic=True)` per module | No compile decorator | 22 separate compiled units per forward |
+| GQA in FlexAttention | `_repeat_kv()` → `enable_gqa=False` | Uses GQA natively | Materializes 4x expanded KV tensors |
+| `create_block_mask` | Compiled via singleton wrapper | Direct call (not compiled) | Extra compilation overhead |
+| `inductor_config.max_autotune_gemm_backends` | Set to `"ATEN,TRITON"` | Not set | Required for Issue 10 fix |
+| RoPE position indexing | Advanced indexing gather | Similar pattern | Both break fusion |
+
+### Issue 26: PyTorch 2.9.1 Speed Regression (3x Slower)
+
+**Problem**: Training at 1.5-1.7 s/step with torch 2.9.1 vs 0.48 s/step with torch 2.6.0.
+
+**GPU utilization profile** (sampled every 0.5s over 10s during training):
+```
+GPU 0: 0, 100, 100, 28, 78, 0, 0, 0, 71, 0, 1, 0, 34, 0, 1, 0, 98, 0, 41  (~30% avg)
+GPU 1: 0, 0, 0, 89, 100, 0, 27, 0, 0, 0, 0, 54, 0, 0, 0, 0, 100, 0, 0     (~20% avg)
+```
+Pattern: short compute bursts (100%) followed by long idle periods (0%). Consistent with CPU-bound overhead or FSDP2 synchronization dominance.
+
+**Profiling results**:
+- `create_block_mask`: **4.2 ms** per call — NOT the bottleneck
+- Anchor sampling (2 sorts + gather): Small overhead — NOT the bottleneck
+- The bottleneck is at the PyTorch runtime level (kernel generation, FSDP2 communication, or inductor codegen changes in 2.9.1)
+
+### Optimization Attempts
+
+| # | Change | Result | Commit |
+|---|--------|--------|--------|
+| 1 | Remove `@torch.compile(dynamic=True)` from DFlashRMSNorm | No speed change | `c5b71e8` |
+| 2 | Use `enable_gqa=True` in FlexAttention (skip `_repeat_kv`) | No speed change | `c5b71e8` |
+| 3 | Use `create_block_mask` directly (remove compiled wrapper) | No speed change | `c5b71e8` |
+| 4 | `TORCHINDUCTOR_MAX_AUTOTUNE=1` + `COORDINATE_DESCENT_TUNING=1` env vars | No speed change | — |
+| 5 | `TORCH_COMPILE_DISABLE=1` (eager mode) | **Crash** — SGLang requires compilation | — |
+| 6 | `mode="reduce-overhead"` for flex_attention compilation | Syntax error in sed; not tested | — |
+
+### Root Cause Analysis
+
+The speed regression is at the **PyTorch 2.9.1 runtime level**, not code-level. Likely causes:
+1. **TorchInductor codegen changes** — torch 2.9.1 may generate different/slower Triton kernels for FlexAttention forward+backward
+2. **FSDP2 behavior changes** — different all-gather/reduce-scatter patterns or synchronization overhead
+3. **NCCL/CUDA runtime differences** — cu128 vs cu124, different NCCL version
+4. **Triton version change** — 3.5.1→3.6.0 generating suboptimal kernels
+
+**Conclusion**: No code-level fix found. The regression is intrinsic to the torch 2.6→2.9.1 upgrade. Training continues at ~1.5 s/step. Future mitigation options:
+- Pin to torch 2.6.0 if SGLang compatibility allows
+- Profile with `torch.profiler` to identify exact kernel-level regression
+- Test torch 2.7/2.8 as intermediate versions
+- Try `torch.compile(mode="max-autotune-no-cudagraphs")` for FlexAttention
+
+### Training Status
+
+| Metric | Value |
+|--------|-------|
+| Checkpoint | Step 18,001 / 23,704 (76%) |
+| Remaining | ~5,703 steps |
+| Speed | ~1.5-1.7 s/step |
+| ETA | ~2.5 hours |
+| Code | Optimization commit `c5b71e8` |
+| Log file | `/tmp/phase_c_final.log` |
+
 ---
 
 ## Pending Work
@@ -673,7 +743,8 @@ tail -f /tmp/phase_c_resume3.log
 | `c7c6605` | Add checkpoint rotation to prevent disk quota exceeded during training |
 | `ba3cd02` | Document Phase C crash debugging: disk quota, eval timeout, checkpoint rotation |
 | `dddcd2a` | Document training speed optimization: 6.6hr → 3.1hr |
+| `c5b71e8` | Optimize DFlash training speed: remove compile overhead and enable GQA |
 
 ---
 
-*Implementation Log v16 — 2026-03-21*
+*Implementation Log v17 — 2026-03-21*
