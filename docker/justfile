@@ -6,6 +6,12 @@ build:
 release-primary:
     ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _release-raw
 
+build-runpod:
+    ARG_TAG_POSTFIX="-runpod" ARG_BUILD_EXTRA_ARGS="-f docker/sglang/{{SGLANG_VERSION}}/Dockerfile.runpod" just _build-only
+
+release-runpod:
+    ARG_TAG_POSTFIX="-runpod" ARG_BUILD_EXTRA_ARGS="-f docker/sglang/{{SGLANG_VERSION}}/Dockerfile.runpod" just _release-raw
+
 _build-only:
     #!/bin/bash
     set -euxo pipefail
