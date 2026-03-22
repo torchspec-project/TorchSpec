@@ -534,7 +534,20 @@ Combined 3 training GPUs with FULL_SHARD and CPU prefetch. Eval disabled (`datas
 
 | Checkpoint | Steps | Loss | τ | DFlash tok/s | Baseline tok/s | Speedup |
 |------------|-------|------|---|-------------|----------------|---------|
-| *(training in progress)* | | | | | | |
+| ckpt-5k | 5,000 | ~3.4 | 1.29 | 45.6 | 51.2 | 0.88x |
+
+---
+
+## Environment Issues & Workarounds
+
+| Issue | Symptom | Workaround |
+|-------|---------|------------|
+| Missing `libibverbs.so.1` | Mooncake fails to load at runtime | `apt-get install libibverbs-dev` on pod |
+| RunPod SCP not supported | SSH proxy rejects file transfers | Commit changes locally, `git pull` on pod |
+| `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS` not set | PyTorch 2.9.1 speed regression (3x slower) | `export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON` — should be added to `train_entry.py` |
+| `eval_interval` under wrong section | Config parsing error | `eval_interval` belongs under `dataset`, not `training` |
+| `enable_perf` wrong path | Perf metrics flag not found | Correct path: `debug.enable_perf_metrics` |
+| Eval timeout with 3 GPUs | Eval cache generation hangs | Set `dataset.eval_data_path=null` to disable eval |
 
 ---
 
