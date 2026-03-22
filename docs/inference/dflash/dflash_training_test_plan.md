@@ -346,10 +346,49 @@ Tested FULL_SHARD (parameter sharding) vs REPLICATE (DDP-like gradient allreduce
 | Test 2: 3 GPU | 3 train | REPLICATE | 2.2 | 0.450s | 41ms | 240ms | 25,000 | 3.2 hr | 96.3% |
 | Test 3: FULL_SHARD+3GPU | 3 train | FULL_SHARD | 2.3 | 0.440s | 16-22ms | 220ms | 25,000 | **3.0 hr** | ~96% |
 
+#### 2.5.9 Scaling Inference: 2 Training + 2 Inference GPUs
+
+**Test 4 — FULL_SHARD, 2 train GPU, 2 inference GPU, max_concurrent_batches=2, bf16 reduce (200 steps):**
+
+| Metric | Test 1 (2T+1I) | Test 4 (2T+2I) | Change |
+|--------|---------------|----------------|--------|
+| step/s | **2.9** | **1.1** | **-62%** |
+| step_time | 0.350s | **0.85s** | +143% |
+| forward | ~100ms | **~230ms** | +130% |
+| backward | ~134ms | **~410ms** | +206% |
+| optimizer | 22ms | 22ms | 0% |
+| data | 145ms | **~400ms** | +176% |
+
+**Raw TIMING data (selected steps):**
+
+| Step | step (s) | data (s) | compute (s) | fwd (s) | bwd (s) | opt (s) |
+|------|----------|----------|-------------|---------|---------|---------|
+| 2 | 0.699 | 0.265 | 0.520 | 0.204 | 0.295 | 0.022 |
+| 10 | 0.858 | 0.304 | 0.677 | 0.246 | 0.409 | 0.022 |
+| 50 | 1.083 | 0.654 | 0.657 | 0.236 | 0.399 | 0.022 |
+| 100 | 1.348 | 0.935 | 0.688 | 0.250 | 0.416 | 0.022 |
+| 150 | 0.891 | 0.495 | 0.604 | 0.172 | 0.410 | 0.022 |
+| 200 | 0.902 | 0.479 | 0.650 | 0.236 | 0.391 | 0.022 |
+
+**Root cause**: 2 inference engines push hidden states to the same 2 training GPUs via Mooncake TCP, creating **PCIe bandwidth contention**. Mooncake transfers compete with GPU compute for bus bandwidth, roughly doubling both compute and data times. The sample pool was constantly full (72/64), confirming inference was never the bottleneck.
+
+**Verdict**: **Worse than 1-inference.** Adding inference GPUs creates contention without benefit. The pipeline was never inference-bound.
+
+#### 2.5.10 Configuration Comparison Summary (Final)
+
+| Config | Train | Infer | FSDP | step/s | step_time | opt (ms) | data (ms) | Eff. Steps | Est. Train | Acc |
+|--------|-------|-------|------|--------|-----------|----------|-----------|-----------|------------|-----|
+| Baseline | 2 | 1 | REPLICATE | 2.5 | 0.370s | 41 | 162 | 37,500 | 4.2 hr | 96.2% |
+| + no_sync + bf16 | 2 | 1 | REPLICATE | 2.7 | 0.353s | 41 | 147 | 37,500 | 3.9 hr | ~96% |
+| **Test 1: FULL_SHARD** | **2** | **1** | **FULL_SHARD** | **2.9** | **0.350s** | **22** | **145** | **37,500** | **3.6 hr** | **97.1%** |
+| Test 2: 3 GPU | 3 | 1 | REPLICATE | 2.2 | 0.450s | 41 | 240 | 25,000 | 3.2 hr | 96.3% |
+| Test 3: FS+3GPU | 3 | 1 | FULL_SHARD | 2.3 | 0.440s | 16-22 | 220 | 25,000 | 3.0 hr | ~96% |
+| Test 4: 2T+2I | 2 | 2 | FULL_SHARD | **1.1** | 0.850s | 22 | 400 | 37,500 | **9.5 hr** | — |
+
 **Recommendation**:
-- **Best per-step throughput**: Test 1 (FULL_SHARD, 2 GPU) — 2.9 step/s, simplest setup
-- **Fastest wall-clock training**: Test 3 (FULL_SHARD + 3 GPU) — ~3.0 hr total, but 3-GPU uses more GPU hours
-- **Best efficiency**: Test 1 — fewest GPU-hours for comparable quality
+- **Best config**: Test 1 (FULL_SHARD, 2 train + 1 infer) — 2.9 step/s, best per-step throughput, simplest setup
+- **Fastest wall-clock**: Test 3 (FULL_SHARD + 3 train + 1 infer) — ~3.0 hr total, uses more GPU-hours
+- **Avoid**: 2+ inference GPUs — creates Mooncake/PCIe contention, strictly worse
 
 ---
 

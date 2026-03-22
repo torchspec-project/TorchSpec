@@ -374,6 +374,13 @@ Combines FULL_SHARD optimizer savings with 3-way DP throughput.
 | **Test 1** | 2 | FULL_SHARD | **2.9** | **22** | 145 | **3.6 hr** |
 | Test 2 | 3 | REPLICATE | 2.2 | 41 | 240 | 3.2 hr |
 | **Test 3** | 3 | FULL_SHARD | **2.3** | **16-22** | 220 | **3.0 hr** |
+| Test 4 (2T+2I) | 2+2I | FULL_SHARD | **1.1** | 22 | 400 | **9.5 hr** |
+
+#### Test 4: 2 Training + 2 Inference GPUs (FULL_SHARD) — WORSE
+
+Adding a second inference engine caused **-62% speed regression** (2.9→1.1 step/s). Root cause: 2 inference engines push hidden states to the same 2 training GPUs via Mooncake TCP, creating PCIe bandwidth contention. Both compute and data times roughly doubled. Sample pool was constantly full (72/64), confirming inference was never the bottleneck.
+
+**Lesson**: Do not add inference GPUs beyond 1 for this workload. The pipeline is training-bound, not inference-bound.
 
 ---
 

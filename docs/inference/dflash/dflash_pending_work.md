@@ -24,6 +24,8 @@
 - [x] **FULL_SHARD benchmark (Test 1)** — 2.9 step/s, optimizer halved (41→22ms), best per-step throughput
 - [x] **3-GPU scaling benchmark (Test 2)** — 2.2 step/s per-step, but 3.2hr total (50% more data/step)
 - [x] **FULL_SHARD + 3-GPU benchmark (Test 3)** — 2.3 step/s, optimizer 16-22ms, ~3.0hr total
+- [x] **2-inference GPU benchmark (Test 4)** — 1.1 step/s, strictly worse due to Mooncake/PCIe contention
+- [x] **Pod disk cleanup** — freed 61 GB on container disk (81%→20%), removed old speed benchmark checkpoints
 
 ## Active — Training
 
