@@ -195,9 +195,33 @@ Note: data and compute partially overlap (async pipeline), so percentages sum to
 
 ### 2.5 Speed Optimization Tests (Phase 2 continued)
 
-#### 2.5.1 Compute Sub-Breakdown (P0)
+#### 2.5.1 Compute Sub-Breakdown (P0) — COMPLETED
 
-Profile forward vs backward vs optimizer vs FSDP allreduce within the 0.68s compute time. Use `torch.cuda.Event` timing in `dflash_trainer._train_step()`.
+Instrumented `dflash_trainer._train_step()` and `trainer._train_core_from_queue()` with `torch.cuda.Event` timing. Config: batch=2, accum=2, anchors=512, seq=2048, 30 steps.
+
+**Result**: Compute is now ~0.26s (was 0.68s in earlier run — likely torch.compile warmup effect).
+
+| Component | Time (ms) | % of Compute | Notes |
+|-----------|----------|--------------|-------|
+| **Backward** | **~140** | **54%** | Dominates — includes gradient allreduce |
+| **Forward** | **~82** | **31%** | FlexAttention + CE loss |
+| **Optimizer** | **~41** | **16%** | FSDP optimizer step, very consistent |
+
+**Raw TIMING data (steps 2-30):**
+
+| Step | step (s) | data (s) | compute (s) | fwd (s) | bwd (s) | opt (s) |
+|------|----------|----------|-------------|---------|---------|---------|
+| 2 | 0.391 | 0.159 | 0.292 | 0.102 | 0.148 | 0.041 |
+| 5 | 0.422 | 0.199 | 0.279 | 0.105 | 0.132 | 0.041 |
+| 10 | 0.412 | 0.212 | 0.261 | 0.079 | 0.141 | 0.041 |
+| 15 | 0.359 | 0.172 | 0.261 | 0.066 | 0.154 | 0.041 |
+| 20 | 0.400 | 0.235 | 0.233 | 0.073 | 0.120 | 0.041 |
+| 25 | 0.413 | 0.221 | 0.267 | 0.068 | 0.158 | 0.041 |
+| 30 | 0.348 | 0.149 | 0.258 | 0.085 | 0.132 | 0.041 |
+
+**Speed**: ~2.5 step/s steady-state (step_time ~0.4s). This is 2.5x faster than the 1.0 step/s measured in Section 2.2.
+
+**Key insight**: Backward (54%) is the biggest lever within compute. Optimizer is small and constant (41ms). Forward is moderate. FSDP gradient allreduce happens during backward — this likely explains why backward > forward for a ~1B model.
 
 #### 2.5.2 Bypass Mooncake for Same-Node (P0)
 

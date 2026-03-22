@@ -241,11 +241,22 @@ Step 1 is warmup (torch.compile JIT). Steps 2-30 show ~1.0s/step steady state.
 | **P1** | Enable FSDP CPU offload to fit batch=4+anchors=512 | May help if compute scales sublinearly with batch | Needs testing |
 | **P2** | Use colocate mode if memory allows | 3-5x (eliminates data_time + reduces FSDP overhead) | But OOM risk with 8B target + draft on same GPU |
 
+### Compute Sub-Breakdown (2026-03-22)
+
+Instrumented forward/backward/optimizer with CUDA event timing. Config: batch=2, accum=2, anchors=512, seq=2048, 30 steps.
+
+| Component | Time (ms) | % of Compute |
+|-----------|----------|--------------|
+| **Backward** (+ FSDP allreduce) | **~140** | **54%** |
+| **Forward** (FlexAttention + CE loss) | **~82** | **31%** |
+| **Optimizer** (FSDP step) | **~41** | **16%** |
+
+Steady-state speed: **~2.5 step/s** (step_time ~0.4s). Backward dominates compute; optimizer is small and constant.
+
 ### Training Time Estimate
 
-With current 1.0 step/s:
-- 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~10.4 hours**
-- With P0 fixes (compute + data, ~2x): **~5 hours**
+With 2.5 step/s:
+- 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~4.2 hours**
 
 ---
 
