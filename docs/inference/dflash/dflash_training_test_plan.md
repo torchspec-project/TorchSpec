@@ -223,13 +223,41 @@ Instrumented `dflash_trainer._train_step()` and `trainer._train_core_from_queue(
 
 **Key insight**: Backward (54%) is the biggest lever within compute. Optimizer is small and constant (41ms). Forward is moderate. FSDP gradient allreduce happens during backward — this likely explains why backward > forward for a ~1B model.
 
-#### 2.5.2 Bypass Mooncake for Same-Node (P0)
+#### 2.5.1b Extended Steady-State (200 steps)
 
-Test whether disabling Mooncake TCP transport and using direct NCCL or shared memory reduces data_time from 0.4s.
+Verified speed stability over 200 steps (2 epochs). **Result: stable ~2.5 step/s** with no degradation.
 
-#### 2.5.3 max_concurrent_batches > 1 (P1)
+| Step Range | Avg step (s) | Avg data (s) | Avg compute (s) | Avg fwd (s) | Avg bwd (s) | Avg opt (s) |
+|-----------|-------------|-------------|----------------|------------|------------|------------|
+| 2-30 | 0.370 | 0.160 | 0.263 | 0.085 | 0.138 | 0.041 |
+| 30-100 | 0.360 | 0.162 | 0.255 | 0.077 | 0.137 | 0.041 |
+| 100-200 | 0.356 | 0.162 | 0.255 | 0.076 | 0.138 | 0.041 |
 
-Test `training.max_concurrent_batches=2` to overlap inference and training pipeline stages.
+Training converged well: loss 12.35→0.12, accuracy 0%→96.2% in 200 steps.
+
+#### 2.5.2 Bypass Mooncake for Same-Node (P0) — NOT FEASIBLE (config-only)
+
+**Finding**: No built-in option to bypass Mooncake for same-node transfers. Code investigation shows:
+- `EagleMooncakeStore` always uses Mooncake protocol (TCP or RDMA) regardless of node topology
+- `enable_gpu_direct=True` tested → CUDA assert error (RunPod lacks RDMA hardware)
+- Implementing bypass requires code changes: shared memory or NCCL p2p transport
+
+**Available alternatives**:
+- `mooncake.protocol="rdma"` — needs RDMA NIC (not available on this pod)
+- Colocate mode (`training.colocate=True`) — eliminates transfer entirely but OOMs with 8B model
+
+**Recommendation**: Data pipeline (~160ms) is already <50% of step_time. Focus optimization on compute (backward dominates at 54% of compute) or training config (batch size, FSDP sharding).
+
+#### 2.5.3 max_concurrent_batches > 1 (P1) — NO IMPROVEMENT
+
+Tested `training.max_concurrent_batches=2`. Result: **same ~2.5 step/s** as baseline.
+
+| Config | step/s | step_time (s) | data (s) | compute (s) |
+|--------|--------|--------------|----------|-------------|
+| concurrent=1 (baseline) | ~2.5 | 0.37 | 0.16 | 0.26 |
+| concurrent=2 | ~2.5 | 0.37 | 0.16 | 0.26 |
+
+Inference throughput increased (I=48-52 vs I=30-33 samples/s), but training was not bottlenecked on inference supply — data fetcher always has samples ready.
 
 ---
 
