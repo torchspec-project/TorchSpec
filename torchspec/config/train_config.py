@@ -40,6 +40,7 @@ class DatasetConfig:
     eval_micro_batch_size: Optional[int] = None
     eval_prompt_key: Optional[str] = None
     last_turn_loss_only: Any = "auto"  # bool or "auto"
+    min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
     prompt_key: str = "conversations"
     shuffle_dataset: bool = True
     train_data_path: str = ""

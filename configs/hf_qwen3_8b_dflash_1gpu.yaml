@@ -16,6 +16,7 @@ dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
   chat_template: qwen
   prompt_key: conversations
+  min_loss_tokens: 32  # 2 * block_size — matches SpecForge filter for valid anchor sampling
 
 training:
   attention_backend: flex_attention

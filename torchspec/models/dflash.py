@@ -128,10 +128,11 @@ class DFlashModel(nn.Module):
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
         if max_n <= 0:
-            # Fallback: no valid positions, return dummy
-            anchors = torch.zeros(bsz, 1, dtype=torch.long, device=device)
-            keep_mask = torch.zeros(bsz, 1, dtype=torch.bool, device=device)
-            return anchors, keep_mask
+            raise ValueError(
+                f"No valid anchor positions found (max_anchor={max_anchor}, "
+                f"block_size={self.block_size}). Preprocess data to ensure "
+                f"sequences have at least 2*block_size loss-masked tokens."
+            )
 
         indices = (
             torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)

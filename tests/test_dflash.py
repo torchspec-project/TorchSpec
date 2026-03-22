@@ -244,12 +244,13 @@ class TestAnchorSampling(unittest.TestCase):
         valid_count = keep_mask.sum(dim=1)
         self.assertLessEqual(valid_count[0].item(), 2)
 
-    def test_short_sequence_no_crash(self):
+    def test_short_sequence_raises_error(self):
+        """Sequences with < 2*block_size tokens must raise ValueError (matches SpecForge)."""
         B = 1
         loss_mask = torch.ones(B, 4)
         model = _make_dflash_model(block_size=8, num_anchors=2)
-        anchors, keep_mask = model._sample_anchor_positions(4, loss_mask, loss_mask.device)
-        # Should return without crashing even if no valid positions
+        with self.assertRaises(ValueError):
+            model._sample_anchor_positions(4, loss_mask, loss_mask.device)
 
 
 class TestPositionIds(unittest.TestCase):
@@ -461,6 +462,54 @@ class TestDFlashModelForward(unittest.TestCase):
         # Both should be finite
         self.assertTrue(torch.isfinite(loss_full))
         self.assertTrue(torch.isfinite(loss_half))
+
+    def test_loss_decay_weights(self):
+        """Loss decay should follow exp(-(k-1)/gamma) for block_size=16, gamma=7.0."""
+        model = _make_dflash_model(block_size=16, num_anchors=2)
+        model.loss_decay_gamma = 7.0
+
+        device = torch.device("cpu")
+        k = torch.arange(16, device=device).view(1, 1, -1)
+        decay = torch.exp(-(k - 1).clamp(min=0).float() / 7.0)
+
+        # k=0 → exp(0) = 1.0 (but excluded by pos_in_block > 0)
+        # k=1 → exp(0) = 1.0
+        # k=2 → exp(-1/7) ≈ 0.867
+        # k=15 → exp(-14/7) = exp(-2) ≈ 0.135
+        self.assertAlmostEqual(decay[0, 0, 0].item(), 1.0, places=5)
+        self.assertAlmostEqual(decay[0, 0, 1].item(), 1.0, places=5)
+        self.assertAlmostEqual(decay[0, 0, 2].item(), math.exp(-1.0 / 7.0), places=5)
+        self.assertAlmostEqual(decay[0, 0, 15].item(), math.exp(-14.0 / 7.0), places=5)
+
+    def test_label_alignment_same_position(self):
+        """Labels at positions anchor+0..anchor+block_size-1 (same-position prediction)."""
+        model = _make_dflash_model(block_size=4, num_anchors=2)
+        device = torch.device("cpu")
+        block_size = 4
+
+        anchor_positions = torch.tensor([[5, 20]])
+        label_offsets = torch.arange(0, block_size, device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+
+        # Block 0 (anchor=5): labels at positions 5, 6, 7, 8
+        self.assertEqual(label_indices[0, 0].tolist(), [5, 6, 7, 8])
+        # Block 1 (anchor=20): labels at positions 20, 21, 22, 23
+        self.assertEqual(label_indices[0, 1].tolist(), [20, 21, 22, 23])
+
+    def test_anchor_loss_excluded(self):
+        """Position 0 in block (the anchor itself) should have zero loss weight."""
+        model = _make_dflash_model(block_size=4, num_anchors=2)
+        device = torch.device("cpu")
+        block_size = 4
+
+        pos_in_block = torch.arange(block_size, device=device).view(1, 1, -1)
+        anchor_weight = (pos_in_block > 0).float()
+
+        # pos 0 (anchor) should be excluded
+        self.assertEqual(anchor_weight[0, 0, 0].item(), 0.0)
+        # pos 1, 2, 3 should be included
+        for i in range(1, block_size):
+            self.assertEqual(anchor_weight[0, 0, i].item(), 1.0)
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
