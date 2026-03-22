@@ -134,8 +134,14 @@ class DFlashTrainer(Trainer):
             cpu_offload=True if self.fsdp_cpu_offload else None,
         )
 
+        if getattr(self.args, "compile_model", False):
+            logger.info("Compiling DFlash model with torch.compile (inductor backend)")
+            dflash_model = torch.compile(dflash_model)
+
         self.model = dflash_model
-        self.dflash = self.model.module if hasattr(self.model, "module") else self.model
+        # Unwrap torch.compile and/or DDP module wrappers to access underlying DFlashModel
+        _unwrapped = getattr(self.model, "_orig_mod", self.model)  # torch.compile
+        self.dflash = getattr(_unwrapped, "module", _unwrapped)  # DDP/replicate
         self.draft_model = self.dflash.draft_model
 
         self.optimizer = BF16Optimizer(

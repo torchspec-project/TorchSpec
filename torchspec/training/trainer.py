@@ -26,6 +26,7 @@ import logging
 import os
 import time
 from argparse import Namespace
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -295,6 +296,11 @@ class Trainer(abc.ABC):
             compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
             t_data_start = time.time()
 
+        # no_sync() context: skip gradient allreduce on non-last micro-batches
+        # Check both model and underlying module (torch.compile wraps the model)
+        _model = getattr(self.model, "_orig_mod", self.model)
+        _no_sync = getattr(_model, "no_sync", None)
+
         batches = self.prof.iterate_train_actor(self._iter_batches_from_queue(num_batches))
         for batch_idx, batch in enumerate(batches):
             is_last = batch_idx == num_batches - 1
@@ -308,13 +314,16 @@ class Trainer(abc.ABC):
             if logger.isEnabledFor(logging.DEBUG):
                 self._log_batch_debug(batch, step, batch_idx, num_batches)
 
-            step_metrics = self._train_step(
-                batch=batch,
-                accumulation_steps=accumulation_steps,
-                step=step,
-                batch_idx=batch_idx,
-                num_batches=num_batches,
-            )
+            # Skip gradient sync on non-last micro-batches (saves one allreduce per step)
+            ctx = _no_sync() if (_no_sync is not None and not is_last) else nullcontext()
+            with ctx:
+                step_metrics = self._train_step(
+                    batch=batch,
+                    accumulation_steps=accumulation_steps,
+                    step=step,
+                    batch_idx=batch_idx,
+                    num_batches=num_batches,
+                )
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
