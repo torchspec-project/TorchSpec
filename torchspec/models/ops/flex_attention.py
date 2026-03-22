@@ -32,9 +32,9 @@ from transformers.utils import is_torchdynamo_compiling
 # (varying anchor positions), causing frequent recompilation. Raise the limit
 # to avoid constant re-tracing.
 try:
-    dynamo.config.recompile_limit = 64
+    dynamo.config.recompile_limit = 128
 except AttributeError:
-    dynamo.config.cache_size_limit = 64
+    dynamo.config.cache_size_limit = 128
 
 # Without ATEN fallback, inductor's GEMM autotuner can fail with
 # NoValidChoicesError during FlexAttention backward (Issue 10).

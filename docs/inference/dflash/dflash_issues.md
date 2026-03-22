@@ -258,3 +258,46 @@ Setting `mooncake.enable_gpu_direct=True` causes `torch.AcceleratorError: CUDA e
 | Mooncake RDMA | 25-100 GB/s | ~1-5 ms | No (no IB on RunPod) |
 
 **Status**: **Needs code changes**. Would require new `local` transport backend in `data_fetcher.py` and `eagle_store.py` using `torch.distributed.send/recv` (NCCL) or CUDA IPC. Colocate mode is the only workaround (but OOMs with 8B target).
+
+### Issue 30: FlexAttention recompile overflow from variable padding — **Critical Performance Bug**
+
+With `batch_size>1`, `DataCollatorWithPadding` pads each batch to the max sequence length within that batch. Every batch gets a unique padded length, producing unique `(Q_LEN, KV_LEN)` dimensions for `flex_attention`.
+
+**Root cause**: `flex_attention` is compiled via `torch.compile` (singleton `WrappedFlexAttention`). Each new `(Q_LEN, KV_LEN)` shape triggers a recompilation. After `dynamo.config.recompile_limit=64` unique shapes, dynamo silently falls back to **eager mode** — losing all FlexAttention kernel optimization.
+
+**Symptoms** (observed at step 615, Phase 3):
+- `fwd=266ms` (vs 78ms Phase F steady-state) — 3.4x slower
+- `bwd=393ms` (vs 138ms Phase F) — 2.8x slower
+- `data=670ms` — prefetch queue drains because compute is slow
+- `step=1.09s` (vs 0.19s target) — **5.7x slower**
+- Phase F benchmarks appeared fast because they were short runs that stayed within the 64-shape limit
+
+**Solution**: Bucketed padding in `DataCollatorWithPadding` — round `max_length` up to the nearest 256 boundary. With `max_seq_length=2048`, this limits unique shapes to 8 (`256, 512, 768, ..., 2048`), well within the recompile limit.
+
+```python
+# torchspec/data/utils.py — DataCollatorWithPadding.__call__()
+_BUCKET = 256
+max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
+```
+
+Also increased `dynamo.config.recompile_limit` from 64 to 128 as safety margin.
+
+**Impact**: Restores steady-state speed of ~5 step/s (matching Phase F Test 7).
+
+**Status**: **RESOLVED** (2026-03-22).
+
+### Issue 31: Mooncake buffer use-after-free with batch_size>1
+
+With `batch_size>1`, the DataLoader collator holds sample N while waiting for sample N+1. `_load_from_mooncake()` called `_cleanup_mooncake_data()` (which frees the Mooncake buffer) before `to_tensor_dict()` returned copies. The freed buffer gets reused by new inference data, corrupting held tensors with garbage values.
+
+**Symptoms**: `input_ids` contained random int64 values like `-4953751034053673866`, causing `embed_tokens` to crash with CUDA index-out-of-bounds.
+
+**Root cause**: `to_tensor_dict()` returns **views** into Mooncake buffers, not copies. With batch_size=1, the single sample is consumed immediately, so the race doesn't manifest.
+
+**Solution**: Clone tensors before cleanup:
+```python
+result = {k: v.clone() for k, v in tensors.to_tensor_dict().items()}
+self._cleanup_mooncake_data(sample)
+```
+
+**Status**: **RESOLVED** (2026-03-22).
