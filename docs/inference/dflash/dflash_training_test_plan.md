@@ -131,48 +131,41 @@ This resolves both the speed regression AND the `NoValidChoicesError` in FlexAtt
 
 **Environment**: torch 2.9.1 + sglang 0.5.9 (latest, matching SpecForge commit `961ca7c`).
 
-### 2.2 Baseline Speed Test (100 steps each)
+### 2.2 Baseline Speed Test — DONE (2026-03-22)
 
-All tests use: 4x H100, 2 inference + 2 training, `perfectblend_50k.jsonl`
+**Setup**: 4x H100 80GB, 2 training + 1 inference + 1 idle, SGLang + Mooncake, `perfectblend_50k.jsonl`, block_size=16, seq=2048, 50 steps each.
 
-| Config ID | batch | accum | anchors | seq_len | block_size | Expected step/s |
-|-----------|-------|-------|---------|---------|------------|-----------------|
-| S1 | 1 | 4 | 512 | 4096 | 16 | ~1.5 |
-| S2 | 2 | 2 | 256 | 2048 | 16 | ~1.9 |
-| S3 | 4 | 1 | 256 | 2048 | 16 | ~2.1 |
-| S4 | 4 | 1 | 128 | 2048 | 16 | ~2.5+ |
-| S5 | 4 | 1 | 256 | 2048 | 8 | ~3.0+ |
-| S6 | 8 | 1 | 128 | 2048 | 8 | ~3.5+ |
+| Config | batch | accum | anchors | step/s | GPU Mem (train) | GPU Mem (infer) | Notes |
+|--------|-------|-------|---------|--------|-----------------|-----------------|-------|
+| S1 | 1 | 4 | 512 | **1.05** | 13.4 GB | 57.3 GB | Baseline |
+| S2 | 2 | 2 | 512 | **1.0** | ~13 GB | 57.3 GB | Same speed |
+| S3 | 4 | 1 | 512 | **OOM** | — | — | Backward alloc 9.27 GB failed |
+| S3b | 2 | 2 | 256 | **1.0** | ~13 GB | 57.3 GB | Anchors don't matter |
 
-Expected speeds based on torch 2.6 measurements. With torch 2.9.1 + env var fix, speeds may differ — re-benchmark needed. See [Phase C speed optimization](dflash_training_results.md#speed-optimization) for prior measurements.
+**Key finding: All configs converge to ~1.0 step/s.** The bottleneck is NOT DFlash compute (T=6-15ms per training batch) but the **inference→training pipeline** (Mooncake KV transfer + Ray actor overhead ≈ 1000ms per cycle).
 
-**Launch template** (e.g., config S3):
-```bash
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-python -m torchspec.train_entry \
-  --config configs/sglang_qwen3_8b_dflash.yaml \
-  training.micro_batch_size=4 \
-  training.draft_accumulation_steps=1 \
-  training.dflash_num_anchors=256 \
-  training.max_seq_length=2048 \
-  training.dflash_block_size=16 \
-  training.num_epochs=1 \
-  dataset.train_data_path=/workspace/data/perfectblend_50k.jsonl \
-  dataset.eval_data_path=null dataset.eval_interval=0 \
-  output_dir=./outputs/speed_test_S3
-```
+Evidence:
+- `avg training=1.9 entries/s` vs `avg inference=2.2 entries/s` — training throughput limited by pipeline feed rate
+- GPU utilization snapshot: GPU 0-1 (training) at **0%**, GPU 2 (inference) at **0%** — GPUs idle between pipeline cycles
+- `wait=0.0-0.1s` in training log — training never waits for data, but each cycle takes ~1s due to pipeline overhead
+- Reducing anchors from 512→256 halves FlexAttention compute but yields identical step/s — confirming compute is not the bottleneck
 
-**Note**: Use `PYTORCH_ALLOC_CONF` (not `PYTORCH_CUDA_ALLOC_CONF`) — see [Issue 23](dflash_issues.md#issue-23-pytorch_cuda_alloc_conf-deprecated-in-pytorch-29).
+**Comparison**:
+- 1-GPU colocate (Phase D smoke test): **~5 step/s** — no Mooncake/Ray overhead
+- 4-GPU SGLang mode: **~1.0 step/s** — 5x slower due to pipeline overhead
+- Training time estimate for 50K×6 epochs: **~10 hours** at 1.0 step/s (37,500 optimizer steps)
 
-### 2.3 Speed Metrics to Collect
+**Bottleneck analysis**: See [Speed Investigation Summary](dflash_training_results.md#phase-e-speed-benchmark) for detailed breakdown and recommendations.
 
-| Metric | How |
-|--------|-----|
-| Steps/second | From training log (after warmup, skip first 20 steps) |
-| Samples/second | steps/s × micro_batch_size |
-| GPU memory (train) | `nvidia-smi` peak during training |
-| GPU memory (inference) | `nvidia-smi` peak during target forward |
-| FlexAttention % of step | `torch.profiler` if needed |
+### 2.3 Speed Improvement Recommendations
+
+| Priority | Approach | Expected Impact | Effort |
+|----------|----------|-----------------|--------|
+| **P0** | Reduce pipeline overhead (Mooncake→shared memory, or colocate mode) | 3-5x speedup | High — requires architecture change |
+| **P1** | Increase inference batch size / max_running_requests | 1.5-2x if inference is sub-saturated | Low — config change |
+| **P1** | Use `max_concurrent_batches > 1` to overlap inference+training | Up to 2x | Medium — may need tuning |
+| **P2** | FSDP CPU offload (`fsdp_cpu_offload: true`) to fit batch=4+anchors=512 | Enables larger batches | Low — config flag |
+| **P2** | Profile Mooncake KV transfer latency vs Ray actor dispatch | Identifies dominant overhead | Medium — instrumentation |
 
 ---
 

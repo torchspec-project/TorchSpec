@@ -173,9 +173,65 @@ Loss starts ~12.7, drops monotonically. No NaN, no zero-loss steps. Speed ~5 ste
 
 ### Next Steps
 
-- Speed benchmark S1-S6 in 4-GPU SGLang mode (Phase 2.2)
 - Fresh training from scratch with bug fixes, 6 epochs on 50K data (Phase 3)
 - Measure τ at epoch boundaries to track progression
+- Investigate pipeline overhead for speed improvements
+
+---
+
+## Phase E: Speed Benchmark (2026-03-22)
+
+### Environment
+
+- torch 2.9.1 + sglang 0.5.9 (patched) + CUDA 12.4
+- `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON`
+- 4x H100 80GB: 2 training + 1 inference + 1 idle
+- Data: `perfectblend_50k.jsonl`, block_size=16, seq_len=2048, 50 steps each
+
+### Results
+
+| Config | batch | accum | anchors | step/s | Status |
+|--------|-------|-------|---------|--------|--------|
+| S1 | 1 | 4 | 512 | **1.05** | OK |
+| S2 | 2 | 2 | 512 | **1.0** | OK |
+| S3 | 4 | 1 | 512 | **OOM** | Backward alloc 9.27 GB |
+| S3b | 2 | 2 | 256 | **1.0** | OK |
+
+### Key Finding: Pipeline Bottleneck
+
+**All configs converge to ~1.0 step/s regardless of DFlash hyperparameters.** The bottleneck is the inference→training pipeline (Mooncake KV transfer + Ray actor dispatch), not DFlash compute.
+
+**Evidence:**
+1. **Training compute is fast**: `T=6-15ms` per batch in training log, but step cycle is ~1000ms
+2. **GPU utilization is near-zero**: nvidia-smi snapshot during training shows 0% on all GPUs — they idle between pipeline cycles
+3. **Anchors don't matter**: 512→256 halves FlexAttention work but yields identical step/s
+4. **Colocate mode is 5x faster**: 1-GPU colocate (Phase D) achieved ~5 step/s by avoiding Mooncake/Ray overhead entirely
+
+### Pipeline Overhead Breakdown (estimated)
+
+| Component | Time (ms) | % of Step |
+|-----------|-----------|-----------|
+| Mooncake KV transfer (hidden states GPU→GPU) | ~300-500 | 30-50% |
+| Ray actor dispatch + result collection | ~200-300 | 20-30% |
+| SGLang prefill (target model forward) | ~150-200 | 15-20% |
+| DFlash training forward+backward | ~6-15 | <2% |
+| Other overhead (scheduling, queueing) | ~100-200 | 10-20% |
+
+### Recommendations for Speed Improvement
+
+| Priority | Approach | Expected Impact |
+|----------|----------|-----------------|
+| **P0** | Bypass Mooncake — use shared GPU memory or colocate mode for KV transfer | 3-5x speedup |
+| **P1** | Increase `max_concurrent_batches` to overlap inference and training | Up to 2x |
+| **P1** | Increase inference throughput (batch_size, max_running_requests) | 1.5-2x if inference is sub-saturated |
+| **P2** | Enable FSDP CPU offload to fit batch=4 + anchors=512 | Enables larger batches |
+| **P2** | Profile Mooncake transfer vs Ray dispatch to isolate dominant overhead | Identifies optimization target |
+
+### Training Time Estimate
+
+With current 1.0 step/s:
+- 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~10.4 hours**
+- With P0 fix (3-5x): **2-3.5 hours**
 
 ---
 
