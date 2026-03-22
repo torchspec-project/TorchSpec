@@ -26,17 +26,20 @@
 - [x] **FULL_SHARD + 3-GPU benchmark (Test 3)** — 2.3 step/s, optimizer 16-22ms, ~3.0hr total
 - [x] **2-inference GPU benchmark (Test 4)** — 1.1 step/s, strictly worse due to Mooncake/PCIe contention
 - [x] **Pod disk cleanup** — freed 61 GB on container disk (81%→20%), removed old speed benchmark checkpoints
+- [x] **Commit factory.py timeout fix** — 30s→120s for PyTorch 2.9+ compatibility (commit `cedef38`)
+- [x] **Async data pre-fetch** — CPU staging to overlap Mooncake TCP with GPU compute (commits `f75a285`, `3ceb630`, `bb922ba`)
+- [x] **Test 5b: CPU prefetch benchmark** — **6.8 step/s** (2.3x over Test 1 baseline), data fully overlapped with compute
+- [x] **Test 6: NVLink transport attempt** — `nvlink_intra` protocol not compiled in Mooncake v0.3.10 pip wheel
 
 ## Active — Training
 
-- [ ] **Retrain from scratch** with bug fixes + speed optimizations applied — fresh training on perfectblend_50k, 6 epochs, with no_sync + bf16 reduce enabled
+- [ ] **Retrain from scratch** with bug fixes + speed optimizations applied — fresh training on perfectblend_50k, 6 epochs, with FULL_SHARD + CPU prefetch (est. ~1.5 hr at 6.8 step/s)
 - [ ] **τ benchmark matrix** (Phase 3) — measure τ at epoch boundaries, by data size, by domain
 
 ## Active — Code Improvements
 
-- [ ] **Commit factory.py timeout fix**: Increase `find_free_port` timeout from 30s to 120s for PyTorch 2.9+ compatibility (currently local pod patch only).
+- [ ] **Build Mooncake from source with NVLink** (P0): pip wheel lacks `nvlink_intra` transport. Build from source with cmake NVLink flags. Would eliminate Mooncake TCP entirely (<0.1ms vs 145ms).
 - [ ] **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` (currently recomputes full context each cycle — O(n²) scaling).
-- [ ] **Mooncake NVLink bypass** (P0): Implement NCCL/CUDA-IPC transport for same-node GPU-to-GPU transfers. Current TCP loopback wastes 1500x available NVLink bandwidth (145ms vs <0.1ms). Would push training from ~2.9 to ~4+ step/s.
 
 ## Future
 

@@ -395,6 +395,68 @@ Adding a second inference engine caused **-62% speed regression** (2.9→1.1 ste
 
 This TCP overhead is 40-60% of step time and the single biggest bottleneck. Implementing a same-node NVLink/NCCL bypass for Mooncake would reduce data_time from ~145ms to <1ms, potentially enabling 4+ step/s.
 
+### Async Data Pre-Fetch Tests (2026-03-22)
+
+#### Test 5a: GPU Prefetch (prefetch_depth=2, staging to GPU) — WORSE
+
+Background thread fetches from Mooncake to GPU concurrently with forward/backward. **GPU contention** caused 2-3x compute slowdown.
+
+| Metric | Test 1 (no prefetch) | Test 5a (GPU prefetch) |
+|--------|---------------------|----------------------|
+| step/s | 2.9 | **1.0** |
+| data_time | 145ms | 11-46ms |
+| compute_time | 100ms | **200-300ms** |
+
+**Root cause**: Background `cudaMemcpy` (HtoD) from Mooncake competes with forward/backward for GPU/PCIe bandwidth. Commit `3ceb630`.
+
+#### Test 5b: CPU Prefetch (prefetch_depth=2, staging to CPU) — **2.3x SPEEDUP**
+
+Fixed: Background thread stages data on CPU only. Main thread moves to GPU synchronously between steps, eliminating GPU contention.
+
+| Metric | Test 1 (baseline) | Test 5b (CPU prefetch) | Change |
+|--------|---------------------|----------------------|--------|
+| step/s | 2.9 | **~6.8** | **+134%** |
+| step_time | 345ms | **100-123ms** | -65% |
+| data_time | 145ms | **1-23ms** | -97% |
+| compute_time | 100ms | **92-115ms** | No contention |
+
+**200-step stability confirmed**: Steady ~6.5-7.0 step/s with no degradation. Loss 12.3→0.39, accuracy 0%→93.5%. Data transfer fully overlapped with compute — step time ≈ compute time. Commit `bb922ba`.
+
+#### Test 6: NVLink Intra-Node Transport (mooncake.protocol=nvlink_intra) — FAILED
+
+Attempted to use Mooncake's native `nvlink_intra` protocol for GPU-to-GPU transfer via NVLink IPC. **Failed**: Mooncake v0.3.10 pip wheel was not compiled with NVLink transport support.
+
+```
+E0322 04:11:07.613032 client_service.cpp:413] unsupported_protocol protocol=nvlink_intra
+```
+
+**Finding**: The NVLink transport code exists in Mooncake source (C++ classes `NvlinkTransport`, `IntraNodeNvlinkTransport`) but the pip wheel build doesn't include it. Building from source with NVLink support may require specific cmake flags.
+
+**Mooncake supported transports (from source)**:
+
+| Protocol | Status on RunPod | Potential Speed |
+|----------|-----------------|-----------------|
+| `tcp` | **Currently used** | ~0.3 GB/s (~145ms/40MB) |
+| `rdma` | No IB hardware | ~25-100 GB/s |
+| `nvlink_intra` | Not compiled in pip wheel | ~478 GB/s (<0.1ms) |
+| `nvlink` (MNNVL) | Needs fabric support | ~478 GB/s |
+
+**Next**: Build Mooncake from source with `-DENABLE_NVLINK=ON` or equivalent flag.
+
+#### Updated Configuration Comparison
+
+| Config | GPUs | FSDP | Prefetch | step/s | data (ms) | compute (ms) | Est. Train Time |
+|--------|------|------|----------|--------|-----------|--------------|-----------------|
+| Baseline | 2 | REPLICATE | No | 2.5 | 162 | 258 | 4.2 hr |
+| + no_sync + bf16 | 2 | REPLICATE | No | 2.7 | 147 | 253 | 3.9 hr |
+| Test 1 | 2 | FULL_SHARD | No | 2.9 | 145 | 100 | 3.6 hr |
+| Test 2 | 3 | REPLICATE | No | 2.2 | 240 | 258 | 3.2 hr |
+| Test 3 | 3 | FULL_SHARD | No | 2.3 | 220 | 100 | 3.0 hr |
+| Test 4 (2T+2I) | 2+2I | FULL_SHARD | No | 1.1 | 400 | 200 | 9.5 hr |
+| Test 5a | 2 | FULL_SHARD | GPU | 1.0 | 11-46 | 200-300 | N/A (worse) |
+| **Test 5b** | **2** | **FULL_SHARD** | **CPU** | **6.8** | **1-23** | **92-115** | **1.5 hr** |
+| Test 6 (NVLink) | 2 | FULL_SHARD | No | N/A | N/A | N/A | Build needed |
+
 ---
 
 ## Commits
@@ -410,3 +472,7 @@ This TCP overhead is 40-60% of step time and the single biggest bottleneck. Impl
 | `dcd5f45` | Add compute sub-breakdown profiling instrumentation |
 | `949c744` | Add no_sync, compile_model, bf16 reduce optimizations |
 | `641802f` | Add FSDP strategy config (FULL_SHARD/REPLICATE) |
+| `cedef38` | Fix factory.py timeout 30s→120s for PyTorch 2.9+ compatibility |
+| `f75a285` | Add async data pre-fetch (PrefetchedDataFetcher) |
+| `3ceb630` | Fix PrefetchedDataFetcher persistent thread (single background thread) |
+| `bb922ba` | Fix prefetch GPU contention: stage data on CPU, move to GPU synchronously |
