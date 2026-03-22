@@ -32,13 +32,15 @@
 - [x] **Test 6: NVLink transport investigation** — Not viable: built from source, patched protocol switch, but NVLink requires GPU memory while mooncake-store uses host memory (fundamental mismatch)
 - [x] **Test 7: 3 GPU + FULL_SHARD + CPU prefetch** — 5.3 step/s × 3 samples/step = 15.9 samples/s, ~17% faster than Test 5b (2 GPU)
 
-## Active — Phase 3: τ Benchmark Training
+## Active — Phase 3: τ Benchmark Training (incremental)
 
-- [ ] **Full training run** — perfectblend_50k, 6 epochs, 3 GPU + FULL_SHARD + CPU prefetch, checkpoints at 5k/10k/15k steps
-- [ ] **τ @ 5k steps** — inference benchmark, measure τ and tok/s vs baseline and Eagle3
-- [ ] **τ @ 10k steps** — inference benchmark, measure τ and tok/s vs baseline and Eagle3
-- [ ] **τ @ 15k steps** — inference benchmark, measure τ and tok/s vs baseline and Eagle3
+- [ ] **Train 5k steps** — perfectblend_50k, 3 GPU + FULL_SHARD + CPU prefetch (~16 min)
+- [ ] **τ @ 5k steps** — inference benchmark: measure τ, tok/s vs baseline, verify performance
 - [ ] **Eagle3 baseline** — benchmark Eagle3 inference speed on same target model for comparison
+- [ ] **Train to 10k steps** — continue from 5k checkpoint (if 5k results are promising)
+- [ ] **τ @ 10k steps** — inference benchmark, compare with 5k
+- [ ] **Train to 15k steps** — continue from 10k checkpoint
+- [ ] **τ @ 15k steps** — inference benchmark, compare progression
 
 ## Active — Code Improvements
 

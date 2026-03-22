@@ -508,11 +508,13 @@ Combined 3 training GPUs with FULL_SHARD and CPU prefetch. Eval disabled (`datas
 - Steps per epoch: ~15,828 (47,484 ÷ 3 samples/step)
 - Total steps: ~94,968
 
+**Incremental approach**: Train 5k steps first, benchmark τ and performance. If results are promising, continue to 10k and 15k.
+
 **Checkpoint schedule**:
 
 | Checkpoint | Steps | Epoch | Est. Wall Time | Measurement |
 |------------|-------|-------|-----------------|-------------|
-| ckpt-5k | 5,000 | ~0.3 | ~16 min | τ, loss, inference tok/s |
+| **ckpt-5k** | **5,000** | **~0.3** | **~16 min** | **τ, loss, inference tok/s (verify first)** |
 | ckpt-10k | 10,000 | ~0.6 | ~31 min | τ, loss, inference tok/s |
 | ckpt-15k | 15,000 | ~0.9 | ~47 min | τ, loss, inference tok/s |
 | epoch-1 | 15,828 | 1.0 | ~50 min | τ, loss, inference tok/s |
