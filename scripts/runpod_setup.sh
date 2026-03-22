@@ -63,7 +63,12 @@ DATASET_SIZE=50000
 DATASET_SEED=42
 HF_CHECKPOINT_REPO="Xingh3/dflash-qwen3-8b-1k"
 MIN_CONTAINER_DISK_GB=50   # Minimum free space on container disk
-SKIP_INSTALL="${SKIP_INSTALL:-0}"  # Set to 1 to skip pip installs on pod restart
+# Auto-detect custom Docker image (all deps pre-installed)
+if python3 -c "import sglang, torchspec, mooncake" 2>/dev/null; then
+    SKIP_INSTALL="${SKIP_INSTALL:-1}"
+else
+    SKIP_INSTALL="${SKIP_INSTALL:-0}"
+fi
 
 # ── Colors ──
 RED='\033[0;31m'

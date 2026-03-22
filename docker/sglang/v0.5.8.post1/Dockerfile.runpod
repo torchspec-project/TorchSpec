@@ -1,10 +1,38 @@
-ARG SGLANG_IMAGE_TAG=v0.5.8-cu129-amd64
-FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
+# =============================================================================
+# DFlash Training Docker Image for RunPod
+# =============================================================================
+#
+# Pre-bakes all dependencies so pod setup takes <1 min instead of 20+ min.
+# Based on lmsysorg/sglang which includes PyTorch + CUDA + flashinfer.
+#
+# Build:
+#   cd /path/to/TorchSpec
+#   docker build -t xingh3/torchspec-dflash:latest \
+#     -f docker/sglang/v0.5.8.post1/Dockerfile.runpod .
+#   docker push xingh3/torchspec-dflash:latest
+#
+# RunPod pod setup:
+#   Container Image: xingh3/torchspec-dflash:latest
+#   Container Disk: 100 GB
+#   Volume Disk: optional (for checkpoint persistence)
+#
+# On pod start, just run:
+#   cd /workspace && git clone https://github.com/zhubohao911/TorchSpec.git
+#   cd TorchSpec && git checkout feature/dflash-training
+#   bash scripts/runpod_setup.sh   # SKIP_INSTALL=1 auto-detected if deps exist
+#
+# References:
+#   - scripts/runpod_setup.sh (issues cross-referenced below)
+#   - docs/inference/dflash/dflash_issues.md
+# =============================================================================
 
+ARG SGLANG_IMAGE_TAG=v0.5.8-cu129-amd64
+FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG}
 
 WORKDIR /root/
 
-# Layer 1: System dependencies (stable, small)
+# ── Layer 1: System dependencies (stable, small) ──
+# Issue 3: libibverbs/rdmacm/libnuma required by mooncake-transfer-engine
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         nvtop rsync dnsutils \
@@ -12,7 +40,9 @@ RUN apt-get update && \
         tmux git vim htop && \
     rm -rf /var/lib/apt/lists/*
 
-# Layer 2: SGLang at pinned commit with patch (moderately stable)
+# ── Layer 2: SGLang at pinned commit with patch (moderately stable) ──
+# Issue 2:  SGLang pulls PyTorch 2.9.1 (needed for FlexAttention)
+# Issue 24: SGLang [all] includes flashinfer — no separate install needed
 ARG SGLANG_COMMIT=0f2df9370a1de1b4fb11b071d39ab3ce2287a350
 COPY patches/sglang/v0.5.8.post1/sglang.patch /sgl-workspace/
 RUN rm -rf /sgl-workspace/sglang && \
@@ -20,32 +50,52 @@ RUN rm -rf /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
     git fetch --depth=1 origin $SGLANG_COMMIT && \
     git checkout $SGLANG_COMMIT && \
+    # Remove conflicting file BEFORE patch (per dflash_runpod_guide.md)
+    rm -f python/sglang/srt/speculative/spec_training_info.py && \
     git apply /sgl-workspace/sglang.patch && \
     rm /sgl-workspace/sglang.patch && \
-    cd python && pip install -e .
+    # Install with [all] extras to get flashinfer + full deps
+    cd python && pip install -e ".[all]"
 
-# Layer 3: flashinfer (stable)
-# Explicitly install flashinfer-jit-cache because it is not directly depended by sglang.
+# ── Layer 3: flashinfer-jit-cache (stable) ──
+# Not directly depended on by sglang but needed at runtime
 RUN pip install flashinfer-jit-cache==0.6.2 --index-url https://flashinfer.ai/whl/cu129
 
-# Layer 4: Pre-download Qwen3-8B model (~16GB, most stable layer)
+# ── Layer 4: Pre-download Qwen3-8B model (~16GB, most stable layer) ──
 # Placed BEFORE code COPY so TorchSpec code changes don't invalidate this layer.
+# Issue 19: Set HF_HOME early so model lands in the right cache dir
+ENV HF_HOME=/root/models/huggingface
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-8B', cache_dir='/root/models/huggingface')" && \
+snapshot_download('Qwen/Qwen3-8B', cache_dir='$HF_HOME')" && \
     rm -rf /root/.cache/pip
 
-# Layer 5: TorchSpec code and dependencies (changes most frequently)
+# ── Layer 5: TorchSpec code and dependencies (changes most frequently) ──
 COPY . /root/torchspec
 RUN pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base -y 2>/dev/null; \
     cd /root/torchspec && pip install --no-cache-dir -e ".[fa,dev]"
 
-# Layer 6: Mooncake binary permission fix
+# ── Layer 6: Mooncake binary permission fix ──
+# From Dockerfile.runpod (commit 7813f79): mooncake_master needs +x
 RUN chmod 755 /usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master
-# Avoid mooncake modifying the binary permissions.
 RUN sed -i 's/os.chmod(bin_path, 0o755)/pass/' /usr/local/lib/python3.12/dist-packages/mooncake/cli.py
 
-# Pre-downloaded model location
-ENV HF_HOME=/root/models/huggingface
+# ── Layer 7: Issue 19 — HF cache symlink for Ray workers ──
+# Ray workers run as root, look at /root/.cache/huggingface/ by default
+RUN mkdir -p /root/.cache && \
+    ln -sf "$HF_HOME" /root/.cache/huggingface
+
+# ── Layer 8: Environment variables ──
+# Issue 23: PyTorch 2.9+ renamed PYTORCH_CUDA_ALLOC_CONF
+# Issue 26: GEMM backend fix (also set in train_entry.py via setdefault)
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
+ENV TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON
+
+# ── Layer 9: Write .env.runpod for scripts ──
+RUN echo '# Auto-generated by Dockerfile — sourced by runpod_phase_c.sh\n\
+export HF_HOME=/root/models/huggingface\n\
+export PYTORCH_ALLOC_CONF=expandable_segments:True\n\
+export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON' \
+    > /root/torchspec/.env.runpod
 
 WORKDIR /root/torchspec
