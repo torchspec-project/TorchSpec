@@ -197,41 +197,55 @@ Loss starts ~12.7, drops monotonically. No NaN, no zero-loss steps. Speed ~5 ste
 | S3 | 4 | 1 | 512 | **OOM** | Backward alloc 9.27 GB |
 | S3b | 2 | 2 | 256 | **1.0** | OK |
 
-### Key Finding: Pipeline Bottleneck
+### Key Finding: Compute + Data Pipeline Both Contribute
 
-**All configs converge to ~1.0 step/s regardless of DFlash hyperparameters.** The bottleneck is the inference→training pipeline (Mooncake KV transfer + Ray actor dispatch), not DFlash compute.
+**All configs converge to ~1.0 step/s regardless of DFlash hyperparameters.** Instrumented timing breakdown (steps 10-30 averages) reveals:
 
-**Evidence:**
-1. **Training compute is fast**: `T=6-15ms` per batch in training log, but step cycle is ~1000ms
-2. **GPU utilization is near-zero**: nvidia-smi snapshot during training shows 0% on all GPUs — they idle between pipeline cycles
-3. **Anchors don't matter**: 512→256 halves FlexAttention work but yields identical step/s
-4. **Colocate mode is 5x faster**: 1-GPU colocate (Phase D) achieved ~5 step/s by avoiding Mooncake/Ray overhead entirely
+### Timing Breakdown (measured, batch=2, accum=2, anchors=512, seq=2048)
 
-### Pipeline Overhead Breakdown (estimated)
+| Component | Time (s) | % of Step | Notes |
+|-----------|----------|-----------|-------|
+| **GPU compute** (forward+backward+optimizer) | **0.68** | **~70%** | Includes FlexAttention, CE loss, FSDP allreduce |
+| **Data pipeline** (Mooncake queue fetch) | **0.40** | **~30%** | Waiting for hidden states from inference engine |
+| **Ray dispatch** | **0.07** | **~7%** | Negligible |
+| **Total step time** | **~0.95** | — | data + compute overlap, so sum > 100% |
 
-| Component | Time (ms) | % of Step |
-|-----------|-----------|-----------|
-| Mooncake KV transfer (hidden states GPU→GPU) | ~300-500 | 30-50% |
-| Ray actor dispatch + result collection | ~200-300 | 20-30% |
-| SGLang prefill (target model forward) | ~150-200 | 15-20% |
-| DFlash training forward+backward | ~6-15 | <2% |
-| Other overhead (scheduling, queueing) | ~100-200 | 10-20% |
+Note: `data_time + compute_time > step_time` because data fetching overlaps with GPU compute (async pipeline). The "ray_overhead" column is negative, confirming overlap.
+
+**Raw timing data (every 5th step):**
+
+| Step | step_time | data_time | compute_time | dispatch_wait |
+|------|-----------|-----------|--------------|---------------|
+| 1 | 6.306s | 0.322s | 5.988s | 33.779s |
+| 2 | 1.041s | 0.384s | 0.782s | 0.063s |
+| 5 | 0.908s | 0.422s | 0.537s | 0.060s |
+| 10 | 0.936s | 0.386s | 0.673s | 0.071s |
+| 15 | 0.922s | 0.275s | 0.739s | 0.057s |
+| 20 | 1.134s | 0.382s | 0.884s | 0.071s |
+| 25 | 0.595s | 0.353s | 0.444s | 0.073s |
+| 30 | 1.092s | 0.618s | 0.658s | 0.070s |
+
+Step 1 is warmup (torch.compile JIT). Steps 2-30 show ~1.0s/step steady state.
+
+**Why anchors=512 vs 256 doesn't matter**: Both produce ~0.6-0.9s compute — FlexAttention is not the dominant cost within compute. FSDP allreduce and optimizer step may dominate.
+
+**Why 1-GPU colocate is 5x faster**: Colocate avoids the 0.4s data_time (no Mooncake transfer) and may have lower FSDP overhead (no multi-GPU allreduce). Target model runs on the same GPU, so hidden states are already in local GPU memory.
 
 ### Recommendations for Speed Improvement
 
-| Priority | Approach | Expected Impact |
-|----------|----------|-----------------|
-| **P0** | Bypass Mooncake — use shared GPU memory or colocate mode for KV transfer | 3-5x speedup |
-| **P1** | Increase `max_concurrent_batches` to overlap inference and training | Up to 2x |
-| **P1** | Increase inference throughput (batch_size, max_running_requests) | 1.5-2x if inference is sub-saturated |
-| **P2** | Enable FSDP CPU offload to fit batch=4 + anchors=512 | Enables larger batches |
-| **P2** | Profile Mooncake transfer vs Ray dispatch to isolate dominant overhead | Identifies optimization target |
+| Priority | Approach | Expected Impact | Rationale |
+|----------|----------|-----------------|-----------|
+| **P0** | Reduce compute_time: profile forward vs backward vs optimizer breakdown | 1.5-2x | Compute is 70% of step — biggest lever |
+| **P0** | Bypass Mooncake for same-node — use NCCL or shared GPU memory | 1.3-1.5x | data_time is 30% of step |
+| **P1** | Increase `max_concurrent_batches` to overlap inference+training | Up to 1.5x | Pipeline already overlaps partially |
+| **P1** | Enable FSDP CPU offload to fit batch=4+anchors=512 | May help if compute scales sublinearly with batch | Needs testing |
+| **P2** | Use colocate mode if memory allows | 3-5x (eliminates data_time + reduces FSDP overhead) | But OOM risk with 8B target + draft on same GPU |
 
 ### Training Time Estimate
 
 With current 1.0 step/s:
 - 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~10.4 hours**
-- With P0 fix (3-5x): **2-3.5 hours**
+- With P0 fixes (compute + data, ~2x): **~5 hours**
 
 ---
 

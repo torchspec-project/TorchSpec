@@ -142,30 +142,28 @@ This resolves both the speed regression AND the `NoValidChoicesError` in FlexAtt
 | S3 | 4 | 1 | 512 | **OOM** | — | — | Backward alloc 9.27 GB failed |
 | S3b | 2 | 2 | 256 | **1.0** | ~13 GB | 57.3 GB | Anchors don't matter |
 
-**Key finding: All configs converge to ~1.0 step/s.** The bottleneck is NOT DFlash compute (T=6-15ms per training batch) but the **inference→training pipeline** (Mooncake KV transfer + Ray actor overhead ≈ 1000ms per cycle).
-
-Evidence:
-- `avg training=1.9 entries/s` vs `avg inference=2.2 entries/s` — training throughput limited by pipeline feed rate
-- GPU utilization snapshot: GPU 0-1 (training) at **0%**, GPU 2 (inference) at **0%** — GPUs idle between pipeline cycles
-- `wait=0.0-0.1s` in training log — training never waits for data, but each cycle takes ~1s due to pipeline overhead
-- Reducing anchors from 512→256 halves FlexAttention compute but yields identical step/s — confirming compute is not the bottleneck
+**Key finding: All configs converge to ~1.0 step/s.** Instrumented timing breakdown (steps 10-30):
+- **GPU compute: ~0.68s (70%)** — forward+backward+optimizer (FlexAttention + FSDP allreduce)
+- **Data pipeline: ~0.40s (30%)** — Mooncake KV queue fetch (overlaps partially with compute)
+- **Ray dispatch: ~0.07s (7%)** — negligible
+- Reducing anchors 512→256 yields identical step/s — FlexAttention is not the dominant compute cost
 
 **Comparison**:
-- 1-GPU colocate (Phase D smoke test): **~5 step/s** — no Mooncake/Ray overhead
-- 4-GPU SGLang mode: **~1.0 step/s** — 5x slower due to pipeline overhead
+- 1-GPU colocate (Phase D smoke test): **~5 step/s** — no Mooncake + no multi-GPU FSDP overhead
+- 4-GPU SGLang mode: **~1.0 step/s** — compute and data pipeline both contribute
 - Training time estimate for 50K×6 epochs: **~10 hours** at 1.0 step/s (37,500 optimizer steps)
 
-**Bottleneck analysis**: See [Speed Investigation Summary](dflash_training_results.md#phase-e-speed-benchmark) for detailed breakdown and recommendations.
+**Detailed analysis**: See [Speed Investigation Summary](dflash_training_results.md#phase-e-speed-benchmark) for raw timing data.
 
 ### 2.3 Speed Improvement Recommendations
 
-| Priority | Approach | Expected Impact | Effort |
-|----------|----------|-----------------|--------|
-| **P0** | Reduce pipeline overhead (Mooncake→shared memory, or colocate mode) | 3-5x speedup | High — requires architecture change |
-| **P1** | Increase inference batch size / max_running_requests | 1.5-2x if inference is sub-saturated | Low — config change |
-| **P1** | Use `max_concurrent_batches > 1` to overlap inference+training | Up to 2x | Medium — may need tuning |
-| **P2** | FSDP CPU offload (`fsdp_cpu_offload: true`) to fit batch=4+anchors=512 | Enables larger batches | Low — config flag |
-| **P2** | Profile Mooncake KV transfer latency vs Ray actor dispatch | Identifies dominant overhead | Medium — instrumentation |
+| Priority | Approach | Expected Impact | Rationale |
+|----------|----------|-----------------|-----------|
+| **P0** | Profile compute breakdown (forward vs backward vs optimizer vs FSDP allreduce) | 1.5-2x | Compute is 70% — biggest lever |
+| **P0** | Bypass Mooncake for same-node transfer (use NCCL/shared memory) | 1.3-1.5x | data_time is 30% of step |
+| **P1** | Increase `max_concurrent_batches` to better overlap inference+training | Up to 1.5x | Pipeline already partially overlaps |
+| **P1** | FSDP CPU offload to fit batch=4+anchors=512 | May help if compute scales sublinearly | Needs testing |
+| **P2** | Colocate mode if memory allows | 3-5x (eliminates data_time + FSDP overhead) | OOM risk with 8B target + draft on same GPU |
 
 ---
 
