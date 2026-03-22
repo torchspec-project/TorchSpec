@@ -59,39 +59,34 @@ fi
 # Step 4: Launch training
 echo ""
 echo "=== Step 4: Launch DFlash training ==="
-echo "Config: 4x H100, 2 inference + 2 training"
+echo "Config: 4x H100, 1 inference + 3 training (FULL_SHARD)"
 echo "Dataset: $DATA_FILE (50K samples)"
-echo "Epochs: 6, LR: 6e-4, block_size: 16"
+echo "Epochs: 2, LR: 6e-4, block_size: 16"
 echo ""
 
 OUTPUT_DIR="./outputs/qwen3-8b-dflash-phase-c"
+CHECKPOINT_DIR="$OUTPUT_DIR/checkpoints"
 mkdir -p "$OUTPUT_DIR"
 
-# Use the SGLang 4-GPU config with training overrides
+# Build resume args if checkpoint exists
+RESUME_ARGS=""
+if [ -d "$CHECKPOINT_DIR" ] && ls "$CHECKPOINT_DIR"/iter_* >/dev/null 2>&1; then
+    echo "Resuming from checkpoint: $(ls -d "$CHECKPOINT_DIR"/iter_* | tail -1)"
+    RESUME_ARGS="training.load_path=$CHECKPOINT_DIR"
+fi
+
+# All settings in YAML — only override dataset path and output_dir
 python3 -m torchspec.train_entry \
     --config configs/sglang_qwen3_8b_dflash.yaml \
     dataset.train_data_path="$DATA_FILE" \
     dataset.eval_data_path=null \
     dataset.eval_interval=0 \
-    training.training_num_gpus_per_node=2 \
-    training.max_seq_length=4096 \
-    training.micro_batch_size=4 \
-    training.learning_rate=6e-4 \
-    training.warmup_ratio=0.04 \
-    training.max_grad_norm=1.0 \
-    training.num_epochs=6 \
-    training.save_per_epoch=true \
-    training.dflash_block_size=16 \
-    training.dflash_num_anchors=512 \
-    training.dflash_loss_decay_gamma=7.0 \
-    inference.inference_num_gpus=2 \
-    inference.inference_num_gpus_per_engine=1 \
-    inference.inference_num_gpus_per_node=2 \
     output_dir="$OUTPUT_DIR" \
+    $RESUME_ARGS \
     2>&1
 
 echo ""
 echo "=== Training Complete ==="
 echo "Timestamp: $(date)"
 echo "Output: $OUTPUT_DIR"
-ls -la "$OUTPUT_DIR/checkpoints/" 2>/dev/null || echo "No checkpoints found"
+ls -la "$CHECKPOINT_DIR/" 2>/dev/null || echo "No checkpoints found"

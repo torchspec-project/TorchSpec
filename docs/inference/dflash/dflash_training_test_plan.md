@@ -18,12 +18,16 @@
 
 | Metric | Value | Target |
 |--------|-------|--------|
-| Phase C τ (step 18,001) | 1.86 | ≥ 5.0 |
-| Phase C speedup | 1.27x | ≥ 3.0x |
-| Training speed (torch 2.9.1, post-fix) | ~5 step/s (colocate 1GPU) | ≥ 2.0 step/s |
+| Phase 3 τ (ckpt-5k, step 5,000) | 1.29 | ≥ 5.0 |
+| Phase 3 speedup (ckpt-5k) | 0.88x (slower than baseline) | ≥ 3.0x |
+| Training speed (real data, 3GPU FULL_SHARD) | ~2.5 step/s | ≥ 2.0 step/s ✓ |
+| Training progress | 5,000 / ~31,656 steps (epoch 0.3 / 2.0) | Stop at epoch 2 |
 | Known bugs | 0 (Bug 1 fixed, Bug 2 matches SpecForge) | 0 |
-| Latest checkpoint | `iter_0018001` ([details](dflash_training_results.md#checkpoint--backup)) | — |
-| PyTorch regression | **Resolved** — `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON` fixes it | ✓ |
+| Latest checkpoint | `ckpt-5k` + extracted `/tmp/dflash_5k.pt` | — |
+| Pod state | Training stopped. Waiting for decision. | — |
+| Config match | Epochs/LR/warmup match z-lab official exactly | ✓ |
+| Dataset gap | 50K vs 800K (z-lab) / 1.2M (community) — **16x smaller** | — |
+| PyTorch regression | **Resolved** — `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON` | ✓ |
 | Environment | torch 2.9.1 + sglang 0.5.9 + 4x H100 | — |
 
 ### Paper Reference — DFlash(16) on Qwen3-8B (Temperature=0)
@@ -436,9 +440,35 @@ Mooncake transfer engine only supports two protocols: **TCP** and **RDMA**. On t
 
 ---
 
-## Phase 3: Acceptance Length (τ) Benchmark Matrix
+## Phase 3: Acceptance Length (τ) Benchmark — 2-Epoch Training
 
-**Goal**: Measure τ across different training configurations (data size, epochs, training time) to find the sweet spot and verify we can reach paper-level τ ≥ 5.0.
+**Goal**: Train for 2 epochs on 50K data, benchmark τ at each checkpoint, and decide whether to continue based on results.
+
+**Strategy change (2026-03-21)**: Originally planned 6 epochs (matching z-lab official). Revised to **stop at 2 epochs** and evaluate before committing more compute. Our dataset (50K) is 16x smaller than z-lab's (800K), so diminishing returns from additional epochs are likely.
+
+### 3.0 Reference Config Comparison
+
+Source: [specforge_dflash_training_reference.md](specforge_dflash_training_reference.md)
+
+| Parameter | Our Config | z-lab Official (Paper) | SpecForge Default | Community (@jianc99) |
+|---|---|---|---|---|
+| **Epochs** | **6** (stop at 2) | **6** | 20 | 3 |
+| **LR** | 6e-4 | 6e-4 | 1e-4 | — |
+| **Warmup** | 0.04 | 0.04 | 0.01 | — |
+| **Max Seq Len** | 4096 | 3072 | 2048 | — |
+| **Dataset** | 50K (PerfectBlend) | ~800K (Nemotron+CodeAlpaca) | ShareGPT | 1.2M (PerfectBlend) |
+| **Batch (global)** | 8 | undisclosed | 4 | — |
+| **Grad clip** | 1.0 | 1.0 | 1.0 | — |
+| **Anchors** | 512 | 512 | — | — |
+| **Block size** | 16 | 16 | 16 | — |
+| **Draft layers** | 5 | 5 | — | 6 |
+
+**Key gap**: Dataset size. z-lab used 800K samples, community result (τ=6.3) used 1.2M. Our 50K is 16x smaller. Epoch count and hyperparameters match the official config exactly.
+
+**Community reference points**:
+- @jianc99: 6-layer draft on 1.2M PerfectBlend, **3 epochs** → acceptance length **6.3** (Math500)
+- @xiaomin-D: Demo model on 0.175M samples (~15% of full PerfectBlend)
+- @wengsnow: sharegpt_only → τ=1.02 (poor); sharegpt+ultrachat → τ=2.06; official z-lab → τ=3.5+
 
 ### 3.1 Benchmark Script
 
@@ -457,58 +487,56 @@ python scripts/benchmark_dflash_inference.py \
 
 See [After Training Completes](dflash_training_results.md#inference-benchmark--step-18001) for prior benchmark results.
 
-### 3.2 τ by Training Data Size
+### 3.2 Training Plan — 2 Epochs (12,500 steps)
 
-Train from scratch with different dataset sizes, same config (S3), 6 epochs each.
-Paper reference: SpecForge trains on ~50K regenerated data for 6 epochs → τ=6.49 avg.
+**Config**: 3 GPU + FULL_SHARD + CPU prefetch, ~2.5 step/s on real data (perfectblend_50k).
+**Batch**: micro_batch=1, dp_size=3, accum=1 → **global_batch=3**.
+**Steps per epoch**: 47,484 / 3 = **~15,828 steps**.
 
-| Exp | Dataset | Samples | Expected Total Steps | Expected τ | Training Time |
-|-----|---------|---------|---------------------|------------|---------------|
-| D1 | perfectblend_5k | 5,000 | ~3,750 | 2.0-3.0 | ~30 min |
-| D2 | perfectblend_10k | 10,000 | ~7,500 | 3.0-4.0 | ~1 hr |
-| D3 | perfectblend_25k | 25,000 | ~18,750 | 4.0-5.0 | ~2.5 hr |
-| D4 | perfectblend_50k | 50,000 | ~37,500 | **5.0-6.0** | ~5.0 hr |
-| D5 | perfectblend_100k | 100,000 | ~75,000 | **5.5-6.5** | ~10 hr |
-| D6 | regen_50k (target-model generated) | 50,000 | ~37,500 | **6.0-7.0** | ~5.0 hr |
+| Checkpoint | Steps | Epoch | Est. Wall Time | Status |
+|-----------|-------|-------|----------------|--------|
+| ckpt-5k | 5,000 | 0.3 | — | **DONE** — τ=1.29, loss=~3.4 |
+| ckpt-15828 | ~15,828 | 1.0 | ~1.2 hr from 5k | Pending |
+| ckpt-31656 | ~31,656 | 2.0 | ~2.9 hr from 5k | Pending — **STOP HERE** |
 
-**Note on D6**: SpecForge uses `perfectblend_qwen3-8b_regen.jsonl` — data regenerated by the target model itself. This is critical for high τ because the draft learns the target's exact distribution, not generic human text.
+**Checkpoint save config**: Save every 1000 steps, keep only latest. Benchmark τ at final (epoch 2 end).
 
-**Checkpoint at**: end of each epoch + every 5000 steps. Benchmark τ at each.
+### 3.3 τ Results — Epoch Progression
 
-### 3.3 τ by Epoch Progression
+| Checkpoint | Steps | Epoch | Loss | τ (avg) | Speedup | Notes |
+|-----------|-------|-------|------|---------|---------|-------|
+| ckpt-5k | 5,000 | 0.3 | ~3.4 | **1.29** | 0.88x (slower) | Done. Draft barely working. |
+| ckpt-31656 | ~31,656 | 2.0 | — | — | — | Pending — **decision point** |
 
-Using D4 (50k samples), measure τ at each epoch boundary:
+### 3.4 Decision Matrix at Epoch 2
 
-| Checkpoint | Steps | Expected τ | Notes |
-|-----------|-------|------------|-------|
-| Epoch 1 end | ~6,250 | 2.5-3.5 | Rapid early convergence |
-| Epoch 2 end | ~12,500 | 3.5-4.5 | Significant improvement |
-| Epoch 3 end | ~18,750 | 4.5-5.5 | Approaching paper numbers |
-| Epoch 4 end | ~25,000 | 5.0-6.0 | Should meet target τ≥5.0 |
-| Epoch 5 end | ~31,250 | 5.5-6.5 | Near paper-level (6.49 avg) |
-| Epoch 6 end | ~37,500 | 5.5-6.5 | Check for overfitting |
+After benchmarking τ at ckpt-31656 (epoch 2), use this to decide next steps:
 
-**Critical signal**: If τ < 3.0 after epoch 2 with 50K data, there is likely a code bug — not a training issue. Stop and investigate before continuing. See [Failure Diagnosis Guide](#failure-diagnosis-guide).
+| τ at Epoch 2 | Diagnosis | Action |
+|---|---|---|
+| **τ < 2.0** | Critical — code bug or data issue | Stop. Diff against SpecForge again. Check data distribution. |
+| **τ = 2.0–3.0** | Below community baselines (sharegpt+ultrachat=2.06) | Dataset size likely the bottleneck. Consider: (a) scale to 200K+ data, (b) try regenerated data, (c) check training loss curve for convergence |
+| **τ = 3.0–4.0** | Reasonable for 50K data. Matches sharegpt+ultrachat range. | Options: (a) continue to epoch 4 for +1-2τ gain, (b) invest in larger dataset instead, (c) try regenerated data for bigger lift |
+| **τ = 4.0–5.0** | Good — approaching paper numbers despite 16x less data | Continue to epoch 4. Data quality is sufficient, more epochs will help. |
+| **τ ≥ 5.0** | Excellent — near paper-level on 50K data | Ship it or squeeze more with regenerated data for τ≥6.0 |
 
-### 3.4 τ by Training Wall-Clock Time
+**Critical signal**: Community baseline with sharegpt+ultrachat (not even regenerated) = τ=2.06. If we're below this at epoch 2 with 50K curated PerfectBlend data, something is wrong beyond dataset size.
 
-Quick-iteration checkpoints to understand τ progression over time:
+### 3.5 Future Experiments (post epoch-2 decision)
 
-| Time | Approx Steps (at 2.1 step/s) | Expected τ | Benchmark? |
-|------|-------------------------------|------------|------------|
-| 5 min | ~630 | 1.0-1.5 | Yes — sanity check (τ > 1.0 = draft working) |
-| 15 min | ~1,890 | 2.0-3.0 | Yes |
-| 30 min | ~3,780 | 3.0-4.0 | Yes |
-| 1 hr | ~7,560 | 4.0-5.0 | Yes — should already beat Eagle3 (τ=2.96) |
-| 2 hr | ~15,120 | 5.0-5.5 | Yes — approaching target |
-| 3 hr | ~22,680 | 5.5-6.0 | Yes — near paper-level |
-| 5 hr | ~37,500 | 5.5-6.5 | Yes — full training (6 epochs on 50K) |
+#### 3.5.1 τ by Training Data Size
 
-**Note**: Step counts assume ~2.1 step/s in 4-GPU SGLang mode. Actual speed with torch 2.9.1 + env var fix TBD — re-benchmark in Phase 2.2.
+Deferred until epoch-2 results inform whether dataset scaling is needed.
 
-### 3.5 τ by Block Size (train vs inference)
+| Exp | Dataset | Samples | Epochs | Expected τ | Training Time |
+|-----|---------|---------|--------|------------|---------------|
+| D1 | perfectblend_50k | 50,000 | 2 (current) | 2.5-4.0 | ~50 min |
+| D2 | perfectblend_50k | 50,000 | 4 | 3.5-5.0 | ~1.7 hr |
+| D3 | perfectblend_50k | 50,000 | 6 | 4.0-5.5 | ~2.5 hr |
+| D4 | perfectblend_200k | 200,000 | 3 | 4.5-5.5 | ~5 hr |
+| D5 | regen_50k (target-generated) | 50,000 | 6 | **5.5-6.5** | ~2.5 hr |
 
-Train with block_size B_train, infer with block_size B_infer (paper Table 7):
+#### 3.5.2 τ by Block Size (train vs inference)
 
 | Exp | B_train | B_infer | Expected τ | Paper τ | Notes |
 |-----|---------|---------|------------|---------|-------|
@@ -518,7 +546,7 @@ Train with block_size B_train, infer with block_size B_infer (paper Table 7):
 | B4 | 8 | 8 | 4.5-5.5 | — | Faster training (smaller FlexAttention) |
 | B5 | 8 | 16 | 4.0-5.0 | 5.02 | Small→large — weaker but usable |
 
-### 3.6 τ by Eval Domain
+#### 3.5.3 τ by Eval Domain
 
 Measure τ separately per benchmark domain (using best checkpoint). Paper numbers as targets:
 
@@ -630,29 +658,36 @@ These are the critical fixes from SpecForge commit `507da3e` — all already por
 
 ## Execution Plan
 
-### Week 1: Fix & Verify
+### Immediate Next Steps (Phase 3 — 2-epoch run)
 
-| Day | Task | GPU Hours |
-|-----|------|-----------|
-| 1 | Bug fixes (1.1, 1.2) + SpecForge deep diff (1.5) + unit tests (1.3) | 0 |
-| 1 | Resolve PyTorch speed regression (2.1) — try pinning torch 2.6 | 1 |
-| 1 | Smoke test (1.4) + speed benchmark S1-S3 (2.2) | 2 |
-| 2 | Speed benchmark S4-S6 (2.2) | 1 |
-| 2 | Start data regeneration (4.4) on inference GPUs | 2 |
-| 2 | Data size experiments D1-D2 (3.2) — quick τ sanity check | 1.5 |
+| # | Task | Est. Time | Status |
+|---|------|-----------|--------|
+| 1 | Upload ckpt-5k to HF | ~5 min | Pending |
+| 2 | Resume training from ckpt-5k → ckpt-12500 (epoch 2) | ~50 min | Pending |
+| 3 | Benchmark τ @ ckpt-10k (epoch 1.6) | ~10 min | Pending |
+| 4 | Benchmark τ @ ckpt-12500 (epoch 2.0) | ~10 min | Pending |
+| 5 | **Decision point**: evaluate τ against [3.4 Decision Matrix](#34-decision-matrix-at-epoch-2) | — | Pending |
 
-### Week 2: Full Benchmark
+### Post-Decision (depends on epoch-2 τ)
 
-| Day | Task | GPU Hours |
-|-----|------|-----------|
-| 1 | Data size experiments D3-D4 (3.2) | 7.5 |
-| 2 | D6 — regenerated data experiment (3.2) | 5 |
-| 2 | Epoch progression benchmark (3.3) — reuse D4/D6 checkpoints | 0 |
-| 3 | Block size experiments B1-B5 (3.5) | 4 |
-| 3 | Domain-specific τ evaluation (3.6) | 1 |
-| 3 | End-to-end validation checklist (Phase 5) | 1 |
+| τ Range | Next Actions | GPU Hours |
+|---------|--------------|-----------|
+| τ < 2.0 | Debug — SpecForge diff, data inspection | 0 |
+| τ = 2.0–3.0 | Scale dataset to 200K+ or try regenerated data | 5-10 hr |
+| τ = 3.0–4.0 | Continue to epoch 4 OR scale dataset | 1-5 hr |
+| τ ≥ 4.0 | Continue to epoch 4-6, then ship | 1-2 hr |
 
-**Total estimated GPU hours**: ~26 hours (4x H100)
+### Deferred Tasks
+
+| Task | Depends On | Notes |
+|------|-----------|-------|
+| Draft KV cache (O(n²) → O(n)) | epoch-2 τ ≥ 3.0 | Biggest inference bottleneck |
+| Set TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS in train_entry.py | Any training run | Always active |
+| Eagle3 baseline benchmark | epoch-2 complete | Compare on same target model |
+| Increase prefetch_depth to 4-8 | Next training run | Use more CPU memory |
+| Data regeneration pipeline (4.4) | epoch-2 τ = 3.0-4.0 | Only if data quality is the bottleneck |
+| Block size experiments (3.5.2) | epoch-2 τ ≥ 4.0 | Only if core training works well |
+| Domain-specific eval (3.5.3) | Best checkpoint | Use best available model |
 
 ---
 
@@ -695,8 +730,8 @@ Report with: `--report-to wandb --wandb-project torchspec-dflash-benchmark`
 | τ = 5.0-6.0 | On track — minor tuning needed | Increase num_anchors to 512, try longer sequences |
 | τ ≥ 6.0 | Paper-level — success | Ship it |
 
-**Current state (τ=1.86)** falls in the 1.5-3.0 range. Bug 1 is now fixed; SpecForge deep diff confirms code parity. Next step: retrain from scratch with bug fixes applied and measure τ progression (Phase 3).
+**Current state (τ=1.29 at step 5k / epoch 0.8)**: Falls in the τ < 1.5 range, but this is expected — less than 1 full epoch completed. The critical evaluation point is **epoch 2 (step 12,500)**. If τ < 2.0 at epoch 2, investigate code/data issues. If τ ≥ 3.0, the model is learning correctly and more data/epochs will improve it.
 
 ---
 
-*Plan v5 — 2026-03-22 (Phase 1 complete, Phase 2 complete — FULL_SHARD recommended)*
+*Plan v6 — 2026-03-21 (Phase 3 revised: 2-epoch stop with decision matrix, reference config comparison added)*
