@@ -7,6 +7,7 @@
 ### Option A: Custom Docker Image (Recommended — <1 min setup)
 
 **1. Build & push image** (one-time, from your local machine):
+
 ```bash
 cd /path/to/TorchSpec
 
@@ -25,14 +26,17 @@ docker push xingh3/torchspec-dflash:slim
 
 **2. Create RunPod pod:**
 
-| Setting | Value |
-|---------|-------|
+
+| Setting         | Value                                         |
+| --------------- | --------------------------------------------- |
 | Container Image | `xingh3/torchspec-dflash:latest` (or `:slim`) |
-| GPUs | 4x H100 80GB |
-| Container Disk | **100 GB** |
-| Volume Disk | Optional (checkpoint persistence) |
+| GPUs            | 4x H100 80GB                                  |
+| Container Disk  | **100 GB**                                    |
+| Volume Disk     | Optional (checkpoint persistence)             |
+
 
 **3. On the pod** (Jupyter terminal or SSH):
+
 ```bash
 cd /workspace
 git clone https://github.com/zhubohao911/TorchSpec.git
@@ -52,14 +56,17 @@ bash scripts/runpod_phase_c.sh 2>&1 | tee /tmp/phase_c.log
 
 **1. Create RunPod pod:**
 
-| Setting | Value |
-|---------|-------|
+
+| Setting         | Value                                                      |
+| --------------- | ---------------------------------------------------------- |
 | Container Image | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` |
-| GPUs | 4x H100 80GB |
-| Container Disk | **100 GB** |
-| Volume Disk | Optional |
+| GPUs            | 4x H100 80GB                                               |
+| Container Disk  | **100 GB**                                                 |
+| Volume Disk     | Optional                                                   |
+
 
 **2. On the pod** (Jupyter terminal or SSH):
+
 ```bash
 cd /workspace
 git clone https://github.com/zhubohao911/TorchSpec.git
@@ -79,24 +86,29 @@ bash scripts/runpod_phase_c.sh 2>&1 | tee /tmp/phase_c.log
 
 ## Pod Requirements
 
-| Spec | Value |
-|------|-------|
-| GPUs | 4x H100 80GB (1 inference + 3 training) |
-| Container Disk | **100 GB** (training needs ~30-40 GB) |
-| Volume Disk | Optional (checkpoint persistence across pods) |
+
+| Spec           | Value                                         |
+| -------------- | --------------------------------------------- |
+| GPUs           | 4x H100 80GB (1 inference + 3 training)       |
+| Container Disk | **100 GB** (training needs ~30-40 GB)         |
+| Volume Disk    | Optional (checkpoint persistence across pods) |
+
 
 ## What Survives Pod Restart
 
-| Survives (`/workspace/`) | Lost (container disk) |
-|---|---|
+
+| Survives (`/workspace/`)             | Lost (container disk)                  |
+| ------------------------------------ | -------------------------------------- |
 | Git repo, checkpoints, training data | All pip packages (unless custom image) |
-| HF model cache | System packages (libibverbs, etc.) |
+| HF model cache                       | System packages (libibverbs, etc.)     |
+
 
 > **After restart**: Run `bash scripts/runpod_setup.sh` — it auto-detects what's missing.
 
 ## SSH Access
 
 RunPod requires a pseudo-terminal. Use `expect`:
+
 ```bash
 expect -c '
 set timeout 60
@@ -113,10 +125,12 @@ Or use the **Jupyter terminal** in the RunPod web UI (no SSH needed).
 
 ## Scripts Reference
 
-| Script | Purpose | When to run |
-|--------|---------|-------------|
-| `scripts/runpod_setup.sh` | Install deps, dataset, checkpoint | Once per new pod |
-| `scripts/runpod_phase_c.sh` | Launch/resume training | After setup |
+
+| Script                      | Purpose                           | When to run      |
+| --------------------------- | --------------------------------- | ---------------- |
+| `scripts/runpod_setup.sh`   | Install deps, dataset, checkpoint | Once per new pod |
+| `scripts/runpod_phase_c.sh` | Launch/resume training            | After setup      |
+
 
 ### `runpod_setup.sh` — What it does
 
@@ -149,24 +163,26 @@ Or use the **Jupyter terminal** in the RunPod web UI (no SSH needed).
 
 All hyperparameters are in `configs/sglang_qwen3_8b_dflash.yaml`:
 
-| Parameter | Value |
-|-----------|-------|
-| Target model | Qwen/Qwen3-8B |
-| Draft model | DFlash (1.05B trainable + 622M frozen embed) |
-| GPUs | 1 inference + 3 training (4x H100) |
-| FSDP | FULL_SHARD, bf16 reduce |
-| micro_batch_size | 1 |
-| accumulation_steps | 4 |
-| global_batch_size | 1 × 3(dp) × 4(accum) = 12 |
-| max_seq_length | 2048 |
-| num_epochs | 2 |
-| learning_rate | 6e-4 |
-| warmup_ratio | 0.04 |
-| prefetch_depth | 8 |
-| save_interval | 1000 (keep latest 1) |
-| num_anchors | 512, block_size | 16 |
-| target_layers | 5 |
-| precision | bf16 |
+
+| Parameter          | Value                                        |
+| ------------------ | -------------------------------------------- |
+| Target model       | Qwen/Qwen3-8B                                |
+| Draft model        | DFlash (1.05B trainable + 622M frozen embed) |
+| GPUs               | 1 inference + 3 training (4x H100)           |
+| FSDP               | FULL_SHARD, bf16 reduce                      |
+| micro_batch_size   | 1                                            |
+| accumulation_steps | 4                                            |
+| global_batch_size  | 1 × 3(dp) × 4(accum) = 12                    |
+| max_seq_length     | 2048                                         |
+| num_epochs         | 2                                            |
+| learning_rate      | 6e-4                                         |
+| warmup_ratio       | 0.04                                         |
+| prefetch_depth     | 8                                            |
+| save_interval      | 1000 (keep latest 1)                         |
+| num_anchors        | 512, block_size                              |
+| target_layers      | 5                                            |
+| precision          | bf16                                         |
+
 
 ---
 
@@ -184,27 +200,32 @@ grep 'Training:' /tmp/phase_c.log | tail -3     # progress bar
 
 ### tmux Cheat Sheet
 
-| Action | Keys |
-|--------|------|
-| Detach (leave running) | `Ctrl+B`, then `D` |
-| New window | `Ctrl+B`, then `C` |
-| Switch windows | `Ctrl+B`, then `0`/`1`/`2` |
-| Reattach | `tmux attach -t train` |
+
+| Action                 | Keys                       |
+| ---------------------- | -------------------------- |
+| Detach (leave running) | `Ctrl+B`, then `D`         |
+| New window             | `Ctrl+B`, then `C`         |
+| Switch windows         | `Ctrl+B`, then `0`/`1`/`2` |
+| Reattach               | `tmux attach -t train`     |
+
 
 ### What to Look For
 
-| Metric | Healthy | Problem |
-|--------|---------|---------|
-| step time | ~1.0 s/step | >2 s/step |
-| loss | Decreasing (10→3 over epoch 1) | Flat or increasing |
-| accuracy | Increasing (0→0.25 over epoch 1) | Stuck at 0 |
-| data_time | <0.7s | >1s consistently |
+
+| Metric    | Healthy                          | Problem            |
+| --------- | -------------------------------- | ------------------ |
+| step time | ~1.0 s/step                      | >2 s/step          |
+| loss      | Decreasing (10→3 over epoch 1)   | Flat or increasing |
+| accuracy  | Increasing (0→0.25 over epoch 1) | Stuck at 0         |
+| data_time | <0.7s                            | >1s consistently   |
+
 
 ---
 
 ## After Training Completes
 
 **1. Extract checkpoint:**
+
 ```bash
 python scripts/extract_dflash_checkpoint.py \
   --checkpoint_dir outputs/qwen3-8b-dflash/checkpoints/iter_NNNNNNN \
@@ -212,6 +233,7 @@ python scripts/extract_dflash_checkpoint.py \
 ```
 
 **2. Benchmark τ:**
+
 ```bash
 python scripts/benchmark_dflash_inference.py \
   --target_model Qwen/Qwen3-8B \
@@ -222,6 +244,7 @@ python scripts/benchmark_dflash_inference.py \
 **3. Target**: τ ≥ 3.0, speedup ≥ 1.5x over baseline.
 
 **4. Upload checkpoint to HF:**
+
 ```bash
 huggingface-cli upload Xingh3/dflash-qwen3-8b-STEP \
   outputs/qwen3-8b-dflash/checkpoints/iter_NNNNNNN/ \
@@ -242,14 +265,17 @@ Resume mechanism: `checkpoint.py` reads `training.load_path` → finds `latest_c
 
 ## Common Pitfalls
 
-| Pitfall | Symptom | Fix |
-|---------|---------|-----|
-| Missing deps on stock image | `No module named 'sglang'` | Run `bash scripts/runpod_setup.sh` |
-| Git files deleted after restart | `No module named torchspec` | `git restore .` (setup script does this) |
-| Missing RDMA libs | `ImportError: libibverbs.so.1` | Setup script installs these (Issue 3) |
-| SGLang patch not applied | `unexpected keyword argument 'enable_aux_hidden_states'` | Re-run setup script |
-| Standard SSH fails | `Your SSH client doesn't support PTY` | Use `expect` or Jupyter terminal |
-| Ray actor timeout (30s) | `GetTimeoutError` during engine init | Setup patches factory.py (Issue 25) |
-| Container disk too small | `No space left on device` | Use 100GB container disk (Issue 5) |
-| Training starts from step 0 | Loss ~10, accuracy 0 | Check checkpoint download in setup |
-| Slow training (~1 s/step) | Expected with Mooncake TCP | See Issue 29 in dflash_issues.md |
+
+| Pitfall                         | Symptom                                                  | Fix                                      |
+| ------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
+| Missing deps on stock image     | `No module named 'sglang'`                               | Run `bash scripts/runpod_setup.sh`       |
+| Git files deleted after restart | `No module named torchspec`                              | `git restore .` (setup script does this) |
+| Missing RDMA libs               | `ImportError: libibverbs.so.1`                           | Setup script installs these (Issue 3)    |
+| SGLang patch not applied        | `unexpected keyword argument 'enable_aux_hidden_states'` | Re-run setup script                      |
+| Standard SSH fails              | `Your SSH client doesn't support PTY`                    | Use `expect` or Jupyter terminal         |
+| Ray actor timeout (30s)         | `GetTimeoutError` during engine init                     | Setup patches factory.py (Issue 25)      |
+| Container disk too small        | `No space left on device`                                | Use 100GB container disk (Issue 5)       |
+| Training starts from step 0     | Loss ~10, accuracy 0                                     | Check checkpoint download in setup       |
+| Slow training (~1 s/step)       | Expected with Mooncake TCP                               | See Issue 29 in dflash_issues.md         |
+
+
