@@ -35,26 +35,39 @@ Usage:
 
     To change GPU type, edit SGLANG_GPU constant at the top of this file.
 
-Recommended parameters (8x H100, best throughput from speed tuning):
+Recommended parameters (8x H100, quality-optimized with anchors=512):
+    --extra-overrides "training.dflash_num_anchors=512 \
+        inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
+
+    Config 512-D: 2 inference + 6 training GPUs, batch=1, accum=4, anchors=512
+    Results: 22-25 samples/s, 457s for 200 steps, most stable step times
+    Quality: anchors=512 matches z-lab recipe for best τ (acceptance length)
+
+    Alternative (fastest overall, anchors=512):
+    --extra-overrides "training.dflash_num_anchors=512 training.micro_batch_size=2 \
+        training.draft_accumulation_steps=2 inference.inference_num_gpus=2 \
+        training.training_num_gpus_per_node=6"
+
+    Config 512-C: 2 inference + 6 training GPUs, batch=2, accum=2, anchors=512
+    Results: 20-25 samples/s, 446s for 200 steps (fastest tested)
+
+    Speed-only (if τ quality not critical):
     --extra-overrides "training.dflash_num_anchors=256 training.micro_batch_size=4 \
         training.draft_accumulation_steps=1 inference.inference_num_gpus=2 \
         training.training_num_gpus_per_node=6"
 
-    Config: 2 inference + 6 training GPUs, batch=4, accum=1, anchors=256
-    Results: 22-25 samples/s, 476s for 200 steps (fastest tested)
-
     Key tuning insights (see dflash_modal_training_results.md):
-      - dflash_num_anchors: 512->256 halves Q_LEN, biggest single speedup
-      - micro_batch_size=4 + accum=1: best GPU utilization per step
-      - inference_num_gpus=2: prevents pool starvation with batch=4
-      - batch=4 + 1 inference GPU starves the sample pool (16-28/64)
-      - batch=1 + anchors=256 is safest (no pool issues, 0.55-0.64s/step)
+      - 2 inference GPUs is essential for anchors=512 (pool starves with 1)
+      - anchors=512 matches anchors=256 speed when using 2 inference GPUs
+      - 512-D (batch=1) has most stable fwd times (305-448ms vs 204-837ms)
+      - 512-C (batch=2) is marginally faster total time but more fwd variance
+      - 1 inference GPU causes pool starvation (12-28/64) for all 512 configs
+      - anchors=256 + batch=4 is fastest but may sacrifice τ quality
 
-    Full training example (200K samples, 3 epochs, best config):
+    Full training example (200K samples, 3 epochs, quality-optimized):
         modal run --detach scripts/modal_dflash_train.py \
             --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
-            --extra-overrides "training.dflash_num_anchors=256 \
-                training.micro_batch_size=4 training.draft_accumulation_steps=1 \
+            --extra-overrides "training.dflash_num_anchors=512 \
                 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 """
 
