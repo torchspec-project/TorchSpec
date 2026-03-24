@@ -1,61 +1,22 @@
 """
-DFlash / Eagle3 training on Modal GPU platform.
+DFlash / Eagle3 training on Modal — HF inference backend (1-2 GPUs).
 
-Ports the RunPod training workflow (runpod_dflash_train.sh + runpod_setup.sh)
-to Modal's serverless GPU infrastructure. The container image is built
-declaratively, and training runs as a subprocess inside a single multi-GPU
-container where Ray manages distributed coordination internally.
+Lightweight variant of modal_dflash_train.py that only provisions 1-2 H100 GPUs
+using the HuggingFace inference backend. Use this for small-scale testing or
+when SGLang is not needed.
 
-Incorporates all fixes from runpod_setup.sh and Dockerfile.runpod:
-    Issue 3:  RDMA libs (libibverbs, librdmacm, libnuma) for Mooncake
-    Issue 19: HF cache symlink for Ray workers
-    Issue 23: PYTORCH_ALLOC_CONF=expandable_segments:True (PyTorch 2.9+)
-    Issue 24: SGLang [all] includes flashinfer — no separate install
-    Issue 26: TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON
-    Mooncake binary chmod + cli.py patch
+For 4+ GPU SGLang training, use modal_dflash_train.py instead.
 
-GPU auto-config (this script — SGLang backend, 4+ GPUs):
-    4 GPUs -> 1 inference + 3 training (FSDP)
-    8 GPUs -> 1 inference + 7 training (FSDP)
-
-For 1-2 GPU HF mode, use modal_dflash_train_hf.py instead.
-
-Setup (one-time):
-    modal token set --token-id ak-l6eYjquYvG1smlyMfH0EKl --token-secret as-eJoVAHKgk0J9iRxNgMNPRJ --profile=doordash
-    modal profile activate doordash
-    modal secret create huggingface-secret HF_TOKEN=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
-    modal secret create wandb-secret WANDB_API_KEY=<key>   # optional
+GPU auto-config:
+    1 GPU  -> HF backend + colocate mode (inference & training share GPU)
+    2 GPUs -> HF backend (1 inference + 1 training)
 
 Usage:
-    modal run scripts/modal_dflash_train.py                                    # 8x H100, 200-step test
-    modal run scripts/modal_dflash_train.py --max-steps 999999 --dataset-size 200000  # full 200K run
-    modal run scripts/modal_dflash_train.py --num-epochs 3 --max-steps 999999  # control epochs
-    modal run scripts/modal_dflash_train.py --gpu-count 4                      # 4-GPU mode
-    modal run --detach scripts/modal_dflash_train.py                           # detached (survives terminal close)
+    modal run scripts/modal_dflash_train_hf.py                         # 2x H100 (default)
+    modal run scripts/modal_dflash_train_hf.py --gpu-count 1           # 1x H100 colocate
+    modal run --detach scripts/modal_dflash_train_hf.py                # detached
 
-    To change GPU type, edit SGLANG_GPU constant at the top of this file.
-
-Recommended parameters (8x H100, best throughput from speed tuning):
-    --extra-overrides "training.dflash_num_anchors=256 training.micro_batch_size=4 \
-        training.draft_accumulation_steps=1 inference.inference_num_gpus=2 \
-        training.training_num_gpus_per_node=6"
-
-    Config: 2 inference + 6 training GPUs, batch=4, accum=1, anchors=256
-    Results: 22-25 samples/s, 476s for 200 steps (fastest tested)
-
-    Key tuning insights (see dflash_modal_training_results.md):
-      - dflash_num_anchors: 512->256 halves Q_LEN, biggest single speedup
-      - micro_batch_size=4 + accum=1: best GPU utilization per step
-      - inference_num_gpus=2: prevents pool starvation with batch=4
-      - batch=4 + 1 inference GPU starves the sample pool (16-28/64)
-      - batch=1 + anchors=256 is safest (no pool issues, 0.55-0.64s/step)
-
-    Full training example (200K samples, 3 epochs, best config):
-        modal run --detach scripts/modal_dflash_train.py \
-            --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
-            --extra-overrides "training.dflash_num_anchors=256 \
-                training.micro_batch_size=4 training.draft_accumulation_steps=1 \
-                inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
+    To change GPU type, edit HF_GPU constant at the top of this file.
 """
 
 from __future__ import annotations
@@ -68,43 +29,36 @@ from typing import Optional
 import modal
 
 # =============================================================================
-# Constants
+# Constants (shared with modal_dflash_train.py)
 # =============================================================================
 
 TORCHSPEC_REPO = "https://github.com/zhubohao911/TorchSpec.git"
 TORCHSPEC_BRANCH = "feature/dflash-training"
-SGLANG_COMMIT = "0f2df9370a1de1b4fb11b071d39ab3ce2287a350"
-SGLANG_PATCH_VERSION = "v0.5.8.post1"
 
 REPO_DIR = "/workspace/TorchSpec"
-SGLANG_DIR = f"{REPO_DIR}/_sglang"
 HF_CACHE_DIR = "/root/.cache/huggingface"
 OUTPUTS_DIR = "/workspace/outputs"
 DATA_DIR = "/workspace/data"
 
-# GPU configuration — edit to change hardware allocation.
-SGLANG_GPU = "H100:8"   # 1 inference + N-1 training (FSDP)
+HF_GPU = "H100:2"
 
 # =============================================================================
 # Modal app + volumes
 # =============================================================================
 
-app = modal.App("torchspec-dflash-training")
+app = modal.App("torchspec-dflash-training-hf")
 
 hf_cache_vol = modal.Volume.from_name("hf-cache", create_if_missing=True)
 outputs_vol = modal.Volume.from_name("torchspec-outputs", create_if_missing=True)
 
 # =============================================================================
-# Container image — base layer shared by all GPU counts
-#
-# Mirrors runpod_setup.sh Steps 3-7 and Dockerfile.runpod Layers 1-8.
+# Container image — base layer (no SGLang needed for HF backend)
 # =============================================================================
 
 base_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
     )
-    # Issue 3: RDMA libs for Mooncake + libcurl for mooncake store + general system deps
     .apt_install(
         "git", "vim", "htop",
         "libibverbs-dev", "librdmacm-dev", "libnuma-dev",
@@ -143,22 +97,18 @@ base_image = (
         "setuptools",
     )
     .run_commands(f"cd {REPO_DIR} && pip install -e '.[dev]'")
-    # Mooncake binary permission fix (from Dockerfile.runpod Layer 6)
     .run_commands(
         "MOONCAKE_DIR=$(python3 -c \"import mooncake, os; print(os.path.dirname(mooncake.__file__))\") && "
         "chmod 755 \"$MOONCAKE_DIR/mooncake_master\" 2>/dev/null || true && "
         "sed -i 's/os.chmod(bin_path, 0o755)/pass/' \"$MOONCAKE_DIR/cli.py\" 2>/dev/null || true",
     )
-    # Issue 19: HF cache symlink so Ray workers find models at /root/.cache/huggingface
     .run_commands(
         "mkdir -p /root/.cache && ln -sf /root/.cache/huggingface /root/.cache/huggingface || true",
     )
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
-            # Issue 23: PyTorch 2.9+ renamed PYTORCH_CUDA_ALLOC_CONF
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            # Issue 26: Fix TorchInductor GEMM backend regression
             "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS": "ATEN,TRITON",
             "TORCHSPEC_LOG_LEVEL": "INFO",
             "HF_HOME": HF_CACHE_DIR,
@@ -166,26 +116,8 @@ base_image = (
     )
 )
 
-# SGLang image: extends base with SGLang from source + patches
-# Mirrors runpod_setup.sh Steps 5-6 and Dockerfile.runpod Layer 2
-sglang_image = (
-    base_image
-    .run_commands(
-        f"git clone https://github.com/sgl-project/sglang.git {SGLANG_DIR}",
-        f"cd {SGLANG_DIR} && git checkout {SGLANG_COMMIT} && git reset --hard HEAD",
-        # Issue 24: SGLang [all] pulls flashinfer — no separate install
-        f"cd {REPO_DIR} && pip install -e '_sglang/python[all]'",
-        # Patch sequence from runpod_setup.sh Step 6:
-        # 1. Remove conflicting spec_training_info.py AFTER install, BEFORE patch
-        # 2. Apply sglang.patch
-        f"rm -f {SGLANG_DIR}/python/sglang/srt/speculative/spec_training_info.py",
-        f"cd {SGLANG_DIR} && git apply "
-        f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/sglang.patch || true",
-    )
-)
-
 # =============================================================================
-# GPU configuration — mirrors the bash script's auto-detect logic
+# GPU configuration — HF backend only (1-2 GPUs)
 # =============================================================================
 
 @dataclass
@@ -197,19 +129,6 @@ class GPUConfig:
 
 
 def _gpu_config(gpu_count: int) -> GPUConfig:
-    if gpu_count >= 4:
-        train_gpus = gpu_count - 1
-        return GPUConfig(
-            mode=f"{gpu_count}gpu (SGLang, 1 inference + {train_gpus} training FSDP)",
-            eagle3_config="configs/sglang_qwen3_8b.yaml",
-            dflash_config="configs/sglang_qwen3_8b_dflash.yaml",
-            overrides=[
-                f"training.training_num_gpus_per_node={train_gpus}",
-                "inference.inference_num_gpus=1",
-                "inference.inference_num_gpus_per_engine=1",
-                f"inference.inference_num_gpus_per_node={gpu_count}",
-            ],
-        )
     if gpu_count == 2:
         return GPUConfig(
             mode="2gpu (HF backend, 1 inference + 1 training)",
@@ -237,7 +156,7 @@ def _gpu_config(gpu_count: int) -> GPUConfig:
 
 
 # =============================================================================
-# Training runner — executed inside the Modal container
+# Training runner
 # =============================================================================
 
 def _run_training(
@@ -312,9 +231,7 @@ def _run_training(
 
 
 # =============================================================================
-# Modal function — SGLang backend (4+ GPUs)
-#
-# For 1-2 GPU HF mode, use modal_dflash_train_hf.py instead.
+# Modal function — HF backend (1-2 GPUs)
 # =============================================================================
 
 _common_kwargs = dict(
@@ -330,8 +247,8 @@ _common_kwargs = dict(
 )
 
 
-@app.function(image=sglang_image, gpu=SGLANG_GPU, **_common_kwargs)
-def train_sglang(
+@app.function(image=base_image, gpu=HF_GPU, **_common_kwargs)
+def train_hf(
     gpu_count: int,
     max_steps: int,
     num_epochs: Optional[int],
@@ -342,86 +259,7 @@ def train_sglang(
     dataset_size: int,
     extra_overrides: Optional[str] = None,
 ):
-    """Training entry point for 4+ GPU configs (SGLang inference backend)."""
-    _train_impl(
-        gpu_count, max_steps, num_epochs, run_eagle3, run_dflash,
-        wandb_project, dataset_path, dataset_size, extra_overrides,
-    )
-
-
-def _probe_rdma():
-    """Probe for RDMA/InfiniBand devices available in this container."""
-    import os
-    import pathlib
-
-    print("\n  --- RDMA / Network Probe ---")
-
-    ib_dir = pathlib.Path("/dev/infiniband")
-    if ib_dir.exists():
-        devices = list(ib_dir.iterdir())
-        print(f"  /dev/infiniband: {[d.name for d in devices]}")
-    else:
-        print("  /dev/infiniband: NOT FOUND")
-
-    ib_sys = pathlib.Path("/sys/class/infiniband")
-    if ib_sys.exists():
-        devices = list(ib_sys.iterdir())
-        print(f"  /sys/class/infiniband: {[d.name for d in devices]}")
-    else:
-        print("  /sys/class/infiniband: NOT FOUND")
-
-    try:
-        result = subprocess.run(
-            ["ibstat", "-l"], capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            print(f"  ibstat devices: {result.stdout.strip()}")
-        else:
-            print(f"  ibstat: not available (rc={result.returncode})")
-    except FileNotFoundError:
-        print("  ibstat: command not found")
-    except Exception as e:
-        print(f"  ibstat: error — {e}")
-
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            lines = result.stdout.strip().split("\n")
-            for line in lines[:12]:
-                print(f"  {line}")
-            if len(lines) > 12:
-                print(f"  ... ({len(lines) - 12} more lines)")
-    except Exception:
-        pass
-
-    rdma_link = pathlib.Path("/sys/class/net")
-    if rdma_link.exists():
-        roce_devices = []
-        for dev in rdma_link.iterdir():
-            device_path = dev / "device" / "infiniband"
-            if device_path.exists():
-                roce_devices.append(dev.name)
-        if roce_devices:
-            print(f"  RoCE-capable NICs: {roce_devices}")
-        else:
-            print("  RoCE-capable NICs: none found")
-
-    print("  --- End RDMA Probe ---\n")
-
-
-def _train_impl(
-    gpu_count: int,
-    max_steps: int,
-    num_epochs: Optional[int],
-    run_eagle3: bool,
-    run_dflash: bool,
-    wandb_project: Optional[str],
-    dataset_path: Optional[str],
-    dataset_size: int,
-    extra_overrides: Optional[str] = None,
-):
+    """Training entry point for 1-2 GPU configs (HF inference backend)."""
     import os
     import shutil
 
@@ -435,21 +273,17 @@ def _train_impl(
         mem_gb = getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1e9
         print(f"    GPU {i}: {name} ({mem_gb:.1f} GB)")
 
-    _probe_rdma()
-
     os.environ["HF_HOME"] = HF_CACHE_DIR
     os.environ.setdefault(
         "CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(detected))
     )
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{REPO_DIR}/cache/compiled_kernels"
 
-    # Step 13 from runpod_setup.sh: clear stale caches
     for stale_dir in [f"{REPO_DIR}/cache", "/tmp/torchinductor_root"]:
         if os.path.isdir(stale_dir):
             shutil.rmtree(stale_dir, ignore_errors=True)
             print(f"  Cleared stale cache: {stale_dir}")
 
-    # Prepare dataset (mirrors runpod_setup.sh Step 10)
     data_file = dataset_path
     if data_file is None:
         data_file = f"{DATA_DIR}/perfectblend_{dataset_size // 1000}k.jsonl"
@@ -528,7 +362,7 @@ def _train_impl(
 
 @app.local_entrypoint()
 def main(
-    gpu_count: int = 8,
+    gpu_count: int = 2,
     max_steps: int = 200,
     num_epochs: int = 0,
     run_eagle3: bool = False,
@@ -538,18 +372,18 @@ def main(
     dataset_size: int = 50000,
     extra_overrides: str = "",
 ):
-    if gpu_count < 4:
-        print(f"Error: This script requires >= 4 GPUs (got {gpu_count}).")
-        print("  For 1-2 GPU HF mode, use: modal run scripts/modal_dflash_train_hf.py")
+    if gpu_count > 2:
+        print(f"Error: This script supports 1-2 GPUs (got {gpu_count}).")
+        print("  For 4+ GPU SGLang mode, use: modal run scripts/modal_dflash_train.py")
         return
 
     epochs_override = num_epochs if num_epochs > 0 else None
-    train_gpus = gpu_count - 1
+    train_gpus = 1 if gpu_count == 2 else 0
 
     print("=" * 60)
-    print("  DFlash Training on Modal")
+    print("  DFlash Training on Modal (HF Backend)")
     print("=" * 60)
-    print(f"  GPU:          {SGLANG_GPU} (1 infer + {train_gpus} train)")
+    print(f"  GPU:          {HF_GPU} ({'1 infer + 1 train' if gpu_count == 2 else 'colocate'})")
     print(f"  Eagle3:       {'YES' if run_eagle3 else 'SKIP'}")
     print(f"  DFlash:       {'YES' if run_dflash else 'SKIP'}")
     print(f"  Max steps:    {max_steps}")
@@ -564,7 +398,7 @@ def main(
         print("Nothing to run. Pass --run-eagle3 and/or --run-dflash.")
         return
 
-    train_sglang.spawn(
+    train_hf.spawn(
         gpu_count=gpu_count,
         max_steps=max_steps,
         num_epochs=epochs_override,
