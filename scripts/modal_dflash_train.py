@@ -35,6 +35,28 @@ Usage:
     modal run --detach scripts/modal_dflash_train.py                           # detached (survives terminal close)
 
     To change GPU type, edit HF_GPU / SGLANG_GPU constants at the top of this file.
+
+Recommended parameters (8x H100, best throughput from speed tuning):
+    --extra-overrides "training.dflash_num_anchors=256 training.micro_batch_size=4 \
+        training.draft_accumulation_steps=1 inference.inference_num_gpus=2 \
+        training.training_num_gpus_per_node=6"
+
+    Config: 2 inference + 6 training GPUs, batch=4, accum=1, anchors=256
+    Results: 22-25 samples/s, 476s for 200 steps (fastest tested)
+
+    Key tuning insights (see dflash_modal_training_results.md):
+      - dflash_num_anchors: 512->256 halves Q_LEN, biggest single speedup
+      - micro_batch_size=4 + accum=1: best GPU utilization per step
+      - inference_num_gpus=2: prevents pool starvation with batch=4
+      - batch=4 + 1 inference GPU starves the sample pool (16-28/64)
+      - batch=1 + anchors=256 is safest (no pool issues, 0.55-0.64s/step)
+
+    Full training example (200K samples, 3 epochs, best config):
+        modal run --detach scripts/modal_dflash_train.py \
+            --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+            --extra-overrides "training.dflash_num_anchors=256 \
+                training.micro_batch_size=4 training.draft_accumulation_steps=1 \
+                inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 """
 
 from __future__ import annotations
