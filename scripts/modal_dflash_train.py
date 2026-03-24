@@ -335,6 +335,70 @@ def _run_training(
         raise RuntimeError(f"{name} failed with exit code {proc.returncode}")
 
 
+def _convert_and_upload_hf(
+    run_id: str,
+    target_model: str,
+    hf_repo: Optional[str] = None,
+):
+    """Convert final FSDP checkpoint to HF format and optionally push to HuggingFace Hub."""
+    import glob
+    import os
+
+    output_dir = f"{OUTPUTS_DIR}/{run_id}"
+    ckpt_base = f"{output_dir}/checkpoints"
+
+    tracker = os.path.join(ckpt_base, "latest_checkpointed_iteration.txt")
+    if not os.path.isfile(tracker):
+        print(f"\n  [HF Convert] No checkpoint found at {ckpt_base}, skipping conversion.")
+        return
+
+    latest_step = open(tracker).read().strip()
+    ckpt_dir = os.path.join(ckpt_base, f"iter_{int(latest_step):07d}")
+    if not os.path.isdir(ckpt_dir):
+        print(f"\n  [HF Convert] Checkpoint dir {ckpt_dir} not found, skipping.")
+        return
+
+    hf_output = f"{output_dir}/hf_model"
+    print(f"\n  [HF Convert] Converting FSDP checkpoint: {ckpt_dir}")
+    print(f"  [HF Convert] Output: {hf_output}")
+
+    draft_config = f"{REPO_DIR}/torchspec/config/dflash_draft_config.json"
+    cmd = [
+        sys.executable, f"{REPO_DIR}/tools/convert_to_hf.py",
+        "--input-dir", ckpt_dir,
+        "--output-dir", hf_output,
+        "--config", draft_config,
+        "--target-model-path", target_model,
+        "--trust-remote-code",
+        "-f",
+    ]
+    proc = subprocess.run(cmd, cwd=REPO_DIR, capture_output=False)
+    if proc.returncode != 0:
+        print(f"  [HF Convert] WARNING: Conversion failed (exit code {proc.returncode})")
+        return
+
+    print(f"  [HF Convert] Conversion successful: {hf_output}")
+
+    if hf_repo:
+        print(f"  [HF Upload] Pushing to: {hf_repo}")
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.create_repo(hf_repo, exist_ok=True, private=True)
+            api.upload_folder(
+                folder_path=hf_output,
+                repo_id=hf_repo,
+                commit_message=f"DFlash draft model (step {latest_step})",
+            )
+            print(f"  [HF Upload] Done: https://huggingface.co/{hf_repo}")
+        except Exception as e:
+            print(f"  [HF Upload] WARNING: Upload failed: {e}")
+            print(f"  [HF Upload] Model saved locally at {hf_output} on Modal volume.")
+    else:
+        print(f"  [HF Upload] No --hf-repo specified, skipping upload.")
+        print(f"  [HF Upload] To upload later: huggingface-cli upload {hf_output} <repo_id>")
+
+
 # =============================================================================
 # Modal function — SGLang backend (4+ GPUs)
 #
@@ -365,11 +429,12 @@ def train_sglang(
     dataset_path: Optional[str],
     dataset_size: int,
     extra_overrides: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ):
     """Training entry point for 4+ GPU configs (SGLang inference backend)."""
     _train_impl(
         gpu_count, max_steps, num_epochs, run_eagle3, run_dflash,
-        wandb_project, dataset_path, dataset_size, extra_overrides,
+        wandb_project, dataset_path, dataset_size, extra_overrides, hf_repo,
     )
 
 
@@ -445,6 +510,7 @@ def _train_impl(
     dataset_path: Optional[str],
     dataset_size: int,
     extra_overrides: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ):
     import os
     import shutil
@@ -529,6 +595,15 @@ def _train_impl(
 
     outputs_vol.commit()
 
+    if run_dflash:
+        _convert_and_upload_hf(
+            run_id="dflash-qwen3-8b",
+            target_model="Qwen/Qwen3-8B",
+            hf_repo=hf_repo,
+        )
+
+    outputs_vol.commit()
+
     print()
     print("=" * 60)
     print("  Training Complete!")
@@ -540,6 +615,9 @@ def _train_impl(
     if run_dflash:
         print(f"  DFlash log:         {OUTPUTS_DIR}/dflash-qwen3-8b.log")
         print(f"  DFlash checkpoints: {OUTPUTS_DIR}/dflash-qwen3-8b/checkpoints/")
+        hf_dir = f"{OUTPUTS_DIR}/dflash-qwen3-8b/hf_model"
+        if os.path.isdir(hf_dir):
+            print(f"  DFlash HF model:    {hf_dir}")
     print()
     print(f"  All outputs saved to Modal volume 'torchspec-outputs'")
     print(f"  Download: modal volume get torchspec-outputs /dflash-qwen3-8b/checkpoints/ ./checkpoints/")
@@ -568,6 +646,7 @@ def main(
     dataset_path: Optional[str] = None,
     dataset_size: int = 50000,
     extra_overrides: str = "",
+    hf_repo: str = "",
 ):
     if gpu_count < 4:
         print(f"Error: This script requires >= 4 GPUs (got {gpu_count}).")
@@ -602,6 +681,9 @@ def main(
         print("Nothing to run. Pass --run-eagle3 and/or --run-dflash.")
         return
 
+    if hf_repo:
+        print(f"  HF Upload:    {hf_repo}")
+
     train_sglang.spawn(
         gpu_count=gpu_count,
         max_steps=max_steps,
@@ -612,4 +694,5 @@ def main(
         dataset_path=dataset_path,
         dataset_size=dataset_size,
         extra_overrides=extra_overrides or None,
+        hf_repo=hf_repo or None,
     ).get()
