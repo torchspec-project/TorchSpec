@@ -1,20 +1,25 @@
 # DFlash training config for Qwen3-8B target model
 #
-# GPU allocation (optimized — Test 7 configuration):
-#   - 1 GPU for inference (SGLang engine, tp_size=1)
-#   - 3 GPUs for training (FSDP FULL_SHARD across 3 GPUs)
-#   - Total: 4 GPUs
+# Phase H: Convergence-optimized config for 800K PerfectBlend
 #
-# Speed: ~5.3 step/s × 3 samples/step = 15.9 samples/s
-# CPU prefetch overlaps Mooncake TCP with GPU compute (data_time ~1-9ms)
+# Key changes from Phase G (190K × 3ep, τ=3.06):
+#   - accum 4→2: 2x more optimizer steps for better convergence
+#   - weight_decay 0→0.01: AdamW regularization for generalization
+#   - min_lr 0→6e-5: prevent LR death in later epochs (10% of peak)
+#   - dataset: 800K PerfectBlend (set via CLI --dataset-size 800000)
+#
+# GPU allocation (8x H100, 512-E config — fastest wall-clock):
+#   - 4 GPUs for inference (SGLang engine, tp_size=1)
+#   - 4 GPUs for training (FSDP FULL_SHARD)
+#   - global_batch = 1 × 2 × 4 = 8
+#   - ~760K effective samples × 3 epochs / 8 = ~285K optimizer steps
 #
 # Usage:
-#   python -m torchspec.train_entry --config configs/sglang_qwen3_8b_dflash.yaml
-#
-# Phase 3 τ benchmark (checkpoints at 5k, 10k, 15k steps):
-#   python -m torchspec.train_entry --config configs/sglang_qwen3_8b_dflash.yaml \
-#     dataset.train_data_path=/workspace/data/perfectblend_50k.jsonl \
-#     dataset.eval_data_path=null
+#   modal run --detach scripts/modal_dflash_train.py \
+#     --num-epochs 3 --dataset-size 800000 \
+#     --hf-repo Xingh3/dflash-qwen3-8b-800k-3epoch \
+#     --extra-overrides "training.dflash_num_anchors=512 \
+#       inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -23,31 +28,33 @@ model:
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
-  eval_data_path: null  # Disable eval for production training
+  eval_data_path: null
   eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
-  min_loss_tokens: 32  # 2 * block_size — matches SpecForge filter for valid anchor sampling
+  min_loss_tokens: 32
 
 training:
   attention_backend: flex_attention
   micro_batch_size: 1
-  draft_accumulation_steps: 4
+  draft_accumulation_steps: 2       # was 4 → 2x more optimizer steps
   learning_rate: 6e-4
+  min_lr: 6e-5                      # 10% of peak — prevents LR death in later epochs
+  weight_decay: 0.01                # AdamW regularization for better generalization
   max_concurrent_batches: 1
   max_grad_norm: 1.0
   max_seq_length: 2048
   num_epochs: 3
   seed: 42
-  training_num_gpus_per_node: 3   # 3 GPUs for training (was 2)
+  training_num_gpus_per_node: 4
   training_num_nodes: 1
   ttt_length: 7
-  fsdp_strategy: FULL_SHARD        # FULL_SHARD halves optimizer memory
-  fsdp_reduce_dtype: bfloat16      # bf16 gradient reduction (saves bandwidth)
-  prefetch_depth: 8                 # CPU prefetch: overlap Mooncake TCP with GPU compute (increased from 2)
-  save_interval: 1000              # Checkpoint every 1k steps
-  save_per_epoch: false
-  max_checkpoints: 2               # Keep epoch 2 + epoch 3 for comparison
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 5000               # was 1000 — less frequent for longer runs
+  save_per_epoch: true              # save at each epoch boundary for τ comparison
+  max_checkpoints: 3
   warmup_ratio: 0.04
 
   # DFlash-specific parameters
@@ -58,9 +65,9 @@ training:
 
 inference:
   inference_engine_type: sgl
-  inference_num_gpus: 1
+  inference_num_gpus: 4
   inference_num_gpus_per_engine: 1
-  inference_num_gpus_per_node: 1
+  inference_num_gpus_per_node: 4
   max_sample_pool_size: 64
   inference_buffer_threshold: 32
   inference_batch_size: 8

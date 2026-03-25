@@ -506,7 +506,7 @@ Based on `specforge_dflash_training_reference.md`: z-lab achieves τ=3.95 with `
 
 ```bash
 modal run --detach --env sandbox scripts/modal_dflash_train.py \
-  --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+  --num-epochs 3 --dataset-size 200000 \
   --extra-overrides "training.dflash_num_anchors=512 inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
 ```
 
@@ -514,7 +514,7 @@ modal run --detach --env sandbox scripts/modal_dflash_train.py \
 
 ```bash
 modal run --detach --env sandbox scripts/modal_dflash_train.py \
-  --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+  --num-epochs 3 --dataset-size 200000 \
   --extra-overrides "training.dflash_num_anchors=512 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 ```
 
@@ -522,6 +522,142 @@ modal run --detach --env sandbox scripts/modal_dflash_train.py \
 
 ```bash
 modal run --detach --env sandbox scripts/modal_dflash_train.py \
-  --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+  --num-epochs 3 --dataset-size 200000 \
   --extra-overrides "training.dflash_num_anchors=256 training.micro_batch_size=4 training.draft_accumulation_steps=1 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 ```
+
+---
+
+## Phase G Convergence Analysis (2026-03-25)
+
+### Observed Training Curves (200K PerfectBlend, 3 Epochs, 23,622 Steps)
+
+See `training_metrics_3epoch.png`.
+
+**Loss (CE):**
+- Drops sharply from ~8 to ~3.5 in first ~2K steps (early epoch 1)
+- Slow decline from ~3.5 to ~2.0 over remaining 21K steps
+- Plateaus around step 5K-7K, then creeps down
+- Visible bumps at epoch boundaries (dataset re-shuffle causes partial forgetting)
+
+**Accuracy (Top-1):**
+- Rises from 0.05 to ~0.35 in first 5K steps
+- Stalls at ~0.35-0.45 for the remaining 18K steps
+- Reaches only ~0.45 after 23K steps — low for a draft model
+- Learning clearly decelerates well before epoch 3
+
+**Diagnosis:** The model learns fast early but hits a wall around 35-45% accuracy. This indicates the optimizer configuration is preventing deeper convergence.
+
+### Root Cause Analysis
+
+#### 1. Global Batch Size Too Large → Too Few Optimizer Steps
+
+Phase G config: `micro_batch=1, accum=4, dp=6` → **global_batch = 24**.
+
+With 190K samples: only **~7,900 steps per epoch**, 23,700 total for 3 epochs. The cosine LR schedule decays too fast relative to data diversity. The optimizer takes big batch steps but sees relatively few unique gradient directions.
+
+z-lab's 800K × 6 epochs with (likely smaller) batch size would have significantly more optimizer steps. Community result (@jianc99, 1.2M × 3 epochs) likely had 100K+ optimizer steps.
+
+#### 2. Cosine LR Decays Before Convergence
+
+```python
+# BF16Optimizer: total_steps=23,622, warmup_ratio=0.04
+warmup = 945 steps (reaches peak lr=6e-4)
+# Then cosine decay: 6e-4 → 0 over 22,677 steps
+# By step ~12K (midpoint): LR ≈ 3e-4
+# By step ~18K: LR < 1e-4 — model barely learning
+```
+
+This explains the accuracy stall at ~0.40 — the LR decays too aggressively for the amount of data diversity.
+
+#### 3. weight_decay = 0.0 (No Regularization)
+
+`BF16Optimizer` passed `weight_decay=0.0` to `AdamW`, making it equivalent to plain Adam. Adding weight decay (0.01) helps prevent overfitting on repeated data across epochs and improves generalization — which directly maps to inference τ.
+
+#### 4. min_lr = 0.0 (LR Decays to Zero)
+
+The cosine schedule decayed to `min_lr=0.0`. In later training steps, the model was effectively frozen. Setting `min_lr` to ~10% of peak (6e-5) keeps the model learning through later epochs.
+
+### Configuration Changes Implemented
+
+| Parameter | Phase G | Phase H | Rationale |
+|-----------|---------|---------|-----------|
+| `draft_accumulation_steps` | 4 | **2** | 2x more optimizer steps per epoch |
+| `weight_decay` | 0.0 (hardcoded) | **0.01** | AdamW regularization → better generalization |
+| `min_lr` | 0.0 (hardcoded) | **6e-5** | 10% of peak → prevents LR death |
+| `save_interval` | 1000 | **5000** | Less frequent for longer runs |
+| `save_per_epoch` | false | **true** | Compare τ at epoch boundaries |
+| `max_checkpoints` | 2 | **3** | Keep all 3 epoch checkpoints |
+
+Code changes (commits TBD):
+- `torchspec/config/train_config.py`: Added `min_lr` and `weight_decay` to `TrainingConfig`
+- `torchspec/training/optimizer.py`: `BF16Optimizer` accepts `min_lr` and passes to scheduler
+- `torchspec/training/dflash_trainer.py`: Plumbs `weight_decay` and `min_lr` from args
+- `torchspec/training/eagle3_trainer.py`: Same plumbing (consistent across trainers)
+- `scripts/modal_dflash_train.py`: Fixed WandB config prefix (`logging.*` not `training.*`)
+
+### Expected Impact
+
+| Change | Speed Impact | τ Impact |
+|--------|-------------|----------|
+| `accum=4→2` | Neutral (same samples/s, 2x optimizer steps) | **+0.3-0.5 τ** |
+| `min_lr=6e-5` | Neutral | **+0.2-0.3 τ** |
+| `weight_decay=0.01` | Neutral | **+0.1-0.2 τ** |
+| Combined | No speed change | **+0.5-1.0 τ** (est. τ=3.5-4.0 on 190K, 4.0-4.5 on 800K) |
+
+---
+
+## Phase H: 800K PerfectBlend Training Plan (2026-03-25)
+
+### Goal
+
+Close the τ gap to z-lab (currently 3.06 vs 4.05) by scaling data 4x and fixing convergence.
+
+### Training Configuration
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Dataset | PerfectBlend 800K (~760K after filtering) | 4x Phase G data |
+| Epochs | 3 | Start with 3, extend to 6 if τ improving |
+| GPU split | 4I + 4T (512-E) | Fastest wall-clock from Modal tuning |
+| Global batch | 8 (micro=1, accum=2, dp=4) | 2x more optimizer steps than Phase G |
+| Anchors | 512 | z-lab recipe |
+| Seq length | 2048 | Keep current; 3072 is Priority 2 |
+| LR | 6e-4, cosine, warmup 0.04, min_lr 6e-5 | Slower decay |
+| Weight decay | 0.01 | New |
+| Optimizer steps | ~285K (3 epochs) | 12x more than Phase G (23.6K) |
+| Total sample passes | ~2.28M | 4x Phase G (567K), 48% of z-lab (4.8M) |
+
+### Estimated Training Time & Cost
+
+| Epochs | Steps | Wall Time | GPU-hours | Modal Cost |
+|--------|-------|-----------|-----------|------------|
+| 3 | ~285K | ~10.5 hr | 84 | ~$332 |
+| 6 | ~570K | ~21 hr | 168 | ~$664 |
+
+Based on 512-E throughput: ~20 samples/s steady state, ~8 global_batch → ~2.5 step/s.
+
+### τ Targets
+
+| Milestone | Expected τ | Comparison |
+|-----------|-----------|------------|
+| Epoch 1 | ~3.3-3.6 | Above Phase G final (3.06) |
+| Epoch 2 | ~3.6-4.0 | Approaching z-lab (4.05) |
+| Epoch 3 | ~3.8-4.2 | Matching z-lab math benchmarks |
+
+### Launch Command
+
+```bash
+modal run --detach scripts/modal_dflash_train.py \
+  --num-epochs 3 --dataset-size 800000 \
+  --wandb-project dflash-800k \
+  --hf-repo Xingh3/dflash-qwen3-8b-800k-3epoch \
+  --extra-overrides "training.dflash_num_anchors=512 \
+    inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
+```
+
+### Monitoring
+
+- **WandB**: `dflash-800k` project — watch `train/avg_loss`, `train/avg_acc`, `train/lr`, `train/grad_norm`
+- **Checkpoints**: Saved at every 5K steps + epoch boundaries → auto-converted + uploaded to `Xingh3/dflash-qwen3-8b-800k-3epoch`
+- **τ benchmark**: After each epoch, run `scripts/modal_dflash_benchmark.py` against the HF checkpoint

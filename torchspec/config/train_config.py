@@ -114,6 +114,8 @@ class TrainingConfig:
     max_concurrent_batches: int = 1
     max_grad_norm: float = 0.5
     max_seq_length: int = 8192
+    min_lr: float = 0.0
+    weight_decay: float = 0.0
     num_epochs: int = 10
     num_train_steps: Optional[int] = None
     micro_batch_size: int = 2

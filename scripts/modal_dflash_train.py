@@ -25,12 +25,12 @@ Setup (one-time):
     modal profile activate doordash
     modal secret create huggingface-secret HF_TOKEN=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
     modal secret create xingh3-hf-write HF_WRITE_TOKEN=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  # personal write token for HF uploads
-    modal secret create wandb-secret WANDB_API_KEY=<key>   # get key from https://wandb.ai/authorize
+    modal secret create wandb-secret WANDB_API_KEY=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  # get key from https://wandb.ai/authorize
 
 Usage:
     modal run scripts/modal_dflash_train.py                                    # 8x H100, 200-step test
-    modal run scripts/modal_dflash_train.py --max-steps 999999 --dataset-size 200000  # full 200K run
-    modal run scripts/modal_dflash_train.py --num-epochs 3 --max-steps 999999  # control epochs
+    modal run scripts/modal_dflash_train.py --num-epochs 3 --dataset-size 800000  # epoch-based (auto-calculates steps)
+    modal run scripts/modal_dflash_train.py --max-steps 500                    # step-based (ignores epochs)
     modal run scripts/modal_dflash_train.py --gpu-count 4                      # 4-GPU mode
     modal run --detach scripts/modal_dflash_train.py                           # detached (survives terminal close)
 
@@ -65,9 +65,11 @@ Recommended parameters (8x H100, quality-optimized with anchors=512):
       - 512-E (4+4) oversaturates inference (I=108); 3+5 may be sweet spot
       - 1 inference GPU causes pool starvation (12-28/64) for all 512 configs
 
-    Full training example (200K samples, 3 epochs, quality-optimized):
+    Full training example (800K samples, 3 epochs, convergence-optimized):
         modal run --detach scripts/modal_dflash_train.py \
-            --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+            --num-epochs 3 --dataset-size 800000 \
+            --wandb-project dflash-800k \
+            --hf-repo Xingh3/dflash-qwen3-8b-800k-3epoch \
             --extra-overrides "training.dflash_num_anchors=512 \
                 inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
 """
@@ -280,9 +282,9 @@ def _run_training(
     wandb_args = []
     if os.environ.get("WANDB_API_KEY"):
         wandb_args = [
-            "training.report_to=wandb",
-            f"training.wandb_project={wandb_project or 'dflash-vs-eagle3'}",
-            f"training.wandb_run_id={run_id}",
+            "logging.report_to=wandb",
+            f"logging.wandb_project={wandb_project or 'dflash-vs-eagle3'}",
+            f"logging.wandb_run_id={run_id}",
         ]
 
     epoch_args = []
@@ -293,7 +295,7 @@ def _run_training(
     os.makedirs(output_dir, exist_ok=True)
 
     step_args = []
-    if num_epochs is None:
+    if num_epochs is None and max_steps > 0:
         step_args = [f"training.num_train_steps={max_steps}"]
 
     cmd = [
@@ -756,6 +758,7 @@ def main(
         return
 
     epochs_override = num_epochs if num_epochs > 0 else None
+    epoch_mode = epochs_override is not None
     infer_gpus = 1
     train_gpus = gpu_count - 1
     if extra_overrides:
@@ -771,8 +774,11 @@ def main(
     print(f"  GPU:          {SGLANG_GPU} ({infer_gpus} infer + {train_gpus} train)")
     print(f"  Eagle3:       {'YES' if run_eagle3 else 'SKIP'}")
     print(f"  DFlash:       {'YES' if run_dflash else 'SKIP'}")
-    print(f"  Max steps:    {max_steps}")
-    print(f"  Num epochs:   {epochs_override or '(from YAML config)'}")
+    if epoch_mode:
+        print(f"  Num epochs:   {epochs_override} (steps auto-calculated from dataset)")
+    else:
+        print(f"  Max steps:    {max_steps}")
+        print(f"  Num epochs:   (from YAML config)")
     print(f"  Dataset:      {dataset_path or f'PerfectBlend ({dataset_size} samples)'}")
     print(f"  WandB:        {wandb_project or '(disabled / auto)'}")
     if extra_overrides:
@@ -788,7 +794,7 @@ def main(
 
     train_sglang.spawn(
         gpu_count=gpu_count,
-        max_steps=max_steps,
+        max_steps=max_steps if not epoch_mode else 0,
         num_epochs=epochs_override,
         run_eagle3=run_eagle3,
         run_dflash=run_dflash,
