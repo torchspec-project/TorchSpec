@@ -52,12 +52,24 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
+        # Truncate if longer than target (can happen when loss_mask/hidden_states
+        # length differs from input_ids after unpacking).
+        if n > N:
+            return intensors[:, :N, :]
+        if n == N:
+            return intensors
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype, device=intensors.device)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
     def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n = intensors.shape
+        # Truncate if longer than target (prevents negative padding dimension
+        # when loss_mask length differs from input_ids after collation).
+        if n > N:
+            return intensors[:, :N]
+        if n == N:
+            return intensors
         padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype, device=intensors.device)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
@@ -75,6 +87,11 @@ class DataCollatorWithPadding:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)
         max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
+        # Round up to nearest bucket to reduce unique shapes for torch.compile.
+        # Without this, every batch gets a different padded length, causing
+        # FlexAttention recompilation (~1s overhead per new shape).
+        _BUCKET = 256
+        max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         # All real tokens get attention_mask=1; paddingtensor2D zero-pads the rest.
         attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]

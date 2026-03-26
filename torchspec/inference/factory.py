@@ -24,8 +24,6 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from torchspec.inference.engine.hf_engine import HFEngine
-from torchspec.inference.engine.sgl_engine import SglEngine
-from torchspec.inference.engine.vllm_engine import VllmEngine
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
@@ -146,7 +144,7 @@ def _prepare_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -
 def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize HF engines with Ray placement groups."""
     engines, init_handles = _prepare_hf_engines(args, pg, mooncake_config, engine_group)
-    _wait_for_init(init_handles, "HF", timeout=300)
+    _wait_for_init(init_handles, "HF", timeout=1200)
     return engines
 
 
@@ -186,6 +184,8 @@ def _prepare_sgl_engines(
         f"Initializing {num_engines} Sgl engines "
         f"({gpus_per_engine} GPU(s) each, nnodes={nnodes}, replicas={num_replicas})"
     )
+
+    from torchspec.inference.engine.sgl_engine import SglEngine
 
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
     SglRayActor = ray.remote(SglEngine)
@@ -235,7 +235,7 @@ def _prepare_sgl_engines(
                 head_engine = engines[replica_idx * nnodes]
                 ip, port = ray.get(
                     [head_engine.get_node_ip.remote(), head_engine.find_free_port.remote()],
-                    timeout=30,
+                    timeout=120,
                 )
                 addr = f"{ip}:{port}"
                 dist_init_addrs[replica_idx] = addr
@@ -249,7 +249,7 @@ def _prepare_sgl_engines(
     for i in range(num_engines):
         port = ray.get(
             engines[i].find_free_port.remote(start_port=next_start, consecutive=2),
-            timeout=30,
+            timeout=120,
         )
         pre_allocated_ports[i] = port
         next_start = port + 2
@@ -327,6 +327,8 @@ def _prepare_vllm_engines(
         f"({gpus_per_engine} GPU(s) each, nnodes={nnodes}, replicas={num_replicas})"
     )
 
+    from torchspec.inference.engine.vllm_engine import VllmEngine
+
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
     VllmRayActor = ray.remote(VllmEngine)
     env_vars = get_torchspec_env_vars()
@@ -372,7 +374,7 @@ def _prepare_vllm_engines(
                 head_engine = engines[replica_idx * nnodes]
                 ip, port = ray.get(
                     [head_engine.get_node_ip.remote(), head_engine.find_free_port.remote()],
-                    timeout=30,
+                    timeout=120,
                 )
                 addr = f"{ip}:{port}"
                 dist_init_addrs[replica_idx] = addr
