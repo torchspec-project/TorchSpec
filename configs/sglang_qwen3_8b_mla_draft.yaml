@@ -1,22 +1,18 @@
-# Configuration for train_entry.py with SglEngine inference (nested config format)
+# Configuration for Qwen3-8B target model with MLA draft model
 #
-# GPU allocation:
-#   - 2 GPUs for inference (duplicate mode: each engine has full model copy)
-#   - 2 GPUs for training (DP/FSDP: model sharded across 2 GPUs)
-#   - Total: 4 GPUs
+# Same as sglang_qwen3_8b.yaml but uses DeepSeek MLA attention in the draft model.
 #
 # Usage:
-#   python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml
-#   ./examples/qwen3-8b-single-node/run.sh
+#   python -m torchspec.train_entry --config configs/sglang_qwen3_8b_mla_draft.yaml
+#   ./examples/qwen3-8b-single-node/run.sh configs/sglang_qwen3_8b_mla_draft.yaml
 
 model:
   target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/draft_models/qwen3_8b_eagle3_mla.json
   trust_remote_code: true
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
-  # eval_data_path: ../examples/data/eval_conversations.jsonl
-  # eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
 
@@ -37,12 +33,12 @@ training:
   warmup_ratio: 0.015
 
 inference:
-  inference_engine_type: sgl  # Use SglEngine instead of HFEngine
+  inference_engine_type: sgl
   inference_num_gpus: 1
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 1
-  max_sample_pool_size: 64       # Max samples in controller pool
-  inference_buffer_threshold: 32     # Fetch prompts when buffer < threshold
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
   inference_batch_size: 8
   sglang:
     tp_size: 1
@@ -55,8 +51,8 @@ mooncake:
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
-output_dir: ./outputs/qwen3-8b-single-node
-cache_dir: ./cache/qwen3-8b-single-node
+output_dir: ./outputs/qwen3-8b-mla-draft
+cache_dir: ./cache/qwen3-8b-mla-draft
 model_download_dir: null
 
 debug:
