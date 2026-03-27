@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import copy
 import json
 import logging
 import warnings
@@ -26,6 +27,12 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_config_value(value):
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return copy.deepcopy(value)
 
 
 def generate_draft_model_config(
@@ -85,6 +92,8 @@ def generate_draft_model_config(
         "num_key_value_heads": "num_key_value_heads",
         "intermediate_size": "intermediate_size",
         "max_position_embeddings": "max_position_embeddings",
+        "rope_theta": "rope_theta",
+        "rope_scaling": "rope_scaling",
         "rms_norm_eps": "rms_norm_eps",
         "hidden_act": "hidden_act",
         "bos_token_id": "bos_token_id",
@@ -101,6 +110,8 @@ def generate_draft_model_config(
             continue
         if target_param == "torch_dtype" and isinstance(value, torch.dtype):
             value = str(value).replace("torch.", "")
+        else:
+            value = _copy_config_value(value)
         draft_config[draft_param] = value
 
     draft_config["num_hidden_layers"] = 1
