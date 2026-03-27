@@ -56,12 +56,14 @@ echo "Local IP: $LOCAL_IP"
 echo "Extra args: $*"
 echo "=============================================="
 
+# TODO: unify tp_size config across sglang/vllm backends
 python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
     training.training_num_gpus_per_node="$TRAIN_GPUS" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
+    inference.sglang.tp_size=2 \
     "$@"
 
 echo "=============================================="
