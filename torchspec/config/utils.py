@@ -35,6 +35,29 @@ def _copy_config_value(value):
     return copy.deepcopy(value)
 
 
+def _normalize_rope_scaling(rope_scaling):
+    if rope_scaling is None:
+        return None
+
+    normalized = _copy_config_value(rope_scaling)
+    if not isinstance(normalized, dict):
+        return normalized
+
+    scaling_type = normalized.get("rope_type", normalized.get("type"))
+    if scaling_type == "yarn":
+        yarn_defaults = {
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 0.0,
+        }
+        for key, default in yarn_defaults.items():
+            if normalized.get(key) is None:
+                normalized[key] = default
+
+    return normalized
+
+
 def generate_draft_model_config(
     target_model_path: str, template_config_path: str = None, cache_dir: str = None
 ):
@@ -112,6 +135,8 @@ def generate_draft_model_config(
             value = str(value).replace("torch.", "")
         else:
             value = _copy_config_value(value)
+            if target_param == "rope_scaling":
+                value = _normalize_rope_scaling(value)
         draft_config[draft_param] = value
 
     draft_config["num_hidden_layers"] = 1
