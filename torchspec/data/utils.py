@@ -450,5 +450,14 @@ def load_hf_dataset(data_path: str):
 
         raise FileNotFoundError(f"Local dataset path not found: {data_path}")
 
-    # hub path
-    return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})
+    # hub path — try native load_dataset first (handles Arrow, Parquet, etc.),
+    # fall back to manual JSON download for repos with mixed-type columns
+    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages"})
+    try:
+        ds = load_dataset(data_path, split="train", streaming=True)
+        drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]
+        if drop_cols:
+            ds = ds.remove_columns(drop_cols)
+        return ds
+    except Exception:
+        return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})
