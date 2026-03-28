@@ -322,3 +322,104 @@ else:
 ```
 
 **Status**: **RESOLVED** (2026-03-22).
+
+---
+
+## Training Pipeline Bugs & Optimizations (Found in Session 13)
+
+Deep-dive code review of the training pipeline against z-lab's reference implementation.
+All items below were identified and fixed in a single pass (2026-03-28).
+
+### BUG 33: Dead `gradient_checkpointing` flag in DFlashModel
+
+**File**: `torchspec/models/dflash.py`
+
+`DFlashModel.__init__` accepted and stored a `gradient_checkpointing` parameter, but no code
+ever used it — no layers were wrapped with `torch.utils.checkpoint`. The `dflash_trainer.py`
+passed `gradient_checkpointing=True` by default, giving a false sense of memory savings.
+
+**Fix**: Removed the parameter from `DFlashModel.__init__` and the kwarg from `dflash_trainer.py`.
+Gradient checkpointing should be implemented properly as a separate effort if needed.
+
+**Status**: **FIXED** (2026-03-28).
+
+### BUG 34: FlexAttention recompilation from variable Q_LEN (anchor count varies per batch)
+
+**File**: `torchspec/models/dflash.py` — `_sample_anchor_positions()`
+
+`_sample_anchor_positions` computed `max_n = min(self.num_anchors, int(valid_counts.max()) - 1)`.
+When any batch had fewer valid positions than `num_anchors`, `max_n` dropped, changing
+`Q_LEN = max_n * block_size`. Since `flex_attention` is compiled via `torch.compile`, each new
+`(Q_LEN, KV_LEN)` shape triggered a Dynamo recompilation. After exhausting the recompile limit,
+Dynamo fell back to eager mode — losing all FlexAttention kernel optimization.
+
+**Note**: This is distinct from Issue 30 (variable padding → variable `KV_LEN`). This bug causes
+variable `Q_LEN` even when `KV_LEN` is stable.
+
+**Fix**: Always return exactly `self.num_anchors` anchor slots. Samples with fewer valid positions
+get `block_keep_mask=False` for the excess slots — the block-sparse kernel skips them at zero cost.
+`Q_LEN = num_anchors * block_size` is now constant across all steps.
+
+**Status**: **FIXED** (2026-03-28).
+
+### BUG 35: `no_sync()` silently no-ops under FSDP2 `fully_shard`
+
+**File**: `torchspec/training/trainer.py` — `_train_core_from_queue()`
+
+The training loop used `getattr(_model, "no_sync", None)` to skip gradient all-reduce on
+non-last micro-batches. FSDP2's composable `fully_shard` does not expose `no_sync()` (that's
+an FSDP1 API). The `getattr` returned `None`, falling through to `nullcontext()`, so every
+micro-batch performed a full reduce-scatter — wasting communication bandwidth proportional
+to `(accumulation_steps - 1) / accumulation_steps`.
+
+**Fix**: Detect `set_requires_gradient_sync` (FSDP2 API) first. If present, call
+`model.set_requires_gradient_sync(is_last_microbatch)`. Falls back to `no_sync()` for
+the `replicate()` (DDP) strategy.
+
+**Status**: **FIXED** (2026-03-28).
+
+### OPT 1: Per-layer FSDP sharding for DFlash draft model
+
+**File**: `torchspec/training/dflash_trainer.py` — `init_model()`
+
+Previously the entire `DFlashModel` was sharded as a single FSDP unit. All parameters were
+gathered/scattered atomically — no opportunity to overlap communication with compute.
+
+**Fix**: Pass `modules_to_shard=list(draft_model.layers)` to `apply_fsdp2()`. Each decoder layer
+is now an independent FSDP unit. Benefits:
+- All-gather for layer N+1 can overlap with forward compute of layer N
+- Reduce-scatter for layer N can overlap with backward compute of layer N-1
+- Peak memory reduced (only one layer's full parameters materialized at a time)
+
+**Status**: **FIXED** (2026-03-28).
+
+### OPT 2: Async H2D transfers in DFlash forward
+
+**File**: `torchspec/training/dflash_trainer.py` — `_forward()`
+
+`_forward()` used `.cuda()` which is synchronous. Replaced with
+`.to(device, non_blocking=True)` to enable async CPU→GPU transfers that overlap
+with computation. Particularly valuable when data comes from pinned Mooncake buffers.
+
+**Status**: **FIXED** (2026-03-28).
+
+### OPT 3: Pre-allocated fp32 gradient buffers in BF16Optimizer
+
+**File**: `torchspec/training/optimizer.py`
+
+Every `step()` call allocated new fp32 tensors via `p.grad.detach().to(torch.float32)` —
+one allocation + deallocation per parameter per step. With ~50 parameter groups, this creates
+significant GC pressure and memory fragmentation.
+
+**Fix**: Pre-allocate `self.fp32_grads` at init time. In `step()`, use `g.copy_(p.grad)` into
+the persistent buffer instead of allocating. The same buffer is reused every step.
+
+**Status**: **FIXED** (2026-03-28).
+
+### Remaining Investigation Items
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Gradient checkpointing | Implement actual `torch.utils.checkpoint` wrapping per decoder layer | Not started |
+| Anchor diversity at prompt boundaries | Allow anchors at prompt positions (Bug 2 above) — benchmark impact on τ | Not started |
+| `torch.compile` on draft model forward | Currently disabled (Issue 27). May be viable now that Q_LEN is stable (BUG 34 fix) | Worth re-testing |

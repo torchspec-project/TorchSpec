@@ -316,10 +316,12 @@ class Trainer(abc.ABC):
             compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
             t_data_start = time.time()
 
-        # no_sync() context: skip gradient allreduce on non-last micro-batches
-        # Check both model and underlying module (torch.compile wraps the model)
+        # Gradient sync control for micro-batch accumulation.
+        # FSDP2 fully_shard: use set_requires_gradient_sync(bool)
+        # replicate (DDP): use no_sync() context manager
         _model = getattr(self.model, "_orig_mod", self.model)
-        _no_sync = getattr(_model, "no_sync", None)
+        _set_grad_sync = getattr(_model, "set_requires_gradient_sync", None)
+        _no_sync = getattr(_model, "no_sync", None) if _set_grad_sync is None else None
 
         batches = self.prof.iterate_train_actor(self._iter_batches_from_queue(num_batches))
         for batch_idx, batch in enumerate(batches):
@@ -334,8 +336,12 @@ class Trainer(abc.ABC):
             if logger.isEnabledFor(logging.DEBUG):
                 self._log_batch_debug(batch, step, batch_idx, num_batches)
 
-            # Skip gradient sync on non-last micro-batches (saves one allreduce per step)
-            ctx = _no_sync() if (_no_sync is not None and not is_last) else nullcontext()
+            if _set_grad_sync is not None:
+                _set_grad_sync(is_last)
+                ctx = nullcontext()
+            else:
+                ctx = _no_sync() if (_no_sync is not None and not is_last) else nullcontext()
+
             with ctx:
                 step_metrics = self._train_step(
                     batch=batch,

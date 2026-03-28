@@ -40,6 +40,7 @@ class BF16Optimizer:
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
         self.fp32_params = [p.detach().clone().to(torch.float32) for p in self.model_params]
+        self.fp32_grads = [torch.zeros_like(mp) for mp in self.fp32_params]
         for mp in self.fp32_params:
             mp.requires_grad = True
         self.optimizer = torch.optim.AdamW(self.fp32_params, lr=lr, weight_decay=weight_decay)
@@ -62,8 +63,12 @@ class BF16Optimizer:
             grad_norm: The gradient norm before clipping (for logging).
         """
         with torch.no_grad():
-            for p, mp in zip(self.model_params, self.fp32_params):
-                mp.grad = p.grad.detach().to(torch.float32) if p.grad is not None else None
+            for p, mp, g in zip(self.model_params, self.fp32_params, self.fp32_grads):
+                if p.grad is not None:
+                    g.copy_(p.grad)
+                    mp.grad = g
+                else:
+                    mp.grad = None
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         if grad_norm > 0.0:

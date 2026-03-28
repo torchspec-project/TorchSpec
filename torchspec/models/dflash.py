@@ -91,14 +91,12 @@ class DFlashModel(nn.Module):
         block_size: int = 16,
         num_anchors: int = 512,
         loss_decay_gamma: float = 7.0,
-        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.draft_model = draft_model
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        self.gradient_checkpointing = gradient_checkpointing
 
     def _sample_anchor_positions(
         self,
@@ -108,7 +106,11 @@ class DFlashModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample anchor positions per sample; returns (anchors, keep_mask).
 
-        Matches SpecForge's OnlineDFlashModel._sample_anchor_positions().
+        Always returns exactly ``self.num_anchors`` anchor slots so that
+        ``Q_LEN = num_anchors * block_size`` is constant across steps,
+        preventing FlexAttention recompilation from shape changes.  Samples
+        with fewer valid positions use ``block_keep_mask=False`` for the
+        excess slots (those blocks are skipped by the block-sparse kernel).
 
         Args:
             seq_len: sequence length
@@ -116,18 +118,19 @@ class DFlashModel(nn.Module):
             device: torch device
 
         Returns:
-            anchors: [B, max_n] — sampled anchor positions (sorted)
-            keep_mask: [B, max_n] — True for valid sampled anchors
+            anchors: [B, num_anchors] — sampled anchor positions (sorted)
+            keep_mask: [B, num_anchors] — True for valid sampled anchors
         """
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
+        max_n = self.num_anchors
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
-        if max_n <= 0:
+        actual_max = int(valid_counts.max().item()) - 1
+        if actual_max <= 0:
             raise ValueError(
                 f"No valid anchor positions found (max_anchor={max_anchor}, "
                 f"block_size={self.block_size}). Preprocess data to ensure "
@@ -146,7 +149,14 @@ class DFlashModel(nn.Module):
 
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
+
+        # Take up to num_anchors slots; pad with zeros if fewer valid positions
+        take_n = min(max_n, gathered.shape[1])
+        selected = gathered[:, :take_n].sort(dim=1).values
+        if take_n < max_n:
+            pad = torch.zeros(bsz, max_n - take_n, dtype=torch.long, device=device)
+            selected = torch.cat([selected, pad], dim=1)
+        anchors = selected
 
         keep_mask = torch.arange(max_n, device=device).unsqueeze(
             0

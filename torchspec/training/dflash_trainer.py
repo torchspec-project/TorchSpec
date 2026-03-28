@@ -115,7 +115,6 @@ class DFlashTrainer(Trainer):
             block_size=self.block_size,
             num_anchors=self.num_anchors,
             loss_decay_gamma=self.loss_decay_gamma,
-            gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
         )
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
@@ -125,6 +124,7 @@ class DFlashTrainer(Trainer):
             mesh=self.dp_mesh,
             cpu_offload=self.fsdp_cpu_offload,
             args=self.args,
+            modules_to_shard=list(draft_model.layers),
         )
 
         dflash_model = fsdp2_load_full_state_dict(
@@ -224,13 +224,14 @@ class DFlashTrainer(Trainer):
         return list(hidden_states.split(per_layer_dim, dim=-1))
 
     def _forward(self, batch: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids = batch["input_ids"].cuda()
-        hidden_states = batch["hidden_states"].cuda()
+        device = torch.device("cuda")
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        hidden_states = batch["hidden_states"].to(device, non_blocking=True)
 
         loss_mask = batch["loss_mask"]
         if loss_mask.dim() == 3:
             loss_mask = loss_mask.squeeze(-1)
-        loss_mask = loss_mask.cuda()
+        loss_mask = loss_mask.to(device, non_blocking=True)
 
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
