@@ -512,6 +512,51 @@ def _probe_rdma():
     print("  --- End RDMA Probe ---\n")
 
 
+def _patch_load_hf_dataset():
+    """Patch the on-disk load_hf_dataset to support Arrow/Parquet Hub datasets
+    and drop unused columns. Needed because the container's pinned commit may
+    lack the fix. Since TorchSpec is installed editable, patching the source
+    file is picked up by the subprocess."""
+    import os
+
+    utils_path = f"{REPO_DIR}/torchspec/data/utils.py"
+    if not os.path.isfile(utils_path):
+        return
+
+    with open(utils_path) as f:
+        src = f.read()
+
+    if "_KEEP_COLUMNS" in src:
+        print("  load_hf_dataset already patched, skipping")
+        return
+
+    old_block = (
+        '    # hub path\n'
+        '    return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})'
+    )
+    new_block = (
+        '    # hub path — try native load_dataset first (handles Arrow, Parquet, etc.),\n'
+        '    # fall back to manual JSON download for repos with mixed-type columns\n'
+        '    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages"})\n'
+        '    try:\n'
+        '        ds = load_dataset(data_path, split="train", streaming=True)\n'
+        '        drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]\n'
+        '        if drop_cols:\n'
+        '            ds = ds.remove_columns(drop_cols)\n'
+        '        return ds\n'
+        '    except Exception:\n'
+        '        return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})'
+    )
+
+    if old_block in src:
+        src = src.replace(old_block, new_block)
+        with open(utils_path, "w") as f:
+            f.write(src)
+        print("  Patched load_hf_dataset for Arrow/Parquet Hub support")
+    else:
+        print("  load_hf_dataset: old pattern not found (may already be updated)")
+
+
 def _train_impl(
     gpu_count: int,
     max_steps: int,
@@ -570,6 +615,10 @@ def _train_impl(
         if os.path.isdir(stale_dir):
             shutil.rmtree(stale_dir, ignore_errors=True)
             print(f"  Cleared stale cache: {stale_dir}")
+
+    # Patch load_hf_dataset to support Arrow/Parquet Hub datasets and drop
+    # unused columns (needed for datasets like jiapingW/qwen3.5-35b-a3b-ultrachat-regen)
+    _patch_load_hf_dataset()
 
     # Prepare dataset (mirrors runpod_setup.sh Step 10)
     data_file = dataset_path

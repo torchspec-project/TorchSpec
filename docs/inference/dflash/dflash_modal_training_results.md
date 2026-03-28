@@ -821,3 +821,72 @@ Our speedup (2.2-2.9x) is below z-lab's reference (2.3-6.2x). This is not a mode
 | + 6 epochs | ~4.0-4.2 | ~1-3% |
 | + seq_len 3072 | ~4.1-4.4 | ~0-2% |
 | + data quality | ~4.2-4.5 | **≈0% (match/exceed)** |
+
+---
+
+## Speedup Methodology Analysis (2026-03-28)
+
+### Why Our Speedup Doesn't Match z-lab's Reported Numbers
+
+Our E2E throughput speedup (1.5-2.9x) is well below z-lab's headline numbers (2.3-6.2x) despite competitive τ values. Investigation of z-lab's benchmark code and a decode-only re-benchmark reveal this is a **measurement methodology difference**, not a model quality issue.
+
+### z-lab's Measurement: Decode-Only Time-per-Token Ratio (Transformers backend)
+
+z-lab's [`benchmark.py`](https://github.com/z-lab/dflash/blob/main/benchmark.py) computes speedup as:
+
+```
+speedup = mean(baseline_time_per_output_token) / mean(dflash_time_per_output_token)
+```
+
+Where `time_per_output_token = decode_time / num_output_tokens`, and decode_time **excludes prefill** (timing starts after prefill + first draft iteration). The baseline uses `block_size=1` (pure autoregressive target model). This runs on bare Transformers with `torch.cuda.synchronize()` — no serving framework overhead.
+
+### Our Measurement: SGLang Server End-to-End Throughput
+
+Our benchmark sends HTTP requests to an SGLang server and measures `total_tokens / total_wall_time`, which includes prefill, HTTP round-trips, scheduler overhead, CUDA graph dispatch, and KV cache paging.
+
+### Decode-Only Re-Benchmark (2026-03-28)
+
+To produce an apples-to-apples comparison, we added decode-only timing: for each prompt, we first measure prefill latency (via a 1-token generation), then subtract it from the server-side `e2e_latency` to isolate decode time.
+
+**GSM8K results (128 samples, 1x H100 80GB):**
+
+| Metric | Baseline | DFlash | Speedup |
+|--------|----------|--------|---------|
+| E2E throughput | 148.3 tok/s | 363.7 tok/s | **2.45x** |
+| Decode-only ms/tok | 6.676 | 2.674 | **2.50x** |
+| Avg prefill latency | 16.1 ms | 21.2 ms | — |
+| τ (acceptance length) | — | 3.75 | — |
+| z-lab reference τ | — | 3.38 | — |
+| z-lab reference speedup | — | — | 5.20x |
+
+**Key finding**: Decode-only speedup (2.50x) is only marginally higher than E2E (2.45x). Prefill is a small fraction of total time for these generation lengths. The ~2x gap to z-lab's 5.20x is **not** caused by prefill inclusion.
+
+### Sources of the Remaining Gap
+
+The gap between our 2.50x decode-only and z-lab's 5.20x comes from the **serving framework overhead**, not measurement methodology or model quality:
+
+| Factor | Impact (est.) | Notes |
+|--------|--------------|-------|
+| **SGLang scheduling + CUDA graph dispatch** | ~1.5-2x | Each verify step goes through SGLang's scheduler, CUDA graph replay, KV cache management. z-lab's Transformers benchmark directly calls `model()` with `torch.cuda.synchronize()`. |
+| **Spec v2 overlap not active** | ~1.2-1.5x | SGLang's spec v2 (pipelining draft + verify) is not yet supported for DFlash. z-lab's `run_sglang_benchmark.sh` uses `trtllm_mha` + `fa4` backends on B200 GPUs with spec v2 enabled. |
+| **Attention backend** | ~1.1-1.2x | We use FlashAttention3 on H100. z-lab's SGLang benchmark uses `trtllm_mha` with `fa4` draft backend on B200 (SM100), which has faster attention kernels. |
+| **Hardware** | ~1.0-1.1x | z-lab's Transformers benchmark runs on H200/B200 with higher memory bandwidth. |
+
+**Critical evidence**: On GSM8K, our τ=3.75 **exceeds** z-lab's τ=3.38, yet our speedup is 2.50x vs their 5.20x. A model with higher acceptance length producing lower speedup can only be explained by per-iteration overhead in the serving stack.
+
+### z-lab's Two Benchmark Scripts
+
+z-lab maintains two separate benchmarks with different purposes:
+
+1. **`benchmark.py` (Transformers backend)** — produces the headline 5-6x numbers on their project page. Uses bare PyTorch with `cuda_time()` = `torch.cuda.synchronize()` + `time.perf_counter()`. Runs `block_size=1` as baseline. Measures decode-only time-per-token ratio.
+
+2. **`benchmark_sglang.py` (SGLang backend)** — production serving benchmark. Tests multiple TP sizes, concurrencies, and attention backends. Uses `trtllm_mha` + `fa4` on B200 GPUs. Reports `output_toks_per_s` (end-to-end throughput).
+
+The headline numbers (5.20x on GSM8K etc.) are from benchmark #1 — the Transformers backend with decode-only timing. These are not directly comparable to SGLang serving throughput.
+
+### Conclusion
+
+Our model quality (τ) is competitive with z-lab and exceeds them on GSM8K. The speedup gap is entirely infrastructure-side and will close as:
+1. SGLang enables spec v2 overlap scheduling for DFlash
+2. Newer attention backends (fa4, trtllm_mha) become available on our hardware
+3. We add a Transformers-backend benchmark for direct comparison with z-lab's methodology

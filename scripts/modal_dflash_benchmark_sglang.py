@@ -318,6 +318,18 @@ def run_benchmark(
         is_local = repo_id.startswith("/") and os.path.isdir(repo_id)
         local_dir = f"/tmp/dflash_model_{repo_id.replace('/', '_')}"
 
+        if repo_id.startswith("/") and not is_local:
+            parent = os.path.dirname(repo_id)
+            print(f"  WARNING: volume path {repo_id} not found.")
+            if os.path.isdir(parent):
+                print(f"  Contents of {parent}: {os.listdir(parent)}")
+            else:
+                gp = os.path.dirname(parent)
+                if os.path.isdir(gp):
+                    print(f"  Contents of {gp}: {os.listdir(gp)}")
+                else:
+                    print(f"  Volume root not found: {gp}")
+
         if is_local:
             print(f"Copying draft model from volume: {repo_id}")
             if os.path.exists(local_dir):
@@ -592,9 +604,32 @@ def run_benchmark(
         except Exception:
             pass
 
-    def run_requests(base_url, prompts, max_new_tokens, temperature, concurrency, expect_dflash=False):
-        """Run all prompts with given concurrency and collect metrics."""
-        # Warmup batch (excluded from metrics, warms CUDA graphs)
+    def measure_prefill_latencies(base_url, prompts):
+        """Measure per-prompt prefill latency by generating 1 token each.
+
+        Returns a list of server-side e2e_latency values (seconds), one per
+        prompt.  Generating 1 token ≈ prefill + 1 decode step, which is a
+        tight upper bound on prefill time (the single decode step is ~6-7 ms
+        on H100 Qwen3-8B, negligible for prompts > ~50 tokens).
+        """
+        latencies = []
+        flush_cache(base_url)
+        for prompt in prompts:
+            out = send_request(base_url, prompt, max_new_tokens=1, temperature=0.0)
+            meta = out.get("meta_info", {}) or {}
+            server_e2e = float(meta["e2e_latency"]) if "e2e_latency" in meta else None
+            latencies.append(server_e2e)
+            flush_cache(base_url)
+        return latencies
+
+    def run_requests(base_url, prompts, max_new_tokens, temperature, concurrency,
+                     expect_dflash=False, prefill_latencies=None):
+        """Run all prompts with given concurrency and collect metrics.
+
+        If prefill_latencies is provided (one per prompt), we subtract it from
+        the server-side e2e_latency to get decode-only time, enabling the
+        Z-Lab paper's time-per-output-token speedup metric.
+        """
         warmup_n = min(concurrency, len(prompts))
         for p in prompts[:warmup_n]:
             send_request(base_url, p, max_new_tokens=32, temperature=temperature)
@@ -603,23 +638,52 @@ def run_benchmark(
         total_tokens = 0
         spec_accept_lengths = []
         latencies = []
+        per_request_metrics = []
+        meta_fields_logged = False
+        request_idx = 0
+
+        def _extract_meta(out, client_elapsed=None, idx=None):
+            nonlocal total_tokens, meta_fields_logged
+            meta = out.get("meta_info", {}) or {}
+
+            if not meta_fields_logged:
+                print(f"  [meta_info fields]: {sorted(meta.keys())}")
+                meta_fields_logged = True
+
+            n_tokens = int(meta.get("completion_tokens", 0))
+            total_tokens += n_tokens
+
+            if "spec_accept_length" in meta:
+                try:
+                    spec_accept_lengths.append(float(meta["spec_accept_length"]))
+                except (TypeError, ValueError):
+                    pass
+
+            prompt_toks = int(meta.get("prompt_tokens", 0))
+            server_e2e = float(meta["e2e_latency"]) if "e2e_latency" in meta else None
+
+            prefill_lat = None
+            if prefill_latencies is not None and idx is not None and idx < len(prefill_latencies):
+                prefill_lat = prefill_latencies[idx]
+
+            per_request_metrics.append({
+                "completion_tokens": n_tokens,
+                "prompt_tokens": prompt_toks,
+                "server_e2e_latency": server_e2e,
+                "client_elapsed": client_elapsed,
+                "spec_verify_ct": int(meta.get("spec_verify_ct", 0)),
+                "prefill_latency": prefill_lat,
+            })
+            return n_tokens
 
         if concurrency <= 1:
             for i, prompt in enumerate(prompts):
                 t0 = time.perf_counter()
                 out = send_request(base_url, prompt, max_new_tokens, temperature)
                 elapsed = time.perf_counter() - t0
-
-                meta = out.get("meta_info", {}) or {}
-                n_tokens = int(meta.get("completion_tokens", 0))
-                total_tokens += n_tokens
                 latencies.append(elapsed)
 
-                if "spec_accept_length" in meta:
-                    try:
-                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                    except (TypeError, ValueError):
-                        pass
+                n_tokens = _extract_meta(out, client_elapsed=elapsed, idx=i)
 
                 if (i + 1) % max(1, len(prompts) // 10) == 0:
                     tau_so_far = statistics.mean(spec_accept_lengths) if spec_accept_lengths else 0
@@ -635,14 +699,8 @@ def run_benchmark(
                     for i, prompt in enumerate(prompts)
                 }
                 for fut in as_completed(futures):
-                    out = fut.result()
-                    meta = out.get("meta_info", {}) or {}
-                    total_tokens += int(meta.get("completion_tokens", 0))
-                    if "spec_accept_length" in meta:
-                        try:
-                            spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                        except (TypeError, ValueError):
-                            pass
+                    idx = futures[fut]
+                    _extract_meta(fut.result(), idx=idx)
 
         avg_tau = statistics.mean(spec_accept_lengths) if spec_accept_lengths else None
         total_time = sum(latencies) if latencies else None
@@ -653,12 +711,14 @@ def run_benchmark(
             "total_latency_s": total_time,
             "num_prompts": len(prompts),
             "spec_accept_lengths": spec_accept_lengths,
+            "per_request_metrics": per_request_metrics,
         }
 
     # ──────────────────────────────────────────────────────────────────────
     # Run baseline (target-only, no speculation)
     # ──────────────────────────────────────────────────────────────────────
     baseline_result = None
+    baseline_prefill_lats = None
     if not skip_baseline:
         port_baseline = find_free_port()
         print(f"\n{'='*70}")
@@ -672,8 +732,14 @@ def run_benchmark(
                 raise RuntimeError("Baseline SGLang server failed to start")
             print("Baseline server ready!")
 
+            print("Measuring per-prompt prefill latencies (baseline server)...")
+            baseline_prefill_lats = measure_prefill_latencies(url_baseline, all_prompts)
+            avg_prefill = statistics.mean(l for l in baseline_prefill_lats if l) if baseline_prefill_lats else 0
+            print(f"  Avg prefill latency: {avg_prefill*1000:.1f} ms ({len(baseline_prefill_lats)} prompts)")
+
             baseline_result = run_requests(
                 url_baseline, all_prompts, max_new_tokens, temperature, concurrency,
+                prefill_latencies=baseline_prefill_lats,
             )
             print(f"\nBaseline: {baseline_result['total_tokens']} tokens generated")
         finally:
@@ -690,21 +756,65 @@ def run_benchmark(
 
     proc_dflash, url_dflash, log_fh_dflash = launch_sglang_server(target_model, port_dflash, draft_model_path=draft_local_path)
     dflash_result = None
+    dflash_prefill_lats = None
     try:
         print("Waiting for DFlash server to start...")
         if not wait_for_server(proc_dflash, url_dflash, timeout=600):
             raise RuntimeError("DFlash SGLang server failed to start — see log above")
         print("DFlash server ready!")
 
+        print("Measuring per-prompt prefill latencies (DFlash server)...")
+        dflash_prefill_lats = measure_prefill_latencies(url_dflash, all_prompts)
+        avg_prefill_d = statistics.mean(l for l in dflash_prefill_lats if l) if dflash_prefill_lats else 0
+        print(f"  Avg prefill latency: {avg_prefill_d*1000:.1f} ms ({len(dflash_prefill_lats)} prompts)")
+
         dflash_result = run_requests(
             url_dflash, all_prompts, max_new_tokens, temperature, concurrency,
             expect_dflash=True,
+            prefill_latencies=dflash_prefill_lats,
         )
     finally:
         kill_server(proc_dflash, log_fh_dflash)
 
     if dflash_result is None:
         raise RuntimeError("DFlash benchmark produced no results")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Compute decode-only time-per-token (z-lab methodology)
+    #
+    # Z-Lab's benchmark.py computes speedup as:
+    #   mean(baseline_time_per_output_token) / mean(dflash_time_per_output_token)
+    # where time_per_output_token = decode_time / completion_tokens,
+    # and decode_time EXCLUDES prefill.
+    #
+    # We measured prefill latency per-prompt (1-token generation) and
+    # subtract it from server_e2e_latency to isolate decode-only time.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def compute_decode_only_metrics(result_dict):
+        """Compute per-request decode-only time_per_output_token.
+
+        For each request:
+          decode_time = server_e2e_latency - prefill_latency
+          time_per_output_token = decode_time / completion_tokens
+
+        Returns list of (completion_tokens, decode_time_per_token) tuples,
+        skipping requests where subtraction would be invalid.
+        """
+        out = []
+        for m in result_dict.get("per_request_metrics", []):
+            n_tok = m["completion_tokens"]
+            if n_tok <= 1:
+                continue
+            server_e2e = m.get("server_e2e_latency")
+            prefill_lat = m.get("prefill_latency")
+            if server_e2e is None or prefill_lat is None:
+                continue
+            decode_time = server_e2e - prefill_lat
+            if decode_time <= 0:
+                continue
+            out.append((n_tok, decode_time / n_tok))
+        return out
 
     # ──────────────────────────────────────────────────────────────────────
     # Results — printed immediately so they survive container shutdown
@@ -743,14 +853,26 @@ def run_benchmark(
         "avg_acceptance_length": round(avg_tau, 2) if avg_tau else 0,
     }
 
-    # Compute speedup from per-request latencies (baseline sequential only)
+    # End-to-end throughput speedup (production metric, includes prefill + HTTP)
     if baseline_result and baseline_result["total_latency_s"] and dflash_result["total_latency_s"]:
         baseline_tpt = baseline_result["total_tokens"] / baseline_result["total_latency_s"]
         dflash_tpt = dflash_result["total_tokens"] / dflash_result["total_latency_s"]
         speedup = dflash_tpt / baseline_tpt if baseline_tpt > 0 else 0
         result["baseline_tok_per_s"] = round(baseline_tpt, 1)
         result["dflash_tok_per_s"] = round(dflash_tpt, 1)
-        result["decoding_speedup"] = round(speedup, 2)
+        result["e2e_speedup"] = round(speedup, 2)
+
+    # Decode-only time-per-token speedup (z-lab paper methodology)
+    baseline_tpt_metrics = compute_decode_only_metrics(baseline_result) if baseline_result else []
+    dflash_tpt_metrics = compute_decode_only_metrics(dflash_result)
+
+    if baseline_tpt_metrics and dflash_tpt_metrics:
+        baseline_mean_tpt = statistics.mean(tpt for _, tpt in baseline_tpt_metrics)
+        dflash_mean_tpt = statistics.mean(tpt for _, tpt in dflash_tpt_metrics)
+        decode_speedup = baseline_mean_tpt / dflash_mean_tpt if dflash_mean_tpt > 0 else 0
+        result["baseline_time_per_tok_ms"] = round(baseline_mean_tpt * 1000, 3)
+        result["dflash_time_per_tok_ms"] = round(dflash_mean_tpt * 1000, 3)
+        result["decode_speedup"] = round(decode_speedup, 2)
 
     print(f"\n{'='*70}")
     print(f"RESULTS: {dataset_name} (SGLang backend)")
@@ -765,10 +887,17 @@ def run_benchmark(
     print(f"  Backend:               SGLang (KV cache, CUDA graphs, paged attention)")
     print(f"  Acceptance length (τ): {avg_tau:.2f}")
 
-    if "decoding_speedup" in result:
+    if "e2e_speedup" in result:
+        print(f"\n  --- End-to-End Throughput (includes prefill + HTTP overhead) ---")
         print(f"  Baseline throughput:   {result['baseline_tok_per_s']} tok/s")
         print(f"  DFlash throughput:     {result['dflash_tok_per_s']} tok/s")
-        print(f"  Decoding speedup:      {result['decoding_speedup']:.2f}x")
+        print(f"  E2E speedup:           {result['e2e_speedup']:.2f}x")
+
+    if "decode_speedup" in result:
+        print(f"\n  --- Decode-Only Time-per-Token (z-lab paper methodology) ---")
+        print(f"  Baseline ms/tok:       {result['baseline_time_per_tok_ms']:.3f}")
+        print(f"  DFlash ms/tok:         {result['dflash_time_per_tok_ms']:.3f}")
+        print(f"  Decode speedup:        {result['decode_speedup']:.2f}x")
 
     # z-lab reference comparison
     zlab_tau_ref = {
@@ -785,7 +914,7 @@ def run_benchmark(
               f"gap: {ref_tau - avg_tau:+.2f})")
     if dataset_name in zlab_speedup_ref:
         ref_spd = zlab_speedup_ref[dataset_name]
-        print(f"  z-lab reference speed: {ref_spd:.2f}x")
+        print(f"  z-lab reference speed: {ref_spd:.2f}x (decode-only, Transformers backend)")
 
     print(f"{'='*70}")
     sys.stdout.flush()
@@ -800,7 +929,7 @@ def run_benchmark(
 @app.local_entrypoint()
 def main(
     target_model: str = "Qwen/Qwen3-8B",
-    draft_repo: str = "/workspace/outputs/dflash-qwen3-8b/hf_model",
+    draft_repo: str = "/workspace/outputs/dflash-qwen3-8b/hf_model_188944",
     datasets: str = "gsm8k,math500",
     max_new_tokens: int = 2048,
     temperature: float = 0.0,
@@ -864,18 +993,23 @@ def main(
     print(f"\n\n{'='*70}")
     print("CROSS-DATASET SUMMARY (SGLang backend)")
     print(f"{'='*70}")
-    print(f"{'Dataset':<15} {'τ':>6} {'Speedup':>8} {'z-lab τ':>8} {'z-lab Spd':>10}")
+    print(f"{'Dataset':<15} {'τ':>6} {'E2E Spd':>8} {'Dec Spd':>8} {'z-lab τ':>8} {'z-lab Spd':>10}")
     print("-" * 70)
 
     for r in all_results:
         ds = r["dataset"]
         tau = r.get("avg_acceptance_length", 0)
-        spd = r.get("decoding_speedup", 0)
+        e2e_spd = r.get("e2e_speedup", 0)
+        dec_spd = r.get("decode_speedup", 0)
         ref_tau = zlab_tau_ref.get(ds, "-")
         ref_spd = zlab_speedup_ref.get(ds, "-")
         ref_tau_str = f"{ref_tau:.2f}" if isinstance(ref_tau, float) else ref_tau
         ref_spd_str = f"{ref_spd:.2f}x" if isinstance(ref_spd, float) else ref_spd
-        spd_str = f"{spd:.2f}x" if spd else "-"
-        print(f"{ds:<15} {tau:>6.2f} {spd_str:>8} {ref_tau_str:>8} {ref_spd_str:>10}")
+        e2e_str = f"{e2e_spd:.2f}x" if e2e_spd else "-"
+        dec_str = f"{dec_spd:.2f}x" if dec_spd else "-"
+        print(f"{ds:<15} {tau:>6.2f} {e2e_str:>8} {dec_str:>8} {ref_tau_str:>8} {ref_spd_str:>10}")
 
     print(f"{'='*70}")
+    print(f"\nE2E Spd  = end-to-end throughput speedup (includes prefill + HTTP)")
+    print(f"Dec Spd  = decode-only time-per-token speedup (z-lab paper methodology)")
+    print(f"z-lab Spd = z-lab's reported decode-only speedup (Transformers backend)")
