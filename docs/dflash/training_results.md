@@ -1837,6 +1837,93 @@ Based on the code audit, the priorities have shifted from "find bugs" to "match 
 
 ---
 
+## Phase K: Hyperparameter Sweep for Convergence (2026-03-30)
+
+### Motivation
+
+Training consistently converges quickly then plateaus (loss ~3.1, accuracy ~0.50 by epoch 2). Phase H achieved τ=3.79 but was 6.4% below z-lab's 4.05. Rather than adding more data or epochs, we investigated whether the training *recipe* itself (LR schedule, batch size, etc.) was limiting convergence.
+
+### Strategy: 3-Phase Hyperparameter Search
+
+| Phase | Data | Steps | Configs | Purpose | Cost |
+|-------|------|-------|---------|---------|------|
+| **1 — Screening** | 200K PerfectBlend | 1,000 | 6 parallel | Cheaply eliminate bad configs | ~$144 |
+| **2 — Validation** | 800K PerfectBlend | 3 epochs (~189K) | 3 parallel | Confirm winners at full scale | ~$2,200 |
+| **3 — Champion** | Full dataset | Full | 1 (best) | Production model + benchmark τ | TBD |
+
+### Phase 1 Results: Quick Screening (1,000 steps, 200K data)
+
+All runs share: 8x H100, 2I+6T, 512 anchors, seq_len=2048, WandB project `dflash-hparam-sweep`.
+
+| Run | LR Schedule | Accum | Key Difference | Final Loss | Final Acc | Duration |
+|-----|-------------|-------|----------------|-----------|----------|----------|
+| R00-baseline | cosine | 2 | Phase H config (control) | 4.545 | 0.158 | 15m |
+| R01-higherLR | cosine (lr=1e-3) | 2 | Higher learning rate | 4.290 | 0.161 | 16m |
+| R04-constantLR | constant | 2 | No LR decay | 4.168 | 0.164 | 16m |
+| **R07-accum1** | cosine | **1** | **2x optimizer steps** | **4.035** | **0.182** | 17m |
+| **R03-WSD** | **WSD (cosine)** | 2 | **Warmup-Stable-Decay** | **4.053** | **0.184** | 18m |
+| R11-aggressive | WSD + lr=1e-3 | 1 | All aggressive settings | 5.498 | 0.113 | 11m |
+
+**Winners**: R03-WSD and R07-accum1 both achieved ~12% lower loss and ~15% higher accuracy than the baseline.
+
+### Key Findings
+
+1. **WSD schedule matches accum=1** in final metrics despite using standard accumulation. The stable LR phase (80% of training at peak LR) prevents premature convergence from cosine decay.
+
+2. **accum=1 gives 2x more optimizer updates** per epoch (smaller effective batch size of 6 vs 12), which helps convergence at the cost of 2x total steps.
+
+3. **Higher LR (1e-3) hurts when combined with other aggressive settings** — R11-aggressive was the worst performer despite using both WSD and accum=1.
+
+4. **Cosine decay alone is suboptimal** — the baseline configs cluster at loss 4.2–4.5, meaningfully worse than WSD (4.05).
+
+### WSD Schedule Explained
+
+WSD (Warmup-Stable-Decay) is a 3-phase LR schedule:
+- **Warmup** (4%): Linear ramp from 0 to peak LR
+- **Stable** (76%): Constant at peak LR — the model keeps exploring
+- **Decay** (20%): Cosine decay to min_lr — the model settles
+
+vs cosine decay which starts dropping LR immediately after warmup, causing the "converge-then-plateau" pattern.
+
+### Phase 2 Status (Running)
+
+Launched 3 full-scale validation runs on 800K PerfectBlend, 3 epochs:
+- **P2-baseline**: cosine LR, accum=2 (control)
+- **P2-WSD**: WSD schedule, accum=2 (Phase 1 winner)
+- **P2-accum1**: cosine LR, accum=1 (Phase 1 winner)
+
+WandB project: `dflash-phase2`. Modal app: `ap-ITUqpphkD28glj55OZSkD0`.
+
+### Infrastructure: Sweep Runner
+
+Added `--sweep-config` flag to `modal_dflash_train.py` for parallel hyperparameter sweeps. Each run gets its own 8xH100 Modal container with isolated WandB tracking.
+
+```bash
+modal run --detach --env sandbox scripts/modal/modal_dflash_train.py \
+  --sweep-config scripts/modal/sweep_configs/convergence_sweep.json \
+  --wandb-team dflash \
+  --sweep-filter "R00-baseline,R03-WSD,R07-accum1"
+```
+
+Sweep configs live in `scripts/modal/sweep_configs/` as JSON files with `base` (shared settings) and `runs` (per-config overrides).
+
+### Best Known Training Config (as of Phase K)
+
+| Parameter | Value |
+|-----------|-------|
+| `learning_rate` | 6e-4 |
+| `min_lr` | 6e-5 |
+| `lr_decay_style` | WSD |
+| `wsd_decay_ratio` | 0.2 (last 20% of steps for decay) |
+| `wsd_decay_style` | cosine |
+| `warmup_ratio` | 0.04 |
+| `weight_decay` | 0.01 |
+| `draft_accumulation_steps` | 2 |
+| `dflash_loss_decay_gamma` | 7.0 |
+| `dflash_num_anchors` | 512 |
+
+---
+
 ## Commits (RunPod Era)
 
 | Hash | Description |

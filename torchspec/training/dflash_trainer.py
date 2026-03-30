@@ -144,16 +144,36 @@ class DFlashTrainer(Trainer):
         self.dflash = getattr(_unwrapped, "module", _unwrapped)  # DDP/replicate
         self.draft_model = self.dflash.draft_model
 
+        total_steps = self.args.lr_total_steps
+        decay_style = getattr(self.args, "lr_decay_style", "cosine")
+        warmup_ratio = getattr(self.args, "warmup_ratio", 0.1)
+
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=self.args.learning_rate,
             weight_decay=getattr(self.args, "weight_decay", 0.0),
             max_grad_norm=self.args.max_grad_norm,
-            warmup_ratio=getattr(self.args, "warmup_ratio", 0.1),
-            total_steps=self.args.lr_total_steps,
-            decay_style=getattr(self.args, "lr_decay_style", "cosine"),
+            warmup_ratio=warmup_ratio,
+            total_steps=total_steps,
+            decay_style=decay_style if decay_style != "WSD" else "cosine",
             min_lr=getattr(self.args, "min_lr", 0.0),
         )
+
+        if decay_style == "WSD" and total_steps:
+            from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
+
+            wsd_ratio = getattr(self.args, "wsd_decay_ratio", 0.2)
+            self.optimizer.scheduler = LRSchedulerWithWarmup(
+                self.optimizer.optimizer,
+                max_lr=self.args.learning_rate,
+                total_steps=total_steps,
+                warmup_steps=int(warmup_ratio * total_steps),
+                decay_style="WSD",
+                min_lr=getattr(self.args, "min_lr", 0.0),
+                wsd_decay_steps=int(wsd_ratio * total_steps),
+                wsd_decay_style=getattr(self.args, "wsd_decay_style", "cosine"),
+            )
+
         self.lr_scheduler = self.optimizer.lr_scheduler
 
         checkpoint_payload = checkpoint.load(self)

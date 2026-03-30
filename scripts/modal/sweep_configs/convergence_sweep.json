@@ -1,0 +1,71 @@
+{
+  "description": "Hyperparameter sweep for DFlash training convergence. Phase 1: screen 12 configs on 200K PerfectBlend at 1000 steps. Compare WandB curves to find best convergence trajectory.",
+  "base": {
+    "dataset_size": 200000,
+    "max_steps": 1000,
+    "wandb_project": "dflash-hparam-sweep",
+    "common_overrides": "training.dflash_num_anchors=512 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6 training.fsdp_strategy=FULL_SHARD training.fsdp_reduce_dtype=bfloat16 training.prefetch_depth=8 training.max_checkpoints=1 training.save_interval=9999 dataset.eval_data_path=null"
+  },
+  "runs": [
+    {
+      "name": "R00-baseline",
+      "description": "Phase H config (baseline for comparison)",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R01-higherLR",
+      "description": "Higher learning rate (1e-3) with proportional min_lr",
+      "overrides": "training.learning_rate=1e-3 training.min_lr=1e-4 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R02-lowerLR",
+      "description": "Lower learning rate (3e-4) for smoother convergence",
+      "overrides": "training.learning_rate=3e-4 training.min_lr=3e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R03-WSD",
+      "description": "WSD schedule: warmup-stable-decay with cosine final phase",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=WSD training.wsd_decay_ratio=0.2 training.wsd_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R04-constantLR",
+      "description": "Constant LR (no decay) to test if cosine decay causes plateau",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-4 training.lr_decay_style=constant training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R05-highWD",
+      "description": "High weight decay (0.1) for stronger regularization",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.1 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R06-noWD",
+      "description": "No weight decay (ablation of Phase H change)",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.0 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R07-accum1",
+      "description": "accum=1 for 2x more optimizer steps per epoch (smaller effective batch)",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=1 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R08-longWarmup",
+      "description": "Longer warmup (10%) for more stable early training",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.10 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "R09-sharpGamma",
+      "description": "Sharper loss decay gamma (3.0): heavier weight on early block positions",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=3.0"
+    },
+    {
+      "name": "R10-flatGamma",
+      "description": "Flatter loss decay gamma (14.0): more uniform weight across positions",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=14.0"
+    },
+    {
+      "name": "R11-aggressive",
+      "description": "Aggressive combo: higher LR + WSD + accum=1 + short warmup",
+      "overrides": "training.learning_rate=1e-3 training.min_lr=1e-4 training.lr_decay_style=WSD training.wsd_decay_ratio=0.2 training.wsd_decay_style=cosine training.warmup_ratio=0.02 training.weight_decay=0.01 training.draft_accumulation_steps=1 training.dflash_loss_decay_gamma=7.0"
+    }
+  ]
+}

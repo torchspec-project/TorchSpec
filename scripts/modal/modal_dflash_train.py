@@ -34,6 +34,15 @@ Usage:
 
     To change GPU type, edit SGLANG_GPU constant at the top of this file.
 
+Hyperparameter sweep mode:
+    modal run --detach scripts/modal/modal_dflash_train.py \
+        --sweep-config scripts/modal/sweep_configs/convergence_sweep.json
+
+    Launches N parallel training runs (one 8xH100 pod per config) with
+    different hyperparameters. All runs log to the same WandB project for
+    side-by-side comparison. See sweep_configs/convergence_sweep.json for
+    the config format.
+
 Recommended parameters (8x H100, quality-optimized with anchors=512):
     --extra-overrides "training.dflash_num_anchors=512 \
         inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
@@ -74,6 +83,7 @@ Recommended parameters (8x H100, quality-optimized with anchors=512):
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -197,9 +207,11 @@ sglang_image = (
         f"cd {SGLANG_DIR} && git apply "
         f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/sglang.patch || true",
     )
-    # Overlay local torchspec/ code on top of the pinned commit —
+    # Overlay local code on top of the pinned commit —
     # picks up local changes without full image rebuild.
     .add_local_dir("torchspec", f"{REPO_DIR}/torchspec", copy=True)
+    .add_local_dir("scripts/tools", f"{REPO_DIR}/scripts/tools", copy=True)
+    .add_local_dir("configs", f"{REPO_DIR}/configs", copy=True)
 )
 
 # =============================================================================
@@ -817,6 +829,153 @@ def convert_checkpoint(
 
 
 # =============================================================================
+# Sweep runner — parallel hyperparameter search
+# =============================================================================
+
+def _load_sweep_config(config_path: str) -> dict:
+    """Load and validate a sweep config JSON file."""
+    with open(config_path) as f:
+        sweep = json.load(f)
+
+    required = ("base", "runs")
+    for key in required:
+        if key not in sweep:
+            raise ValueError(f"Sweep config missing required key: {key}")
+
+    base = sweep["base"]
+    if "max_steps" not in base and "num_epochs" not in base:
+        raise ValueError("Sweep base config must specify 'max_steps' or 'num_epochs'")
+
+    runs = sweep["runs"]
+    if not runs:
+        raise ValueError("Sweep config has no runs defined")
+
+    names = [r["name"] for r in runs]
+    if len(names) != len(set(names)):
+        raise ValueError(f"Duplicate run names in sweep config: {names}")
+
+    return sweep
+
+
+def _run_sweep(
+    sweep_config_path: str,
+    gpu_count: int,
+    wandb_team: Optional[str] = None,
+    dataset_path: Optional[str] = None,
+    run_filter: Optional[str] = None,
+):
+    """Launch parallel training runs from a sweep config.
+
+    Each run gets its own 8xH100 Modal container. All runs share the same
+    WandB project for side-by-side comparison.
+
+    Args:
+        sweep_config_path: Path to the sweep JSON config.
+        gpu_count: GPUs per container.
+        wandb_team: WandB team name.
+        dataset_path: Override dataset path for all runs.
+        run_filter: Comma-separated list of run names to include (e.g. "R00-baseline,R01-higherLR").
+                     If None, all runs are launched.
+    """
+    sweep = _load_sweep_config(sweep_config_path)
+    base = sweep["base"]
+    runs = sweep["runs"]
+
+    filter_names = None
+    if run_filter:
+        filter_names = set(run_filter.split(","))
+        unknown = filter_names - {r["name"] for r in runs}
+        if unknown:
+            print(f"WARNING: Unknown run names in filter (ignored): {unknown}")
+
+    wandb_project = base.get("wandb_project", "dflash-hparam-sweep")
+    max_steps = base.get("max_steps", 0)
+    num_epochs = base.get("num_epochs")
+    dataset_size = base.get("dataset_size", 200000)
+    common_overrides = base.get("common_overrides", "")
+
+    selected = [r for r in runs if filter_names is None or r["name"] in filter_names]
+
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  DFlash Hyperparameter Sweep")
+    print(sep)
+    print(f"  Config:       {sweep_config_path}")
+    print(f"  Description:  {sweep.get('description', 'N/A')}")
+    print(f"  Runs:         {len(selected)} / {len(runs)}")
+    print(f"  GPU per run:  {SGLANG_GPU}")
+    if max_steps:
+        print(f"  Max steps:    {max_steps}")
+    if num_epochs:
+        print(f"  Num epochs:   {num_epochs}")
+    print(f"  Dataset:      {dataset_path or f'PerfectBlend ({dataset_size} samples)'}")
+    print(f"  WandB:        {wandb_project}")
+    print(sep)
+
+    for run_cfg in selected:
+        print(f"  [{run_cfg['name']}] {run_cfg.get('description', '')}")
+        print(f"    overrides: {run_cfg['overrides']}")
+    print()
+
+    futures = []
+    for run_cfg in selected:
+        run_name = run_cfg["name"]
+        run_overrides_parts = []
+        if common_overrides:
+            run_overrides_parts.append(common_overrides)
+        if run_cfg.get("overrides"):
+            run_overrides_parts.append(run_cfg["overrides"])
+        run_overrides_parts.append(f"logging.wandb_run_id=sweep-{run_name}")
+        merged_overrides = " ".join(run_overrides_parts)
+
+        epoch_val = num_epochs if num_epochs and num_epochs > 0 else None
+
+        print(f"  Spawning [{run_name}] ...")
+        f = train_sglang.spawn(
+            gpu_count=gpu_count,
+            max_steps=max_steps if not epoch_val else 0,
+            num_epochs=epoch_val,
+            run_eagle3=False,
+            run_dflash=True,
+            wandb_project=wandb_project,
+            wandb_team=wandb_team,
+            dataset_path=dataset_path,
+            dataset_size=dataset_size,
+            extra_overrides=merged_overrides or None,
+            hf_repo=None,
+            resume=False,
+        )
+        futures.append((run_name, f))
+
+    print(f"\n  All {len(futures)} runs spawned. Waiting for completion...")
+    print(f"  Monitor at: https://wandb.ai/{wandb_team or '_'}/{wandb_project}\n")
+
+    results = {}
+    for run_name, f in futures:
+        try:
+            f.get()
+            results[run_name] = "OK"
+            print(f"  [{run_name}] completed successfully")
+        except Exception as e:
+            results[run_name] = f"FAILED: {e}"
+            print(f"  [{run_name}] FAILED: {e}")
+
+    print(f"\n{sep}")
+    print("  Sweep Complete!")
+    print(sep)
+    for name, status in results.items():
+        print(f"  [{name}]: {status}")
+    print()
+    print(f"  Compare runs at: https://wandb.ai/{wandb_team or '_'}/{wandb_project}")
+    print(f"  Key metrics: train/avg_loss, train/avg_acc, train/lr, train/grad_norm")
+    print()
+
+    failed = [n for n, s in results.items() if s != "OK"]
+    if failed:
+        print(f"  WARNING: {len(failed)} run(s) failed: {failed}")
+
+
+# =============================================================================
 # CLI entry point
 # =============================================================================
 
@@ -836,7 +995,20 @@ def main(
     convert_only: str = "",
     convert_step: int = 0,
     resume: bool = False,
+    sweep_config: str = "",
+    sweep_filter: str = "",
 ):
+    # --- Sweep mode: parallel hyperparameter search ---
+    if sweep_config:
+        _run_sweep(
+            sweep_config_path=sweep_config,
+            gpu_count=gpu_count,
+            wandb_team=wandb_team,
+            dataset_path=dataset_path,
+            run_filter=sweep_filter or None,
+        )
+        return
+
     # --- Convert-only mode: no GPU, just convert + upload ---
     if convert_only:
         if not hf_repo:
