@@ -23,9 +23,6 @@
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from torchspec.inference.engine.hf_engine import HFEngine
-from torchspec.inference.engine.sgl_engine import SglEngine
-from torchspec.inference.engine.vllm_engine import VllmEngine
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
@@ -131,6 +128,8 @@ def _prepare_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -
 
     logger.info(f"Initializing {num_engines} HF engines ({num_gpus_per_engine} GPU(s) each)")
 
+    from torchspec.inference.engine.hf_engine import HFEngine
+
     HFRayActor = ray.remote(HFEngine)
     return _create_and_init_actors(
         args,
@@ -188,6 +187,8 @@ def _prepare_sgl_engines(
     )
 
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    from torchspec.inference.engine.sgl_engine import SglEngine
+
     SglRayActor = ray.remote(SglEngine)
     env_vars = get_torchspec_env_vars()
 
@@ -328,6 +329,8 @@ def _prepare_vllm_engines(
     )
 
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    from torchspec.inference.engine.vllm_engine import VllmEngine
+
     VllmRayActor = ray.remote(VllmEngine)
     env_vars = get_torchspec_env_vars()
 
