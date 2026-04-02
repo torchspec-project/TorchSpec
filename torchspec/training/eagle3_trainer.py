@@ -188,6 +188,7 @@ class Eagle3Trainer(Trainer):
             self.target_lm_head = TargetLMHead.from_pretrained(
                 model_path=target_model_path,
                 lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
                 load_norm=self._last_hs_prenorm,
                 device="cuda",
                 dtype=torch.bfloat16,

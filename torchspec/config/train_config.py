@@ -85,6 +85,7 @@ class ModelConfig:
     draft_model_config: Optional[str] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
+    norm_key: str = "model.norm.weight"
     target_model_backend: str = "sglang"
     target_model_path: str = ""
     trust_remote_code: bool = False
