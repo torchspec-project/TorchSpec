@@ -235,13 +235,30 @@ def _save_with_vocab_pruning(
 
     lm_head_key = "lm_head.weight"
     if lm_head_key in tensors:
-        target_ids = torch.arange(draft_vocab_size) + d2t
-        logger.info(
-            "Trimming lm_head from %d to %d",
-            tensors[lm_head_key].shape[0],
-            draft_vocab_size,
-        )
-        tensors[lm_head_key] = tensors[lm_head_key][target_ids]
+        current_size = tensors[lm_head_key].shape[0]
+        if current_size == vocab_size and current_size != draft_vocab_size:
+            # lm_head is full vocab — prune to draft vocab using d2t mapping
+            logger.info(
+                "Trimming lm_head from %d to %d using d2t mapping",
+                current_size,
+                draft_vocab_size,
+            )
+            tensors[lm_head_key] = tensors[lm_head_key][d2t]
+        elif current_size == draft_vocab_size:
+            raise ValueError(
+                f"lm_head is already pruned to draft_vocab_size ({current_size}). "
+                f"This model was trained with vocabulary pruning, so the lm_head weight "
+                f"ordering is tied to the training data's token mapping. "
+                f"Post-training re-pruning with a different dataset is not supported. "
+                f"Retrain with draft_vocab_size == vocab_size (full vocab) for post-training pruning."
+            )
+        else:
+            logger.warning(
+                "lm_head size (%d) matches neither vocab_size (%d) nor draft_vocab_size (%d), skipping trim",
+                current_size,
+                vocab_size,
+                draft_vocab_size,
+            )
 
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
@@ -434,8 +451,15 @@ def _convert_fsdp_to_hf(
     with open(config_path) as f:
         raw_config = json.load(f)
     vocab_size = raw_config["vocab_size"]
+    config_draft_vocab_size = raw_config.get("draft_vocab_size") or vocab_size
 
     if not prune_vocab:
+        if config_draft_vocab_size != vocab_size:
+            raise ValueError(
+                f"draft_vocab_size ({config_draft_vocab_size}) != vocab_size ({vocab_size}) "
+                f"in {config_path}. This model was trained with vocabulary pruning. "
+                f"Use --prune-vocab to generate t2d/d2t token mappings during conversion."
+            )
         _save_without_vocab_pruning(hf_model, output_dir, config_path, vocab_size)
         return
 
