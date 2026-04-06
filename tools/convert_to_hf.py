@@ -237,10 +237,19 @@ def _extract_model_weights(
     return model_state
 
 
+def _prepare_export_tensors(hf_model, export_for_vllm: bool) -> dict[str, torch.Tensor]:
+    tensors = hf_model.state_dict()
+    if export_for_vllm:
+        logger.info("Exporting vLLM-compatible checkpoint keys")
+        return _remap_weight_keys(tensors)
+    logger.info("Exporting native checkpoint keys")
+    return dict(tensors)
+
+
 def _save_without_vocab_pruning(
-    hf_model, output_dir: str, raw_config: dict, vocab_size: int
+    hf_model, output_dir: str, raw_config: dict, vocab_size: int, export_for_vllm: bool = False
 ) -> None:
-    tensors = _remap_weight_keys(hf_model.state_dict())
+    tensors = _prepare_export_tensors(hf_model, export_for_vllm)
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
     export_config = _fixup_export_config(raw_config)
@@ -265,8 +274,9 @@ def _save_with_vocab_pruning(
     draft_vocab_size: int,
     d2t: torch.Tensor,
     t2d: torch.Tensor,
+    export_for_vllm: bool = False,
 ) -> None:
-    tensors = _remap_weight_keys(hf_model.state_dict())
+    tensors = _prepare_export_tensors(hf_model, export_for_vllm)
     tensors["t2d"] = t2d
     tensors["d2t"] = d2t
 
@@ -426,6 +436,7 @@ def _convert_fsdp_to_hf(
     output_dir: str,
     target_model_path: Optional[str] = None,
     embedding_key: str = "model.embed_tokens",
+    export_for_vllm: bool = False,
     output_dtype: Optional[torch.dtype] = None,
     prune_vocab: bool = False,
     dataset_path: Optional[str] = None,
@@ -498,7 +509,9 @@ def _convert_fsdp_to_hf(
                 f"in {config_path}. This model was trained with vocabulary pruning. "
                 f"Use --prune-vocab to generate t2d/d2t token mappings during conversion."
             )
-        _save_without_vocab_pruning(hf_model, output_dir, raw_config, vocab_size)
+        _save_without_vocab_pruning(
+            hf_model, output_dir, raw_config, vocab_size, export_for_vllm=export_for_vllm
+        )
         return
 
     # ── Vocab pruning ────────────────────────────────────────────────────
@@ -526,7 +539,14 @@ def _convert_fsdp_to_hf(
 
     d2t, t2d = process_token_dict_to_mappings(token_dict, draft_vocab_size, vocab_size)
     _save_with_vocab_pruning(
-        hf_model, output_dir, raw_config, vocab_size, draft_vocab_size, d2t, t2d
+        hf_model,
+        output_dir,
+        raw_config,
+        vocab_size,
+        draft_vocab_size,
+        d2t,
+        t2d,
+        export_for_vllm=export_for_vllm,
     )
 
 
@@ -569,6 +589,11 @@ def _parse_args() -> argparse.Namespace:
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading target model config/tokenizer",
+    )
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        help="Export vLLM-compatible checkpoint keys. Defaults to native keys for sglang.",
     )
     parser.add_argument(
         "--dtype",
@@ -717,6 +742,7 @@ if __name__ == "__main__":
         output_dir=output_dir,
         target_model_path=args.target_model_path,
         embedding_key=args.embedding_key,
+        export_for_vllm=args.vllm,
         output_dtype=output_dtype,
         prune_vocab=args.prune_vocab,
         dataset_path=args.dataset_path,
