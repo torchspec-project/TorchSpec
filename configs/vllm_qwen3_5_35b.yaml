@@ -9,7 +9,7 @@
 #   pip install -e ".[vllm]"  # Install vLLM backend
 #
 # Usage:
-#   python -m torchspec.train_entry --config configs/vllm_qwen3_35b.yaml
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_5_35b.yaml
 #
 # Note: Uses vLLM's extract_hidden_states speculative method with MooncakeHiddenStatesConnector.
 
