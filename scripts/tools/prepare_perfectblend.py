@@ -49,9 +49,7 @@ def is_valid_conversation(conv):
     if not has_assistant:
         return False
     # Check minimum content length (need enough tokens for block_size=16)
-    total_assistant_chars = sum(
-        len(m["content"]) for m in conv if m["role"] == "assistant"
-    )
+    total_assistant_chars = sum(len(m["content"]) for m in conv if m["role"] == "assistant")
     if total_assistant_chars < 50:
         return False
     return True
@@ -60,11 +58,11 @@ def is_valid_conversation(conv):
 def main():
     parser = argparse.ArgumentParser(description="Prepare PerfectBlend for DFlash training")
     parser.add_argument("--output", type=str, required=True, help="Output JSONL path")
-    parser.add_argument("--sample-size", type=int, default=None,
-                        help="Number of samples (default: all)")
+    parser.add_argument(
+        "--sample-size", type=int, default=None, help="Number of samples (default: all)"
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--min-turns", type=int, default=2,
-                        help="Minimum conversation turns")
+    parser.add_argument("--min-turns", type=int, default=2, help="Minimum conversation turns")
     args = parser.parse_args()
 
     random.seed(args.seed)

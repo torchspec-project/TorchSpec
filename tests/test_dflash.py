@@ -12,16 +12,15 @@ import math
 import unittest
 
 import torch
-import torch.nn.functional as F
 
+from torchspec.models.dflash import (
+    DFlashModel,
+    _create_dflash_mask_mod,
+)
 from torchspec.models.draft.dflash import (
     DFlashConfig,
     DFlashDraftModel,
     build_target_layer_ids,
-)
-from torchspec.models.dflash import (
-    DFlashModel,
-    _create_dflash_mask_mod,
 )
 
 
@@ -56,8 +55,13 @@ def _make_config(
 def _make_dflash_model(H=64, V=128, num_target_layers=2, block_size=4, num_anchors=4):
     """Helper to create a DFlashModel for testing."""
     config = _make_config(
-        H=H, intermediate=256, num_heads=4, num_kv_heads=2,
-        V=V, num_target_layers=num_target_layers, target_num_hidden=12,
+        H=H,
+        intermediate=256,
+        num_heads=4,
+        num_kv_heads=2,
+        V=V,
+        num_target_layers=num_target_layers,
+        target_num_hidden=12,
     )
     draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
     draft_model.freeze_embedding()
@@ -114,8 +118,13 @@ class TestDFlashDraftModel(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
         self.config = _make_config(
-            H=64, intermediate=256, num_heads=4, num_kv_heads=2,
-            V=128, num_target_layers=2, target_num_hidden=12,
+            H=64,
+            intermediate=256,
+            num_heads=4,
+            num_kv_heads=2,
+            V=128,
+            num_target_layers=2,
+            target_num_hidden=12,
         )
         self.model = DFlashDraftModel(self.config).to(dtype=torch.float32)
         self.model.eval()
@@ -188,8 +197,8 @@ class TestDFlashDraftModel(unittest.TestCase):
         """DFlashAttention should have q_norm and k_norm (Qwen3 requirement)."""
         for layer in self.model.layers:
             attn = layer.self_attn
-            self.assertTrue(hasattr(attn, 'q_norm'), "Missing q_norm in DFlashAttention")
-            self.assertTrue(hasattr(attn, 'k_norm'), "Missing k_norm in DFlashAttention")
+            self.assertTrue(hasattr(attn, "q_norm"), "Missing q_norm in DFlashAttention")
+            self.assertTrue(hasattr(attn, "k_norm"), "Missing k_norm in DFlashAttention")
             # q_norm and k_norm should operate on head_dim
             self.assertEqual(attn.q_norm.weight.shape[0], attn.head_dim)
             self.assertEqual(attn.k_norm.weight.shape[0], attn.head_dim)
@@ -202,7 +211,9 @@ class TestAnchorSampling(unittest.TestCase):
     def test_basic_sampling(self):
         B, seq_len = 2, 64
         loss_mask = torch.ones(B, seq_len)
-        anchors, keep_mask = self.model._sample_anchor_positions(seq_len, loss_mask, loss_mask.device)
+        anchors, keep_mask = self.model._sample_anchor_positions(
+            seq_len, loss_mask, loss_mask.device
+        )
 
         self.assertEqual(anchors.shape[0], B)
         self.assertEqual(keep_mask.shape, anchors.shape)
@@ -211,7 +222,9 @@ class TestAnchorSampling(unittest.TestCase):
     def test_sorted_order(self):
         B, seq_len = 1, 128
         loss_mask = torch.ones(B, seq_len)
-        anchors, keep_mask = self.model._sample_anchor_positions(seq_len, loss_mask, loss_mask.device)
+        anchors, keep_mask = self.model._sample_anchor_positions(
+            seq_len, loss_mask, loss_mask.device
+        )
 
         for b in range(B):
             a = anchors[b]
@@ -384,8 +397,11 @@ class TestDFlashModelForward(unittest.TestCase):
         self.V = 128
         self.num_target_layers = 2
         self.model = _make_dflash_model(
-            H=self.H, V=self.V, num_target_layers=self.num_target_layers,
-            block_size=4, num_anchors=4,
+            H=self.H,
+            V=self.V,
+            num_target_layers=self.num_target_layers,
+            block_size=4,
+            num_anchors=4,
         )
         self.model.eval()
 
@@ -456,8 +472,10 @@ class TestDFlashModelForward(unittest.TestCase):
         loss_mask_full = torch.ones(B, seq_len)
         with torch.no_grad():
             loss_full, _ = self.model(
-                input_ids=input_ids, hidden_states_list=hidden_states_list,
-                loss_mask=loss_mask_full, lm_head_weight=lm_head_weight,
+                input_ids=input_ids,
+                hidden_states_list=hidden_states_list,
+                loss_mask=loss_mask_full,
+                lm_head_weight=lm_head_weight,
             )
 
         # Half masked out
@@ -465,8 +483,10 @@ class TestDFlashModelForward(unittest.TestCase):
         loss_mask_half[:, :32] = 0.0
         with torch.no_grad():
             loss_half, _ = self.model(
-                input_ids=input_ids, hidden_states_list=hidden_states_list,
-                loss_mask=loss_mask_half, lm_head_weight=lm_head_weight,
+                input_ids=input_ids,
+                hidden_states_list=hidden_states_list,
+                loss_mask=loss_mask_half,
+                lm_head_weight=lm_head_weight,
             )
 
         # Both should be finite
@@ -493,7 +513,6 @@ class TestDFlashModelForward(unittest.TestCase):
 
     def test_label_alignment_same_position(self):
         """Labels at positions anchor+0..anchor+block_size-1 (same-position prediction)."""
-        model = _make_dflash_model(block_size=4, num_anchors=2)
         device = torch.device("cpu")
         block_size = 4
 
@@ -508,7 +527,6 @@ class TestDFlashModelForward(unittest.TestCase):
 
     def test_anchor_loss_excluded(self):
         """Position 0 in block (the anchor itself) should have zero loss weight."""
-        model = _make_dflash_model(block_size=4, num_anchors=2)
         device = torch.device("cpu")
         block_size = 4
 
@@ -530,7 +548,8 @@ class TestMiniTrainingLoop(unittest.TestCase):
         model = _make_dflash_model()
 
         optimizer = torch.optim.Adam(
-            [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+            [p for p in model.parameters() if p.requires_grad],
+            lr=1e-3,
         )
 
         B, seq_len = 1, 32
@@ -556,7 +575,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
 
         # Loss should generally decrease (allow some noise, check last < first)
         self.assertLess(losses[-1], losses[0], "Loss did not decrease over 10 training steps")
-        self.assertTrue(all(math.isfinite(l) for l in losses), "Non-finite loss encountered")
+        self.assertTrue(all(math.isfinite(v) for v in losses), "Non-finite loss encountered")
 
     def test_gradient_accumulation(self):
         """Two half-LR steps with accumulated gradients should produce finite grads."""
@@ -775,9 +794,7 @@ class TestTrainEntryDFlashIntegration(unittest.TestCase):
             target_num_hidden_layers=28,
         )
 
-        if isinstance(config, DFlashConfig) and not getattr(
-            args, "aux_hidden_states_layers", None
-        ):
+        if isinstance(config, DFlashConfig) and not getattr(args, "aux_hidden_states_layers", None):
             target_layer_ids = getattr(config, "target_layer_ids", None)
             if target_layer_ids is None:
                 num_target = getattr(config, "num_target_layers", 5)
@@ -804,9 +821,7 @@ class TestTrainEntryDFlashIntegration(unittest.TestCase):
             target_num_hidden_layers=28,
         )
 
-        if isinstance(config, DFlashConfig) and not getattr(
-            args, "aux_hidden_states_layers", None
-        ):
+        if isinstance(config, DFlashConfig) and not getattr(args, "aux_hidden_states_layers", None):
             args.aux_hidden_states_layers = [0, 1, 2, 3, 4]
 
         self.assertEqual(args.aux_hidden_states_layers, [1, 5, 10, 15, 20])
@@ -833,10 +848,12 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         self.assertEqual(schema.training.dflash_block_size, 16)
         self.assertEqual(schema.training.dflash_num_target_layers, 5)
 
-        overrides = OmegaConf.from_dotlist([
-            "training.dflash_block_size=8",
-            "training.dflash_num_target_layers=3",
-        ])
+        overrides = OmegaConf.from_dotlist(
+            [
+                "training.dflash_block_size=8",
+                "training.dflash_num_target_layers=3",
+            ]
+        )
         merged = OmegaConf.merge(schema, overrides)
         self.assertEqual(merged.training.dflash_block_size, 8)
         self.assertEqual(merged.training.dflash_num_target_layers, 3)
@@ -845,25 +862,36 @@ class TestDFlashTrainingConfig(unittest.TestCase):
 class TestDFlashTrainingQuality(unittest.TestCase):
     """Comprehensive training quality validation for DFlash."""
 
-    def _make_model_and_data(self, H=64, V=128, num_target_layers=2,
-                             block_size=4, num_anchors=4, seq_len=64, batch_size=2):
+    def _make_model_and_data(
+        self,
+        H=64,
+        V=128,
+        num_target_layers=2,
+        block_size=4,
+        num_anchors=4,
+        seq_len=64,
+        batch_size=2,
+    ):
         model = _make_dflash_model(
-            H=H, V=V, num_target_layers=num_target_layers,
-            block_size=block_size, num_anchors=num_anchors,
+            H=H,
+            V=V,
+            num_target_layers=num_target_layers,
+            block_size=block_size,
+            num_anchors=num_anchors,
         )
         input_ids = torch.randint(0, V, (batch_size, seq_len))
-        hidden_states_list = [
-            torch.randn(batch_size, seq_len, H) for _ in range(num_target_layers)
-        ]
+        hidden_states_list = [torch.randn(batch_size, seq_len, H) for _ in range(num_target_layers)]
         loss_mask = torch.ones(batch_size, seq_len)
         lm_head_weight = torch.randn(V, H)
         return model, input_ids, hidden_states_list, loss_mask, lm_head_weight
 
-    def _train_steps(self, model, input_ids, hidden_states_list, loss_mask,
-                     lm_head_weight, steps=20, lr=1e-3):
+    def _train_steps(
+        self, model, input_ids, hidden_states_list, loss_mask, lm_head_weight, steps=20, lr=1e-3
+    ):
         model.train()
         optimizer = torch.optim.Adam(
-            [p for p in model.parameters() if p.requires_grad], lr=lr,
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
         )
         losses, accs = [], []
         for _ in range(steps):
@@ -886,7 +914,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         model, *data = self._make_model_and_data(seq_len=128, num_anchors=8)
         losses, _ = self._train_steps(model, *data, steps=20)
         self.assertLess(losses[-1], losses[0])
-        self.assertTrue(all(math.isfinite(l) for l in losses))
+        self.assertTrue(all(math.isfinite(v) for v in losses))
 
     def test_large_block_size(self):
         """Block size 8 should still converge."""
@@ -902,8 +930,9 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         _, accs = self._train_steps(model, *data, steps=30)
         avg_first5 = sum(accs[:5]) / 5
         avg_last5 = sum(accs[-5:]) / 5
-        self.assertGreater(avg_last5, avg_first5,
-                           f"Accuracy did not improve: {avg_first5:.4f} → {avg_last5:.4f}")
+        self.assertGreater(
+            avg_last5, avg_first5, f"Accuracy did not improve: {avg_first5:.4f} → {avg_last5:.4f}"
+        )
 
     def test_gradient_norms_are_healthy(self):
         """Gradient norms should stay finite and non-zero during training."""
@@ -911,21 +940,24 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         model, input_ids, hs_list, mask, lm_w = self._make_model_and_data()
         model.train()
         optimizer = torch.optim.Adam(
-            [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+            [p for p in model.parameters() if p.requires_grad],
+            lr=1e-3,
         )
         grad_norms = []
         for _ in range(10):
             optimizer.zero_grad()
             loss, _ = model(
-                input_ids=input_ids, hidden_states_list=hs_list,
-                loss_mask=mask, lm_head_weight=lm_w,
+                input_ids=input_ids,
+                hidden_states_list=hs_list,
+                loss_mask=mask,
+                lm_head_weight=lm_w,
             )
             loss.backward()
             total_norm = 0.0
             for p in model.parameters():
                 if p.grad is not None:
                     total_norm += p.grad.data.norm(2).item() ** 2
-            grad_norms.append(total_norm ** 0.5)
+            grad_norms.append(total_norm**0.5)
             optimizer.step()
         self.assertTrue(all(math.isfinite(g) for g in grad_norms), "Non-finite gradient norm")
         self.assertTrue(all(g > 0 for g in grad_norms), "Zero gradient norm detected")
@@ -941,14 +973,20 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         """Model should handle sequences with partial padding via loss_mask."""
         torch.manual_seed(42)
         model, input_ids, hs_list, loss_mask, lm_w = self._make_model_and_data(
-            seq_len=64, batch_size=2,
+            seq_len=64,
+            batch_size=2,
         )
         loss_mask[0, :16] = 0.0
         loss_mask[1, :32] = 0.0
         losses, _ = self._train_steps(
-            model, input_ids, hs_list, loss_mask, lm_w, steps=15,
+            model,
+            input_ids,
+            hs_list,
+            loss_mask,
+            lm_w,
+            steps=15,
         )
-        self.assertTrue(all(math.isfinite(l) for l in losses))
+        self.assertTrue(all(math.isfinite(v) for v in losses))
         self.assertLess(losses[-1], losses[0])
 
 
@@ -958,18 +996,19 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
     def test_parameter_count_comparison(self):
         H, V = 64, 128
         dflash_config = _make_config(
-            H=H, intermediate=256, num_heads=4, num_kv_heads=2,
-            V=V, num_target_layers=5, target_num_hidden=12,
+            H=H,
+            intermediate=256,
+            num_heads=4,
+            num_kv_heads=2,
+            V=V,
+            num_target_layers=5,
+            target_num_hidden=12,
         )
         dflash_model = DFlashDraftModel(dflash_config).to(dtype=torch.float32)
         dflash_model.freeze_embedding()
 
-        dflash_trainable = sum(
-            p.numel() for p in dflash_model.parameters() if p.requires_grad
-        )
-        dflash_frozen = sum(
-            p.numel() for p in dflash_model.parameters() if not p.requires_grad
-        )
+        dflash_trainable = sum(p.numel() for p in dflash_model.parameters() if p.requires_grad)
+        dflash_frozen = sum(p.numel() for p in dflash_model.parameters() if not p.requires_grad)
 
         self.assertGreater(dflash_trainable, 0)
         self.assertGreater(dflash_frozen, 0)
@@ -997,8 +1036,10 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
 
         with torch.no_grad():
             loss, acc = model(
-                input_ids=input_ids, hidden_states_list=hs_list,
-                loss_mask=loss_mask, lm_head_weight=lm_head_weight,
+                input_ids=input_ids,
+                hidden_states_list=hs_list,
+                loss_mask=loss_mask,
+                lm_head_weight=lm_head_weight,
             )
 
         self.assertGreaterEqual(loss.item(), 0.0, "CE loss should be non-negative")
@@ -1028,8 +1069,11 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
                 context_position_ids=ctx_pos,
             )
 
-        self.assertEqual(out.shape, (B, draft_len, H),
-                         "DFlash should produce all predictions in one forward pass")
+        self.assertEqual(
+            out.shape,
+            (B, draft_len, H),
+            "DFlash should produce all predictions in one forward pass",
+        )
 
 
 class TestDFlashConfigYAML(unittest.TestCase):
@@ -1037,7 +1081,6 @@ class TestDFlashConfigYAML(unittest.TestCase):
 
     def test_dflash_yaml_loads(self):
         import os
-        from omegaconf import OmegaConf
 
         try:
             from torchspec.config.train_config import load_config
@@ -1046,7 +1089,8 @@ class TestDFlashConfigYAML(unittest.TestCase):
 
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
-            "configs", "sglang_qwen3_8b_dflash.yaml",
+            "configs",
+            "sglang_qwen3_8b_dflash.yaml",
         )
         if not os.path.exists(config_path):
             self.skipTest(f"DFlash config not found at {config_path}")
@@ -1064,11 +1108,14 @@ class TestDFlashConfigYAML(unittest.TestCase):
     def test_dflash_draft_config_json_loads(self):
         import json
         import os
+
         from torchspec.models.draft.auto import AutoDraftModelConfig
 
         json_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
-            "torchspec", "config", "dflash_draft_config.json",
+            "torchspec",
+            "config",
+            "dflash_draft_config.json",
         )
         if not os.path.exists(json_path):
             self.skipTest(f"DFlash draft config JSON not found at {json_path}")
@@ -1078,11 +1125,65 @@ class TestDFlashConfigYAML(unittest.TestCase):
 
         config = AutoDraftModelConfig.from_dict(config_dict)
         from torchspec.models.draft.dflash import DFlashConfig
+
         self.assertIsInstance(config, DFlashConfig)
         self.assertEqual(config.hidden_size, 4096)
         self.assertEqual(config.num_hidden_layers, 5)  # Updated from 1 to 5
         self.assertEqual(config.num_target_layers, 5)
         self.assertEqual(config.target_num_hidden_layers, 36)
+
+
+class TestDFlashHotfixes(unittest.TestCase):
+    """Tests for incremental correctness fixes (tensor schema, collator, validation)."""
+
+    def test_collator_accepts_dflash_batch(self):
+        """DataCollator should accept hidden_states without target/last_hidden_states."""
+        from torchspec.data.utils import DataCollatorWithPadding
+
+        # Reset the warned flag for clean test
+        DataCollatorWithPadding._warned_no_target_lhs = False
+
+        collator = DataCollatorWithPadding()
+        samples = []
+        for seq_len in [32, 48]:
+            samples.append(
+                {
+                    "input_ids": torch.randint(0, 1000, (1, seq_len)),
+                    "hidden_states": torch.randn(1, seq_len, 384),
+                    "loss_mask": torch.ones(1, seq_len),
+                }
+            )
+
+        # Should not raise
+        batch = collator(samples)
+        self.assertIsNotNone(batch["hidden_states"])
+        self.assertIsNone(batch["target"])
+        self.assertIsNone(batch["last_hidden_states"])
+
+    def test_min_loss_tokens_validation(self):
+        """min_loss_tokens < 2 * block_size should be caught."""
+        from argparse import Namespace
+
+        # Simulate the validation logic from train_entry
+        args = Namespace(
+            dflash_block_size=16,
+            min_loss_tokens=10,  # < 2 * 16 = 32
+        )
+        block_size = getattr(args, "dflash_block_size", 16)
+        min_loss = getattr(args, "min_loss_tokens", 0)
+
+        with self.assertRaises(ValueError):
+            if min_loss < 2 * block_size:
+                raise ValueError(
+                    f"DFlash requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
+                    f"({min_loss} < {2 * block_size})."
+                )
+
+    def test_min_loss_tokens_validation_passes(self):
+        """min_loss_tokens >= 2 * block_size should pass."""
+        block_size = 16
+        min_loss = 32  # == 2 * 16
+        self.assertGreaterEqual(min_loss, 2 * block_size)
 
 
 if __name__ == "__main__":

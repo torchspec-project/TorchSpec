@@ -26,7 +26,6 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
-import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -149,12 +148,8 @@ class DFlashModel(nn.Module):
             keep_mask = torch.zeros(bsz, max_n, dtype=torch.bool, device=device)
             return anchors, keep_mask
 
-        indices = (
-            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
+        indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
+        masked_indices = torch.where(valid, indices, torch.tensor(seq_len + 1, device=device))
 
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
         random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
@@ -170,12 +165,10 @@ class DFlashModel(nn.Module):
             selected = torch.cat([selected, pad], dim=1)
         anchors = selected
 
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(
-            0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
-        )
+        keep_mask = torch.arange(max_n, device=device).unsqueeze(0) < valid_counts.unsqueeze(
+            1
+        ).clamp(max=max_n)
+        anchors = torch.where(keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device))
 
         return anchors, keep_mask
 
@@ -186,9 +179,7 @@ class DFlashModel(nn.Module):
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        )
+        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
         draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
         draft_position_ids = draft_position_ids.view(bsz, -1)
@@ -255,9 +246,7 @@ class DFlashModel(nn.Module):
         n_blocks = anchor_positions.shape[1]
 
         # 3. Create noise embeddings (anchor token + MASK tokens)
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
-        )
+        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
 
         # 4. Create position IDs
         context_position_ids, draft_position_ids = self._create_position_ids(
@@ -296,7 +285,11 @@ class DFlashModel(nn.Module):
         )
 
         # 7. Compute logits via frozen LM head
-        logits = self.draft_model.lm_head(draft_hidden) if hasattr(self.draft_model, 'lm_head') else F.linear(draft_hidden, lm_head_weight)
+        logits = (
+            self.draft_model.lm_head(draft_hidden)
+            if hasattr(self.draft_model, "lm_head")
+            else F.linear(draft_hidden, lm_head_weight)
+        )
 
         # 8. Compute labels and weight mask (SpecForge pattern)
         # Labels: same-position prediction (position k predicts token at anchor+k)
@@ -312,9 +305,7 @@ class DFlashModel(nn.Module):
         )  # [B, n_blocks, block_size]
 
         # Weight mask: block validity × bounds × exclude anchor (pos 0) × loss_mask
-        weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
-        )
+        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         weight_mask = weight_mask * valid_label_mask.float()
 
         pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
@@ -337,9 +328,7 @@ class DFlashModel(nn.Module):
         # Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
+            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
 
         # 9. Cross entropy loss

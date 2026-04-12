@@ -189,8 +189,7 @@ class DFlashTrainer(Trainer):
 
         if self.target_lm_head is None:
             raise ValueError(
-                "target_lm_head is required but was None. "
-                "Ensure _init_target_lm_head succeeded."
+                "target_lm_head is required but was None. Ensure _init_target_lm_head succeeded."
             )
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
 
@@ -341,19 +340,20 @@ class DFlashTrainer(Trainer):
         # Sub-timing breakdown (forward vs backward)
         fwd_ms = sum(
             m["_fwd_events"][0].elapsed_time(m["_fwd_events"][1])
-            for m in all_step_metrics if "_fwd_events" in m
+            for m in all_step_metrics
+            if "_fwd_events" in m
         )
         bwd_ms = sum(
             m["_bwd_events"][0].elapsed_time(m["_bwd_events"][1])
-            for m in all_step_metrics if "_bwd_events" in m
+            for m in all_step_metrics
+            if "_bwd_events" in m
         )
         metrics["perf/forward_time"] = fwd_ms / 1000.0
         metrics["perf/backward_time"] = bwd_ms / 1000.0
 
         if dist.get_rank() == 0 and (step % 5 == 0 or step <= 5):
             logger.info(
-                f"COMPUTE_BREAKDOWN step={step}: "
-                f"forward={fwd_ms:.1f}ms backward={bwd_ms:.1f}ms"
+                f"COMPUTE_BREAKDOWN step={step}: forward={fwd_ms:.1f}ms backward={bwd_ms:.1f}ms"
             )
 
         if dist.get_rank() == 0:

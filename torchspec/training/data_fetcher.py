@@ -182,7 +182,11 @@ class MooncakeDataset(IterableDataset):
                 )
                 continue
 
-            if self._min_loss_tokens > 0 and isinstance(mask, torch.Tensor) and mask.sum() < self._min_loss_tokens:
+            if (
+                self._min_loss_tokens > 0
+                and isinstance(mask, torch.Tensor)
+                and mask.sum() < self._min_loss_tokens
+            ):
                 skip_count += 1
                 logger.warning(
                     f"Skipping sample with too few loss-masked tokens "

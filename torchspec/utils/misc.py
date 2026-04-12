@@ -88,9 +88,7 @@ def get_default_eagle3_aux_layer_ids(model_path: str) -> List[int]:
     return [1, num_layers // 2 - 1, num_layers - 4]
 
 
-def get_default_dflash_aux_layer_ids(
-    model_path: str, num_target_layers: int = 5
-) -> List[int]:
+def get_default_dflash_aux_layer_ids(model_path: str, num_target_layers: int = 5) -> List[int]:
     """Get default auxiliary hidden state layer IDs for DFlash.
 
     Uses the same uniform spacing algorithm as DFlashDraftModel.build_target_layer_ids().

@@ -5,7 +5,6 @@ Uses the same loading approach as tools/convert_to_hf.py — no distributed setu
 """
 
 import argparse
-import glob
 import os
 
 import torch
@@ -42,17 +41,20 @@ class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_dir", required=True,
-                        help="Path to FSDP checkpoint directory (iter_XXXXXXX)")
-    parser.add_argument("--output", default="dflash_draft.pt",
-                        help="Output .pt file path")
+    parser.add_argument(
+        "--checkpoint_dir", required=True, help="Path to FSDP checkpoint directory (iter_XXXXXXX)"
+    )
+    parser.add_argument("--output", default="dflash_draft.pt", help="Output .pt file path")
     args = parser.parse_args()
 
     # Try loading as a simple checkpoint first
     if os.path.isfile(args.checkpoint_dir):
         state = torch.load(args.checkpoint_dir, map_location="cpu")
-        draft_keys = {k: v for k, v in state.items()
-                      if "draft_model" in k or "context_proj" in k or "context_norm" in k}
+        draft_keys = {
+            k: v
+            for k, v in state.items()
+            if "draft_model" in k or "context_proj" in k or "context_norm" in k
+        }
         if draft_keys:
             torch.save(draft_keys, args.output)
             print(f"Saved {len(draft_keys)} keys to {args.output}")
@@ -95,7 +97,7 @@ def main():
     torch.save(draft_state, args.output)
     print(f"\nSaved {len(draft_state)} draft model keys to {args.output}")
     for k in sorted(draft_state.keys())[:15]:
-        shape = draft_state[k].shape if hasattr(draft_state[k], 'shape') else 'n/a'
+        shape = draft_state[k].shape if hasattr(draft_state[k], "shape") else "n/a"
         print(f"  {k}: {shape}")
     if len(draft_state) > 15:
         print(f"  ... ({len(draft_state) - 15} more)")

@@ -44,7 +44,10 @@ _worker_state = {}
 
 
 def _init_tokenize_worker(
-    tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False,
+    tokenizer_path,
+    trust_remote_code,
+    chat_template_name,
+    last_turn_loss_only=False,
     min_loss_tokens=0,
 ):
     """Initializer for each worker process — loads tokenizer once."""
@@ -219,7 +222,13 @@ def load_conversation_dataset(args):
             )
         min_loss_tokens = getattr(args, "min_loss_tokens", 0)
         worker_init = _init_tokenize_worker
-        worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only, min_loss_tokens)
+        worker_initargs = (
+            args.target_model_path,
+            True,
+            chat_template_name,
+            last_turn_loss_only,
+            min_loss_tokens,
+        )
         worker_fn = _tokenize_single
         desc = "Tokenizing dataset"
 

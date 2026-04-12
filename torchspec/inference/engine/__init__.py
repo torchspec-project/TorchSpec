@@ -32,14 +32,14 @@ __all__ = [
 # Lazy imports: SGLang/vLLM are optional — HF-only training (e.g. single-GPU
 # DFlash) should not require these heavy dependencies to be installed.
 try:
-    from torchspec.inference.engine.sgl_engine import SglEngine
+    from torchspec.inference.engine.sgl_engine import SglEngine  # noqa: F401
 
     __all__.append("SglEngine")
 except ImportError:
     pass
 
 try:
-    from torchspec.inference.engine.vllm_engine import VllmEngine
+    from torchspec.inference.engine.vllm_engine import VllmEngine  # noqa: F401
 
     __all__.append("VllmEngine")
 except ImportError:

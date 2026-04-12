@@ -106,7 +106,10 @@ class TrainerActor(RayActor):
         self._trainer.save_draft_model_for_serving(output_dir)
 
     def set_vocab_buffers(self, d2t, t2d) -> None:
-        self._trainer.draft_model.set_vocab_buffers(d2t, t2d)
+        if hasattr(self._trainer, "draft_model") and hasattr(
+            self._trainer.draft_model, "set_vocab_buffers"
+        ):
+            self._trainer.draft_model.set_vocab_buffers(d2t, t2d)
 
     def set_eval_queue(self, queue, mooncake_config=None, per_dp_rank_batch_size: int = 1):
         return self._trainer.set_eval_queue(

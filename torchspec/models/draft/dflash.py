@@ -27,9 +27,7 @@ Architecture overview:
   - Shared embedding and LM head from target model (frozen)
 """
 
-import glob
 import json
-import math
 import os
 from typing import List, Optional, Tuple
 
@@ -39,8 +37,6 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
-
-from torchspec.utils.logging import logger
 
 
 class DFlashConfig(PretrainedConfig):
@@ -267,9 +263,7 @@ class DFlashAttention(nn.Module):
             # Fallback: bidirectional attention (no mask) — expand KV for SDPA
             k = _repeat_kv(k, self.num_kv_groups)
             v = _repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v, is_causal=False, dropout_p=0.0
-            )
+            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
@@ -346,8 +340,7 @@ def build_target_layer_ids(num_target_layers: int, num_hidden_layers: int) -> Li
     end = num_hidden_layers - 3
     span = end - start
     return [
-        int(round(start + (i * span) / (num_target_layers - 1)))
-        for i in range(num_target_layers)
+        int(round(start + (i * span) / (num_target_layers - 1))) for i in range(num_target_layers)
     ]
 
 
@@ -397,9 +390,7 @@ class DFlashDraftModel(PreTrainedModel):
         # Final norm
         self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def extract_context_feature(
-        self, all_hidden_states: List[torch.Tensor]
-    ) -> torch.Tensor:
+    def extract_context_feature(self, all_hidden_states: List[torch.Tensor]) -> torch.Tensor:
         """Extract and project context features from target hidden states.
 
         Args:

@@ -120,9 +120,14 @@ class DataCollatorWithPadding:
             has_target = all(item.get("target") is not None for item in features)
             has_last_hs = all(item.get("last_hidden_states") is not None for item in features)
             if not has_target and not has_last_hs:
-                raise ValueError(
-                    "Either 'target' or 'last_hidden_states' is required when 'hidden_states' is provided"
-                )
+                if not getattr(DataCollatorWithPadding, "_warned_no_target_lhs", False):
+                    import logging
+
+                    logging.getLogger(__name__).debug(
+                        "Batch has hidden_states but no target/last_hidden_states. "
+                        "Expected for DFlash; Eagle3 will fail at trainer level."
+                    )
+                    DataCollatorWithPadding._warned_no_target_lhs = True
             if has_target:
                 batch["target"] = torch.cat(
                     [self.paddingtensor(item["target"], max_length) for item in features]
@@ -460,4 +465,6 @@ def load_hf_dataset(data_path: str):
             ds = ds.remove_columns(drop_cols)
         return ds
     except Exception:
-        return IterableDataset.from_generator(_load_hub_json_files, gen_kwargs={"data_path": data_path})
+        return IterableDataset.from_generator(
+            _load_hub_json_files, gen_kwargs={"data_path": data_path}
+        )
