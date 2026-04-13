@@ -35,12 +35,16 @@ try:
     from torchspec.inference.engine.sgl_engine import SglEngine  # noqa: F401
 
     __all__.append("SglEngine")
-except ImportError:
-    pass
+except ImportError as _e:
+    import logging as _logging
+
+    _logging.getLogger(__name__).debug("SglEngine not available: %s", _e)
 
 try:
     from torchspec.inference.engine.vllm_engine import VllmEngine  # noqa: F401
 
     __all__.append("VllmEngine")
-except ImportError:
-    pass
+except ImportError as _e:
+    import logging as _logging
+
+    _logging.getLogger(__name__).debug("VllmEngine not available: %s", _e)

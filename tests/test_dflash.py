@@ -1138,10 +1138,9 @@ class TestDFlashHotfixes(unittest.TestCase):
 
     def test_collator_accepts_dflash_batch(self):
         """DataCollator should accept hidden_states without target/last_hidden_states."""
-        from torchspec.data.utils import DataCollatorWithPadding
+        import warnings
 
-        # Reset the warned flag for clean test
-        DataCollatorWithPadding._warned_no_target_lhs = False
+        from torchspec.data.utils import DataCollatorWithPadding
 
         collator = DataCollatorWithPadding()
         samples = []
@@ -1154,8 +1153,10 @@ class TestDFlashHotfixes(unittest.TestCase):
                 }
             )
 
-        # Should not raise
-        batch = collator(samples)
+        # Should not raise — just warn
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            batch = collator(samples)
         self.assertIsNotNone(batch["hidden_states"])
         self.assertIsNone(batch["target"])
         self.assertIsNone(batch["last_hidden_states"])

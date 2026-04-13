@@ -26,7 +26,7 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -142,10 +142,10 @@ class DFlashModel(nn.Module):
         # Avoiding .item() prevents a torch.compile graph break.
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
-        masked_indices = torch.where(valid, indices, torch.tensor(seq_len + 1, device=device))
+        masked_indices = torch.where(valid, indices, seq_len + 1)
 
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
+        random_vals = torch.where(valid, random_vals, 2.0)
 
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
@@ -161,7 +161,7 @@ class DFlashModel(nn.Module):
         keep_mask = torch.arange(max_n, device=device).unsqueeze(0) < valid_counts.unsqueeze(
             1
         ).clamp(max=max_n)
-        anchors = torch.where(keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device))
+        anchors = torch.where(keep_mask, anchors, 0)
 
         return anchors, keep_mask
 
@@ -219,8 +219,6 @@ class DFlashModel(nn.Module):
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        norm_weight: Optional[torch.Tensor] = None,
-        norm_eps: float = 1e-6,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Full DFlash training forward pass.
 
