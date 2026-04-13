@@ -4,19 +4,19 @@ torchspec sglang patch (base: 94f03a39db)
  python/sglang/srt/entrypoints/http_server.py       |  17 +++
  python/sglang/srt/layers/logits_processor.py       |  54 ++++++++
  python/sglang/srt/managers/detokenizer_manager.py  |   3 +
- python/sglang/srt/managers/io_struct.py            |  48 ++++++++
+ python/sglang/srt/managers/io_struct.py            |  48 +++++++
  python/sglang/srt/managers/schedule_batch.py       |  54 +++++++-
  python/sglang/srt/managers/scheduler.py            |  57 ++++++++-
- .../managers/scheduler_output_processor_mixin.py   | 137 ++++++++++++++++++---
+ .../managers/scheduler_output_processor_mixin.py   | 138 ++++++++++++++++++---
  python/sglang/srt/managers/tokenizer_manager.py    |  16 +++
  python/sglang/srt/managers/utils.py                |   5 +-
  .../srt/model_executor/forward_batch_info.py       |   4 +
  python/sglang/srt/model_executor/model_runner.py   |  16 +++
  python/sglang/srt/models/qwen3_next.py             |   8 ++
  python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
- python/sglang/srt/server_args.py                   |  23 ++++
+ python/sglang/srt/server_args.py                   |  24 ++++
  .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
- 16 files changed, 481 insertions(+), 22 deletions(-)
+ 16 files changed, 483 insertions(+), 22 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index d864e4aba..b74514924 100644
@@ -544,7 +544,7 @@ index 67af2d0de..36d6e539c 100644
          # Release the closure and large GPU tensors that are no longer needed.
          # The delay_sample_func closure captures forward_batch (which holds
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index 496cd9665..25ccb527b 100644
+index 496cd9665..45ceb0e20 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 @@ -218,21 +218,22 @@ class SchedulerOutputProcessorMixin:
@@ -584,7 +584,7 @@ index 496cd9665..25ccb527b 100644
  
                      if req.grammar is not None:
                          # FIXME: this try-except block is for handling unexpected xgrammar issue.
-@@ -893,6 +894,74 @@ class SchedulerOutputProcessorMixin:
+@@ -893,6 +894,75 @@ class SchedulerOutputProcessorMixin:
          if req.input_token_ids_logprobs_idx is None:
              req.input_token_ids_logprobs_idx = []
  
@@ -638,7 +638,8 @@ index 496cd9665..25ccb527b 100644
 +        )
 +
 +        last_hidden_states = None
-+        if logits_output.last_hidden_states is not None:
++        store_lhs = getattr(self.server_args, "spec_training_store_last_hidden_states", True)
++        if store_lhs and logits_output.last_hidden_states is not None:
 +            last_hidden_states = logits_output.last_hidden_states[
 +                hidden_state_offset : hidden_state_offset + seq_len
 +            ]
@@ -659,7 +660,7 @@ index 496cd9665..25ccb527b 100644
      def stream_output(
          self: Scheduler,
          reqs: List[Req],
-@@ -954,6 +1023,18 @@ class SchedulerOutputProcessorMixin:
+@@ -954,6 +1024,18 @@ class SchedulerOutputProcessorMixin:
          routed_experts = None
          customized_info = {}
  
@@ -678,7 +679,7 @@ index 496cd9665..25ccb527b 100644
          time_stats = []
  
          if return_logprob:
-@@ -1058,6 +1139,13 @@ class SchedulerOutputProcessorMixin:
+@@ -1058,6 +1140,13 @@ class SchedulerOutputProcessorMixin:
                      spec_accepted_tokens.append(req.spec_accepted_tokens)
                      spec_acceptance_histogram.append(req.spec_acceptance_histogram)
  
@@ -692,7 +693,7 @@ index 496cd9665..25ccb527b 100644
                  if return_logprob:
                      if (
                          req.return_logprob
-@@ -1128,9 +1216,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1128,9 +1217,15 @@ class SchedulerOutputProcessorMixin:
                          output_token_ids_logprobs_idx.append([])
  
                  if req.return_hidden_states:
@@ -711,7 +712,7 @@ index 496cd9665..25ccb527b 100644
                  if req.return_routed_experts:
                      if routed_experts is None:
                          routed_experts = []
-@@ -1197,6 +1291,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1197,6 +1292,15 @@ class SchedulerOutputProcessorMixin:
                      retraction_counts=retraction_counts,
                      load=load,
                      dp_ranks=dp_ranks,
@@ -895,10 +896,10 @@ index b2bdbbbe8..833c055ab 100644
      def forward(
          self,
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index d91ced805..b9bb901f1 100644
+index d91ced805..2708630cc 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -514,6 +514,11 @@ class ServerArgs:
+@@ -514,6 +514,12 @@ class ServerArgs:
      speculative_ngram_capacity: int = 10 * 1000 * 1000
      enable_multi_layer_eagle: bool = False
  
@@ -906,11 +907,12 @@ index d91ced805..b9bb901f1 100644
 +    enable_spec_training_mooncake: bool = False
 +    enable_aux_hidden_states: bool = False
 +    aux_hidden_state_layer_ids: Optional[List[int]] = None
++    spec_training_store_last_hidden_states: bool = True
 +
      # Expert parallelism
      ep_size: int = 1
      moe_a2a_backend: Literal[
-@@ -4896,6 +4901,24 @@ class ServerArgs:
+@@ -4896,6 +4902,24 @@ class ServerArgs:
              help="Enable multi-layer Eagle speculative decoding.",
          )
  

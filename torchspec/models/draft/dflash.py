@@ -464,7 +464,9 @@ class DFlashDraftModel(PreTrainedModel):
                     return
                 pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
                 if os.path.exists(pytorch_model_path):
-                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                    state_dict = torch.load(
+                        pytorch_model_path, map_location="cpu", weights_only=True
+                    )
                     self.embed_tokens.weight.copy_(state_dict[embedding_key])
                     return
                 raise FileNotFoundError(
@@ -478,7 +480,9 @@ class DFlashDraftModel(PreTrainedModel):
                 with safe_open(os.path.join(model_path, ckpt_file), framework="pt") as f:
                     self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
             else:
-                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                state_dict = torch.load(
+                    os.path.join(model_path, ckpt_file), map_location="cpu", weights_only=True
+                )
                 self.embed_tokens.weight.copy_(state_dict[embedding_key])
         else:
             local_cache_path = snapshot_download(repo_id=model_path)

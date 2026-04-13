@@ -378,7 +378,11 @@ class PrefetchedDataFetcher:
             for batch in self.inner:
                 self._queue.put(batch)
         except Exception as e:
-            self._error = e
+            # Preserve the original traceback so re-raise in __next__
+            # points to the actual failure site, not to __next__ itself.
+            import sys
+
+            self._error = e.with_traceback(sys.exc_info()[2])
         finally:
             self._queue.put(self._SENTINEL)
 

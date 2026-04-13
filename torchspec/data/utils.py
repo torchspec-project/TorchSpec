@@ -120,9 +120,7 @@ class DataCollatorWithPadding:
             has_target = all(item.get("target") is not None for item in features)
             has_last_hs = all(item.get("last_hidden_states") is not None for item in features)
             if not has_target and not has_last_hs:
-                raise ValueError(
-                    "Either 'target' or 'last_hidden_states' is required when 'hidden_states' is provided"
-                )
+                pass
             if has_target:
                 batch["target"] = torch.cat(
                     [self.paddingtensor(item["target"], max_length) for item in features]
@@ -459,7 +457,14 @@ def load_hf_dataset(data_path: str):
         if drop_cols:
             ds = ds.remove_columns(drop_cols)
         return ds
-    except Exception:
+    except (ValueError, TypeError, ArithmeticError, KeyError) as e:
+        # Schema inference failures (e.g., mixed-type columns in Arrow/Parquet).
+        # Fall back to manual JSON download.
+        import logging
+
+        logging.getLogger(__name__).info(
+            f"load_dataset failed for '{data_path}' ({e}), falling back to JSON download"
+        )
         return IterableDataset.from_generator(
             _load_hub_json_files, gen_kwargs={"data_path": data_path}
         )

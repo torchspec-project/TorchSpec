@@ -117,6 +117,7 @@ class InferenceConfig:
     inference_num_gpus_per_node: int = 8
     last_hidden_states_prenorm: Optional[bool] = None
     max_sample_pool_size: int = 0
+    store_last_hidden_states: bool = True
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
 

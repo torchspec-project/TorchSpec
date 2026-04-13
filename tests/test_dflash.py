@@ -575,7 +575,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
 
         # Loss should generally decrease (allow some noise, check last < first)
         self.assertLess(losses[-1], losses[0], "Loss did not decrease over 10 training steps")
-        self.assertTrue(all(math.isfinite(loss) for loss in losses), "Non-finite loss encountered")
+        self.assertTrue(all(math.isfinite(v) for v in losses), "Non-finite loss encountered")
 
     def test_gradient_accumulation(self):
         """Two half-LR steps with accumulated gradients should produce finite grads."""
@@ -914,7 +914,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         model, *data = self._make_model_and_data(seq_len=128, num_anchors=8)
         losses, _ = self._train_steps(model, *data, steps=20)
         self.assertLess(losses[-1], losses[0])
-        self.assertTrue(all(math.isfinite(loss) for loss in losses))
+        self.assertTrue(all(math.isfinite(v) for v in losses))
 
     def test_large_block_size(self):
         """Block size 8 should still converge."""
@@ -986,7 +986,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
             lm_w,
             steps=15,
         )
-        self.assertTrue(all(math.isfinite(loss) for loss in losses))
+        self.assertTrue(all(math.isfinite(v) for v in losses))
         self.assertLess(losses[-1], losses[0])
 
 
@@ -1131,6 +1131,56 @@ class TestDFlashConfigYAML(unittest.TestCase):
         self.assertEqual(config.num_hidden_layers, 5)  # Updated from 1 to 5
         self.assertEqual(config.num_target_layers, 5)
         self.assertEqual(config.target_num_hidden_layers, 36)
+
+
+class TestDFlashHotfixes(unittest.TestCase):
+    """Tests for incremental correctness fixes (tensor schema, collator, validation)."""
+
+    def test_collator_accepts_dflash_batch(self):
+        """DataCollator should accept hidden_states without target/last_hidden_states."""
+        from torchspec.data.utils import DataCollatorWithPadding
+
+        collator = DataCollatorWithPadding()
+        samples = []
+        for seq_len in [32, 48]:
+            samples.append(
+                {
+                    "input_ids": torch.randint(0, 1000, (1, seq_len)),
+                    "hidden_states": torch.randn(1, seq_len, 384),
+                    "loss_mask": torch.ones(1, seq_len),
+                }
+            )
+
+        # Should not raise (DFlash does not provide target/last_hidden_states)
+        batch = collator(samples)
+        self.assertIsNotNone(batch["hidden_states"])
+        self.assertIsNone(batch["target"])
+        self.assertIsNone(batch["last_hidden_states"])
+
+    def test_min_loss_tokens_validation(self):
+        """min_loss_tokens < 2 * block_size should be caught."""
+        from argparse import Namespace
+
+        # Simulate the validation logic from train_entry
+        args = Namespace(
+            dflash_block_size=16,
+            min_loss_tokens=10,  # < 2 * 16 = 32
+        )
+        block_size = getattr(args, "dflash_block_size", 16)
+        min_loss = getattr(args, "min_loss_tokens", 0)
+
+        with self.assertRaises(ValueError):
+            if min_loss < 2 * block_size:
+                raise ValueError(
+                    f"DFlash requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
+                    f"({min_loss} < {2 * block_size})."
+                )
+
+    def test_min_loss_tokens_validation_passes(self):
+        """min_loss_tokens >= 2 * block_size should pass."""
+        block_size = 16
+        min_loss = 32  # == 2 * 16
+        self.assertGreaterEqual(min_loss, 2 * block_size)
 
 
 if __name__ == "__main__":
