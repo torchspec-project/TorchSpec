@@ -273,7 +273,7 @@ class Trainer(abc.ABC):
         if not os.path.exists(path):
             return 0
         try:
-            self._eval_cache = torch.load(path, weights_only=False)
+            self._eval_cache = torch.load(path, weights_only=False, mmap=True)
         except Exception as e:
             logger.warning(f"[Rank {self.dp_rank}] Corrupt eval cache at {path}, ignoring: {e}")
             return 0

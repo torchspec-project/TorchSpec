@@ -89,6 +89,14 @@ class RayTrainGroup:
         }
         if "TORCHINDUCTOR_CACHE_DIR" in os.environ:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.environ["TORCHINDUCTOR_CACHE_DIR"]
+        env_vars.setdefault(
+            "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC",
+            os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800"),
+        )
+        env_vars.setdefault(
+            "TORCHINDUCTOR_FX_GRAPH_CACHE",
+            os.environ.get("TORCHINDUCTOR_FX_GRAPH_CACHE", "1"),
+        )
 
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(
             self._training_class
