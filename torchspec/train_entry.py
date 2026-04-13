@@ -195,6 +195,41 @@ def _get_draft_model_config(args):
     return AutoDraftModelConfig.from_dict(config_dict)
 
 
+def _validate_and_configure_dflash(args, draft_model_config) -> None:
+    """Validate DFlash-specific config and auto-set aux layer IDs.
+
+    Called before dataset loading to fail fast on misconfigurations.
+    """
+    from torchspec.models.draft.dflash import DFlashConfig
+
+    if not isinstance(draft_model_config, DFlashConfig):
+        return
+
+    if getattr(args, "inference_engine_type", "hf") != "sgl":
+        raise NotImplementedError("DFlash currently supports only inference_engine_type='sgl'.")
+    if getattr(args, "defer_tokenization", False):
+        raise NotImplementedError("DFlash does not support defer_tokenization=True.")
+    block_size = getattr(args, "dflash_block_size", 16)
+    min_loss = getattr(args, "min_loss_tokens", 0)
+    if min_loss < 2 * block_size:
+        raise ValueError(
+            f"DFlash requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
+            f"({min_loss} < {2 * block_size}). Set dataset.min_loss_tokens={2 * block_size}."
+        )
+
+    # Auto-set aux layer IDs from draft config if not explicitly provided
+    if not getattr(args, "aux_hidden_states_layers", None):
+        from torchspec.models.draft.dflash import build_target_layer_ids
+
+        target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
+        if target_layer_ids is None:
+            num_target = getattr(draft_model_config, "num_target_layers", 5)
+            target_num_hidden = getattr(draft_model_config, "target_num_hidden_layers", 36)
+            target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
+        args.aux_hidden_states_layers = target_layer_ids
+        logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
+
+
 def train_async_no_generation(args):
     """Entry point for Eagle3 online training.
 
@@ -219,6 +254,13 @@ def train_async_no_generation(args):
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, args.dp_size)
 
+    # [1.5] Parse draft config + DFlash validation (before any async work)
+    with timer.phase("Parse draft model config"):
+        draft_model_config = _get_draft_model_config(args)
+        args.draft_model_config_obj = draft_model_config
+
+        _validate_and_configure_dflash(args, draft_model_config)
+
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")
     dataset_size_ref = controller.load_dataset.remote(args)
@@ -226,25 +268,6 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
-        draft_model_config = _get_draft_model_config(args)
-        args.draft_model_config_obj = draft_model_config
-
-        # Auto-set aux layer IDs for DFlash (5 layers) if not explicitly provided
-        from torchspec.models.draft.dflash import DFlashConfig
-
-        if isinstance(draft_model_config, DFlashConfig) and not getattr(
-            args, "aux_hidden_states_layers", None
-        ):
-            from torchspec.models.draft.dflash import build_target_layer_ids
-
-            target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
-            if target_layer_ids is None:
-                num_target = getattr(draft_model_config, "num_target_layers", 5)
-                target_num_hidden = getattr(draft_model_config, "target_num_hidden_layers", 36)
-                target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
-            args.aux_hidden_states_layers = target_layer_ids
-            logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
-
         pgs = create_placement_groups(args)
         launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)

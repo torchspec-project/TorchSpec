@@ -101,6 +101,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         self._mooncake_config = None
         self._mooncake_store = None
         self._hidden_size = None
+        self._store_last_hidden_states = True
         self.local_gpu_id = None
         setup_file_logging("inference", self.rank, group=engine_group)
 
@@ -162,6 +163,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 mooncake_config.master_server_address,
                 mooncake_config.metadata_server,
             )
+
+        self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
 
         # Get configuration
         mem_fraction = getattr(self.args, "sglang_mem_fraction_static", 0.8)
@@ -243,6 +246,11 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "chunked_prefill_size": -1,
                 "allow_auto_truncate": True,
                 **({"context_length": max_seq_length} if max_seq_length else {}),
+                **(
+                    {"spec_training_store_last_hidden_states": False}
+                    if not self._store_last_hidden_states
+                    else {}
+                ),
             }
         )
 
@@ -532,16 +540,20 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         # IMPORTANT: Sglang stores tensors WITHOUT batch dimension in mooncake
         # We must request the SAME shapes that sglang stored, otherwise we get size mismatch
         # The collator will add batch dimension when needed
-        return {
+        shapes = {
             "hidden_states": (seq_len, concat_hidden_size),  # 2D without batch dim
             "input_ids": (seq_len,),  # 1D without batch dim
-            "last_hidden_states": (seq_len, hidden_size),  # 2D without batch dim
         }
+        if self._store_last_hidden_states:
+            shapes["last_hidden_states"] = (seq_len, hidden_size)
+        return shapes
 
     def _get_tensor_dtypes(self) -> dict:
         """Get tensor dtypes for mooncake metadata."""
-        return {
+        dtypes = {
             "hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
             "input_ids": torch.long,
-            "last_hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
         }
+        if self._store_last_hidden_states:
+            dtypes["last_hidden_states"] = HIDDEN_STATES_STORAGE_DTYPE
+        return dtypes
