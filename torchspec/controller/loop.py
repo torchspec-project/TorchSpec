@@ -103,7 +103,10 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
     to_delete = iter_dirs[: len(iter_dirs) - max_checkpoints]
     for old_dir in to_delete:
         logger.info(f"Removing old checkpoint: {old_dir}")
-        shutil.rmtree(old_dir, ignore_errors=True)
+        try:
+            shutil.rmtree(old_dir)
+        except OSError as e:
+            logger.warning(f"Failed to remove old checkpoint {old_dir}: {e}")
 
 
 def _safe_training_cleanup(
@@ -373,9 +376,6 @@ def training_loop(
             progress.update(1)
 
             if _is_save_interval_step(completed_steps, args.save_interval):
-                max_ckpts = getattr(args, "max_checkpoints", 0)
-                if max_ckpts > 0:
-                    _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
                 eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
@@ -383,6 +383,9 @@ def training_loop(
                 best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                 )
+                max_ckpts = getattr(args, "max_checkpoints", 0)
+                if max_ckpts > 0:
+                    _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
 
             _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines)
 
@@ -398,9 +401,6 @@ def training_loop(
                     and args.checkpoint_dir
                     and last_saved_step != completed_steps
                 ):
-                    max_ckpts = getattr(args, "max_checkpoints", 0)
-                    if max_ckpts > 0:
-                        _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
                     eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                     logger.info(
                         f"Saving checkpoint at end of epoch {current_epoch} "
@@ -411,6 +411,9 @@ def training_loop(
                     best_eval_score = update_checkpoint_eval_meta(
                         args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                     )
+                    max_ckpts = getattr(args, "max_checkpoints", 0)
+                    if max_ckpts > 0:
+                        _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
 
                 if completed_steps < num_steps:
                     current_epoch += 1
@@ -429,15 +432,15 @@ def training_loop(
 
     # Always save a final checkpoint unless saved.
     if args.checkpoint_dir and last_saved_step != completed_steps:
-        max_ckpts = getattr(args, "max_checkpoints", 0)
-        if max_ckpts > 0:
-            _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)
         best_eval_score = update_checkpoint_eval_meta(
             args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
         )
+        max_ckpts = getattr(args, "max_checkpoints", 0)
+        if max_ckpts > 0:
+            _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
 
     final_status = ray.get(controller.get_full_status.remote())
     logger.info(

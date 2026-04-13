@@ -465,7 +465,14 @@ def load_hf_dataset(data_path: str):
         if drop_cols:
             ds = ds.remove_columns(drop_cols)
         return ds
-    except Exception:
+    except (ValueError, TypeError, ArithmeticError, KeyError) as e:
+        # Schema inference failures (e.g., mixed-type columns in Arrow/Parquet).
+        # Fall back to manual JSON download.
+        import logging
+
+        logging.getLogger(__name__).info(
+            f"load_dataset failed for '{data_path}' ({e}), falling back to JSON download"
+        )
         return IterableDataset.from_generator(
             _load_hub_json_files, gen_kwargs={"data_path": data_path}
         )

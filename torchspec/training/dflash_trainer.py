@@ -78,7 +78,10 @@ class DFlashTrainer(Trainer):
             elif isinstance(draft_model_config, DFlashConfig):
                 config = draft_model_config
             else:
-                config = draft_model_config
+                raise TypeError(
+                    f"Unsupported draft_model_config type: {type(draft_model_config).__name__}. "
+                    f"Expected str, dict, or DFlashConfig."
+                )
 
             if not hasattr(config, "num_target_layers") or config.num_target_layers is None:
                 config.num_target_layers = self.num_target_layers
