@@ -2042,7 +2042,7 @@ class LlamaDecoderLayer(nn.Module):
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "fa4":
             self.self_attn = LlamaFlashAttentionMasked(config=config)
-        elif attention_backend in ("fa", "fa_low_acc"):
+        elif attention_backend == "fa":
             self.self_attn = LlamaFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
