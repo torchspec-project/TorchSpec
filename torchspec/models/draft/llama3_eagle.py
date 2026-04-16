@@ -72,6 +72,7 @@ except ImportError as _e:
 def _import_standard_flash_attn():
     try:
         import flash_attn as mod
+        from flash_attn import flash_attn_varlen_func as varlen_func
         from flash_attn.bert_padding import pad_input, unpad_input
         from flash_attn.flash_attn_interface import (
             _flash_attn_backward as backward,
@@ -86,13 +87,14 @@ def _import_standard_flash_attn():
             _flash_attn_varlen_forward as varlen_forward,
         )
     except ImportError as exc:
-        return None, None, None, None, None, None, None, exc
+        return None, None, None, None, None, None, None, None, exc
 
-    return mod, pad_input, unpad_input, forward, backward, varlen_forward, varlen_backward, None
+    return mod, varlen_func, pad_input, unpad_input, forward, backward, varlen_forward, varlen_backward, None
 
 
 (
     _std_flash_attn_mod,
+    _std_flash_attn_varlen_func,
     _std_flash_pad_input,
     _std_flash_unpad_input,
     _std_flash_attn_forward,
@@ -1703,12 +1705,10 @@ def _standard_flash_attn_varlen_forward(
     softmax_scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from flash_attn import flash_attn_varlen_func
-
     q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(q, attention_mask)
     k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(k, attention_mask)
     v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
-    out_unpad, lse_unpad, _ = flash_attn_varlen_func(
+    out_unpad, lse_unpad, _ = _std_flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
