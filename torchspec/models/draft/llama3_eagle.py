@@ -89,7 +89,17 @@ def _import_standard_flash_attn():
     except ImportError as exc:
         return None, None, None, None, None, None, None, None, exc
 
-    return mod, varlen_func, pad_input, unpad_input, forward, backward, varlen_forward, varlen_backward, None
+    return (
+        mod,
+        varlen_func,
+        pad_input,
+        unpad_input,
+        forward,
+        backward,
+        varlen_forward,
+        varlen_backward,
+        None,
+    )
 
 
 (
